@@ -1,0 +1,223 @@
+import { describe, expect, it, vi } from "vitest";
+import { preferences, statusInput } from "../shared/contracts";
+import { emptyState, HOUR, holdIds, type Agent, type SavedState, type Workspace } from "../shared/model";
+import type { RecoveryHost } from "./host";
+import { RecoveryService, type RecoveryEvent } from "./service";
+import { RecoveryError } from "./store";
+
+const epoch = Date.parse("2026-10-20T00:00:00Z");
+const hook = { id: "session", title: "Test session", provider: "codex", workspaceId: "workspace", parentAgentId: null as string | null };
+function fixture(options: Record<string, unknown> = {}) {
+  let clock = epoch;
+  let saved = emptyState("host");
+  let shuttingDown = false;
+  let service!: RecoveryService;
+  const a: Agent = { id: hook.id, title: hook.title, provider: hook.provider, workspaceId: hook.workspaceId, parentId: null,
+    status: "running", activeTurn: "turn-1", pendingPermissions: 0, archivedAt: null, lastUserMessageAt: new Date(epoch).toISOString(),
+    attentionReason: null, attentionTimestamp: null, persistence: true, internal: false };
+  const workspace: Workspace = { id: "workspace", archived: false, archiving: false };
+  const others = new Map<string, Agent>();
+  const store = { load: vi.fn(async () => structuredClone(saved)), save: vi.fn(async (s: SavedState) => { saved = structuredClone(s); }) };
+  const fetch = vi.fn(async (id: string) => structuredClone(id === a.id ? a : others.get(id) ?? null));
+  const getWorkspace = vi.fn(async () => structuredClone(workspace));
+  const send = vi.fn(async (_id: string, _prompt: string, _messageId: string, _expected: Agent, check: () => void) => { check(); });
+  const settings = preferences.schema.parse(options);
+  const hosts: RecoveryHost[] = [];
+  const create = (bootKey: string) => {
+    const host: RecoveryHost = { bootKey, serverId: "host", store, fetch, workspace: getWorkspace,
+      shuttingDown: vi.fn(async () => shuttingDown), send, close: vi.fn(async () => {}) };
+    hosts.push(host); service = new RecoveryService(async () => host, () => clock, false); return service;
+  };
+  create("boot-a");
+  const event = (value: Omit<RecoveryEvent, "agent">) => service.observe({ ...value, agent: { ...hook, parentAgentId: a.parentId } } as RecoveryEvent);
+  return {
+    a, others, workspace, settings, store, fetch, getWorkspace, send, hosts,
+    get service() { return service; },
+    get saved() { return structuredClone(saved); }, setSaved: (s: SavedState) => { saved = structuredClone(s); },
+    advance: (n: number) => { clock += n; }, shutdown: (value: boolean) => { shuttingDown = value; },
+    event,
+    async track() { await service.configure(settings); await event({ kind: "start", turnId: "turn-1" } as Omit<RecoveryEvent, "agent">); clock += 1000; await service.scanNow(); },
+    idle() { a.status = "idle"; a.activeTurn = null; },
+    async restart(boot = "boot-b") { create(boot); await service.configure(settings); },
+    row() { return service.status(statusInput.parse({})).rows[0]; },
+  };
+}
+describe("restart recovery", () => {
+  it("does not scan or resume pre-existing sessions on first install", async () => {
+    const f = fixture(); f.idle(); await f.service.configure(f.settings); f.advance(HOUR); await f.service.scanNow();
+    expect(f.fetch).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled(); expect(f.saved.records).toEqual({});
+  });
+  it("waits through the grace period, saves the intent, and sends one continuation", async () => {
+    const f = fixture(); await f.track(); f.idle(); await f.restart();
+    expect(f.row()?.reason).toBe("daemon_restart"); expect(f.send).not.toHaveBeenCalled();
+    f.send.mockImplementationOnce(async (id, prompt, messageId, _a, check) => {
+      check(); expect(f.saved.records[id].phase).toBe("sending"); expect(f.saved.records[id].attemptMessageId).toBe(messageId);
+      expect(holdIds(f.saved)).toContain(id); expect(prompt).toContain("before repeating");
+    });
+    f.advance(59_999); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+    f.advance(1); await f.service.scanNow(); await f.service.scanNow();
+    expect(f.send).toHaveBeenCalledTimes(1); expect(f.saved.records.session.phase).toBe("resumed");
+  });
+  it.each(["completed", "canceled"] as const)("never restarts an explicitly %s turn", async (kind) => {
+    const f = fixture(); await f.track();
+    await f.event({ kind: "end", turnId: "turn-1", outcome: kind === "completed" ? { kind } : { kind, reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
+    f.idle(); await f.restart(); f.advance(HOUR); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled(); expect(holdIds(f.saved)).toEqual([]);
+  });
+  it("distinguishes graceful daemon shutdown from a manual stop", async () => {
+    const f = fixture(); await f.track(); f.shutdown(true);
+    await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
+    await f.event({ kind: "closed" }); expect(f.saved.records.session.phase).toBe("interrupted");
+    f.shutdown(false); f.idle(); await f.restart(); f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(1);
+  });
+  it("treats a plugin reload in the same daemon as a review candidate", async () => {
+    const f = fixture(); await f.track(); f.idle(); await f.restart("boot-a"); f.advance(HOUR); await f.service.scanNow();
+    expect(f.row()?.reason).toBe("monitor_gap"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("does not mistake an unexplained runtime close for a daemon interruption", async () => {
+    const f = fixture(); await f.track(); await f.event({ kind: "closed" }); f.idle(); await f.restart(); f.advance(HOUR); await f.service.scanNow();
+    expect(f.row()?.reason).toBe("runtime_closed"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("leaves old interruptions for review", async () => {
+    const f = fixture(); await f.track(); f.idle(); f.advance(25 * HOUR); await f.restart();
+    expect(f.row()?.reason).toBe("too_old"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("preserves questions across a crash even when the daemon loses its pending request", async () => {
+    const f = fixture(); await f.track(); await f.event({ kind: "permission", requestId: "approval" } as Omit<RecoveryEvent, "agent">);
+    f.idle(); await f.restart(); f.advance(HOUR); await f.service.scanNow();
+    expect(f.row()?.reason).toBe("input"); expect(f.row()?.canResume).toBe(false); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("keeps multiple approvals pending until they are allowed", async () => {
+    const f = fixture(); await f.track();
+    for (const id of ["one", "two"]) await f.event({ kind: "permission", requestId: id } as Omit<RecoveryEvent, "agent">);
+    await f.event({ kind: "resolution", requestId: "one", allowed: true } as Omit<RecoveryEvent, "agent">);
+    expect(f.saved.records.session.humanRequired).toBe(true);
+    await f.event({ kind: "resolution", requestId: "two", allowed: true } as Omit<RecoveryEvent, "agent">);
+    expect(f.saved.records.session.humanRequired).toBe(false);
+  });
+  it("excludes subagents from automatic recovery by default", async () => {
+    const f = fixture(); f.a.parentId = "parent"; await f.track(); f.idle(); await f.restart();
+    expect(f.row()?.reason).toBe("subagent"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("checks all parents before recovering an opted-in subagent", async () => {
+    const f = fixture({ recoverSubagents: true }); f.a.parentId = "parent";
+    f.others.set("parent", { ...f.a, id: "parent", parentId: null, activeTurn: "parent-turn" });
+    await f.track(); f.idle(); await f.restart(); f.advance(60_000); await f.service.scanNow();
+    expect(f.row()?.reason).toBe("parent_unavailable"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it.each([
+    ["archivedAt", "2026-10-20T00:00:01Z", "archived"], ["persistence", false, "no_history"],
+    ["activeTurn", undefined, "unknown_state"], ["pendingPermissions", -1, "unknown_state"],
+    ["lastUserMessageAt", "2026-10-20T00:00:30Z", "new_activity"],
+  ] as const)("does not resume when %s changes", async (field, value, expected) => {
+    const f = fixture(); await f.track(); f.idle(); Object.assign(f.a, { [field]: value }); await f.restart(); f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe(expected); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("honors completion found in the snapshot after a lost hook", async () => {
+    const f = fixture(); await f.track(); f.idle(); f.a.attentionReason = "finished"; f.a.attentionTimestamp = new Date(epoch + 500).toISOString();
+    await f.restart(); f.advance(HOUR); await f.service.scanNow(); expect(f.saved.records.session.phase).toBe("completed"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("does not interrupt a turn that is already active after reconnection", async () => {
+    const f = fixture(); await f.track(); await f.restart(); f.advance(HOUR); await f.service.scanNow();
+    expect(f.saved.records.session.phase).toBe("watching"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("keeps monitoring while automatic recovery is off", async () => {
+    const f = fixture({ enabled: false }); await f.track(); f.idle(); await f.restart(); f.advance(HOUR); await f.service.scanNow();
+    expect(f.service.status().state).toBe("paused"); expect(f.send).not.toHaveBeenCalled();
+  });
+});
+describe("bounded attempts and delivery", () => {
+  it("never automatically repeats a submission with an unknown result", async () => {
+    const f = fixture(); await f.track(); f.idle(); await f.restart();
+    f.send.mockRejectedValueOnce(new Error("response lost")); f.advance(60_000); await f.service.scanNow();
+    expect(f.row()?.reason).toBe("uncertain_send"); expect(f.row()?.canResume).toBe(false);
+    await f.restart("boot-c"); f.advance(HOUR); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(1);
+  });
+  it("preserves the attempt budget and increases backoff across continued turns", async () => {
+    const f = fixture({ retryTransientErrors: true, maxAttempts: 2 }); await f.track(); f.idle(); await f.restart();
+    f.advance(60_000); await f.service.scanNow();
+    await f.event({ kind: "start", turnId: "turn-2" } as Omit<RecoveryEvent, "agent">);
+    await f.event({ kind: "end", turnId: "turn-2", outcome: { kind: "failed", error: { code: "ETIMEDOUT" } } } as Omit<RecoveryEvent, "agent">);
+    expect(f.saved.records.session.attempts).toBe(1);
+    f.advance(119_999); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(1);
+    f.advance(1); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(2);
+    await f.event({ kind: "start", turnId: "turn-3" } as Omit<RecoveryEvent, "agent">);
+    await f.event({ kind: "end", turnId: "turn-3", outcome: { kind: "failed", error: { code: "ETIMEDOUT" } } } as Omit<RecoveryEvent, "agent">);
+    await f.service.scanNow(); expect(f.row()?.reason).toBe("attempt_limit"); f.advance(HOUR); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(2);
+  });
+  it("sends unknown provider errors to review even if transient retries are enabled", async () => {
+    const f = fixture({ retryTransientErrors: true }); await f.track(); f.idle();
+    await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "failed", error: { code: "authentication_failed" } } } as Omit<RecoveryEvent, "agent">);
+    f.advance(HOUR); await f.service.scanNow(); expect(f.row()?.reason).toBe("provider_error"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("does not send when durable intent storage fails", async () => {
+    const f = fixture(); await f.track(); f.idle(); await f.restart(); f.advance(60_000);
+    f.store.save.mockRejectedValueOnce(new RecoveryError("disk full")); await expect(f.service.scanNow()).rejects.toThrow("disk full");
+    await expect(f.service.scanNow()).rejects.toThrow(/paused/); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("does not guess after unreadable history", async () => {
+    const f = fixture(); f.store.load.mockRejectedValueOnce(new RecoveryError("unreadable history"));
+    await expect(f.service.configure(f.settings)).rejects.toThrow("unreadable"); expect(f.service.status().state).toBe("error"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("ignores a terminal event from an earlier turn", async () => {
+    const f = fixture(); await f.track();
+    await f.event({ kind: "end", turnId: "turn-old", outcome: { kind: "completed" } } as Omit<RecoveryEvent, "agent">);
+    expect(f.saved.records.session.phase).toBe("watching");
+  });
+});
+describe("manual review and concurrent changes", () => {
+  it("does not report a manual validation error as paused automation", async () => {
+    const f = fixture(); await f.service.configure(f.settings);
+    await expect(f.service.prepare("missing")).rejects.toThrow(/does not have/);
+    expect(f.service.status().state).toBe("running");
+  });
+  it("does not clear a pending question with an unrelated resolution", async () => {
+    const f = fixture(); await f.track(); f.a.pendingPermissions = 1; await f.service.scanNow();
+    await f.event({ kind: "resolution", requestId: "unobserved-request", allowed: true } as Omit<RecoveryEvent, "agent">);
+    expect(f.saved.records.session.humanRequired).toBe(true); f.idle(); f.a.pendingPermissions = 0;
+    await f.restart(); f.advance(HOUR); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("previews the actual continuation and consumes the ticket once", async () => {
+    const f = fixture(); await f.track(); f.idle(); await f.event({ kind: "closed" });
+    const preview = await f.service.prepare("session"); expect(preview.prompt).toBe(f.settings.prompt);
+    await f.service.resume(preview.token); await expect(f.service.resume(preview.token)).rejects.toThrow(/expired/); expect(f.send).toHaveBeenCalledTimes(1);
+  });
+  it("rejects a preview when the conversation changes", async () => {
+    const f = fixture(); await f.track(); f.idle(); await f.event({ kind: "closed" }); const preview = await f.service.prepare("session");
+    f.a.title = "Changed"; await expect(f.service.resume(preview.token)).rejects.toThrow(/changed/); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("expires manual recovery previews", async () => {
+    const f = fixture(); await f.track(); f.idle(); await f.event({ kind: "closed" }); const preview = await f.service.prepare("session");
+    f.advance(60_000); await expect(f.service.resume(preview.token)).rejects.toThrow(/expired/); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("dismisses a candidate and releases cleanup protection", async () => {
+    const f = fixture(); await f.track(); f.idle(); await f.restart(); expect(holdIds(f.saved)).toEqual(["session"]);
+    await f.service.dismiss("session"); expect(holdIds(f.saved)).toEqual([]); f.advance(HOUR); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("supports excluding a session before its first observed turn", async () => {
+    const f = fixture(); await f.service.configure(f.settings); await f.service.exclude("session", true); await f.track(); f.idle(); await f.restart(); f.advance(HOUR); await f.service.scanNow();
+    expect(holdIds(f.saved)).toEqual([]); expect(f.send).not.toHaveBeenCalled();
+    await f.service.exclude("session", false); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("cancels automatic recovery when settings change during verification", async () => {
+    const f = fixture(); await f.track(); f.idle(); await f.restart(); f.advance(60_000);
+    let release!: (w: Workspace) => void; let began!: () => void;
+    const reading = new Promise<void>((resolve) => { began = resolve; });
+    f.getWorkspace.mockImplementationOnce(async () => { began(); return new Promise((resolve) => { release = resolve; }); });
+    const scan = f.service.scanNow(); await reading; const pause = f.service.configure({ ...f.settings, enabled: false }); release(f.workspace);
+    await expect(scan).rejects.toThrow(/changed/); await pause; expect(f.send).not.toHaveBeenCalled();
+  });
+  it("honors a stop event while verification is in flight", async () => {
+    const f = fixture(); await f.track(); f.idle(); await f.restart(); f.advance(60_000);
+    let release!: (w: Workspace) => void; let began!: () => void;
+    const reading = new Promise<void>((resolve) => { began = resolve; });
+    f.getWorkspace.mockImplementationOnce(async () => { began(); return new Promise((resolve) => { release = resolve; }); });
+    const scan = f.service.scanNow(); await reading;
+    const stopped = f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
+    release(f.workspace); await expect(scan).rejects.toThrow(/changed/); await stopped;
+    expect(f.send).not.toHaveBeenCalled(); expect(f.saved.records.session.phase).toBe("stopped");
+  });
+  it("invalid settings block further recovery actions", async () => {
+    const f = fixture(); await f.track(); await f.service.invalidSettings();
+    await expect(f.service.scanNow()).rejects.toThrow(/paused/); await expect(f.service.exclude("session", true)).rejects.toThrow(/paused/); expect(f.send).not.toHaveBeenCalled();
+  });
+});
