@@ -58,6 +58,8 @@ paseo plugin install /absolute/path/to/paseo-session-recovery
 
 Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed.
 
+For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.1.0`. The public registry listing requires a separate review.
+
 ## Local data
 
 Session IDs, titles, providers, turn IDs, timestamps, attempt counts, exclusions, and recent outcomes stay under `plugin-data/session-recovery/` in the daemon's Paseo home. `state.json` is the journal, `holds.json` is the cleanup protection list, and `worker.lock` prevents duplicate monitors. Files use owner-only permissions. Journal writes use sync and atomic rename.

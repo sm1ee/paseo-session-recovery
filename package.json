@@ -5,6 +5,9 @@
   "description": "Resume interrupted Paseo sessions after a daemon restart.",
   "license": "MIT",
   "author": "sm1ee",
+  "repository": { "type": "git", "url": "git+https://github.com/sm1ee/paseo-session-recovery.git" },
+  "homepage": "https://github.com/sm1ee/paseo-session-recovery#readme",
+  "bugs": { "url": "https://github.com/sm1ee/paseo-session-recovery/issues" },
   "files": [
     "paseo-plugin.json",
     "OVERVIEW.md",
