@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
-import { busy, fingerprint, type Agent, type Workspace } from "../shared/model";
+import { busy, fingerprint, goalCommandReady, type Agent, type Workspace } from "../shared/model";
 import { FileStore, RecoveryError, type StateStore } from "./store";
 import { daemonCompatibilityError } from "./compatibility";
 import { localWebSocketFactory } from "./transport";
@@ -178,7 +178,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         await check(); guard();
         const agent = (await paseo.agents.ref(id).refresh())?.agent;
         const latest = agent ? metadata(agent) : null;
-        if (!agent?.persistence?.sessionId || !latest || busy(latest) || latest.archivedAt || fingerprint(latest) !== fingerprint(expected)) throw new RecoveryError("The session changed before its goal could resume. Check it and try again.");
+        if (!agent?.persistence?.sessionId || !latest || !goalCommandReady(latest) || latest.archivedAt || fingerprint(latest) !== fingerprint(expected)) throw new RecoveryError("The session changed before its goal could resume. Check it and try again.");
         const workspace = latest.workspaceId ? await paseo.workspaces.ref(latest.workspaceId).refresh() : null;
         if (!workspace || workspace.archivingAt) throw new RecoveryError("This workspace is unavailable.");
         await check(); guard();
@@ -186,7 +186,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
           return await codexGoals.resumeBlocked(agent.provider, agent.persistence.sessionId, key, guard, async () => {
             if (driver.getLastServerInfoMessage()?.features?.agentRequestReceipts !== true) throw new RecoveryError("This daemon does not advertise durable message receipts.");
             const current = await fetch(id);
-            if (!current || busy(current) || current.archivedAt || fingerprint(current) !== fingerprint(expected)) throw new RecoveryError("The session changed before its goal could resume. Check it and try again.");
+            if (!current || !goalCommandReady(current) || current.archivedAt || fingerprint(current) !== fingerprint(expected)) throw new RecoveryError("The session changed before its goal could resume. Check it and try again.");
             await check(); guard();
             await driver.sendAgentMessage(id, "/goal resume", { messageId, activeTurnBehavior: "steer" });
           });

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { GOAL_PROMPT, preferences, reasonText, statusInput, type GoalControl, type Preferences, type Reason, type RecoveryRow, type RecoveryStatus, type ResumePreview } from "../shared/contracts";
-import { automaticBlock, backoff, busy, emptyState, fingerprint, isGoalContinuation, isSelectedGoal, isTransient, OPEN_PHASES, snapshotBlock, time, type Agent, type RecordEntry, type SavedState } from "../shared/model";
+import { automaticBlock, backoff, busy, emptyState, fingerprint, goalCommandReady, isGoalContinuation, isSelectedGoal, isTransient, OPEN_PHASES, snapshotBlock, time, type Agent, type RecordEntry, type SavedState } from "../shared/model";
 import { openLocalHost, type RecoveryHost } from "./host";
 import { RecoveryError } from "./store";
 
@@ -348,7 +348,7 @@ export class RecoveryService {
       if (reactivating) {
         if (!this.settings.enabled || !this.settings.continueGoals) throw new RecoveryError("Enable Continue selected goals in Settings before resuming this goal.");
         if (existing?.humanRequired || existing?.pendingIds.length || a.pendingPermissions !== 0) throw new RecoveryError("Answer the pending question or approval before resuming this goal.");
-        if (busy(a) || a.activeTurn === undefined || !a.persistence) throw new RecoveryError("The session must be idle with saved history before its blocked goal can resume.");
+        if (!goalCommandReady(a)) throw new RecoveryError("Wait until the session is ready and has saved history before resuming its goal.");
         if (!resetAttempts && existing?.goal?.key === reading.key && existing.goal.attempts >= this.settings.goalMaxAttempts) throw new RecoveryError("The goal continuation limit was reached. Review it before resetting the count.");
         const workspace = a.workspaceId ? await host.workspace(a.workspaceId) : null; guard();
         if (!workspace || workspace.archived || workspace.archiving || a.parentId && (!this.settings.recoverSubagents || await this.parentBlock(a, host))) throw new RecoveryError("The workspace or parent session is unavailable for goal continuation.");

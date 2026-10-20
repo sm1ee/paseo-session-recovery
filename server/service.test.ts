@@ -96,6 +96,29 @@ describe("goal composer inspection", () => {
     f.advance(1); await f.service.scanNow(); expect(f.send).toHaveBeenCalledOnce();
     expect(f.saved.records.session.goal?.attempts).toBe(1);
   });
+  it("accepts a blocked-goal toggle during a running turn and waits for that turn to finish", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.track();
+    await f.service.watchGoal("session", active.key!, false, true);
+    expect(f.resumeBlockedGoal).toHaveBeenCalledOnce();
+    expect(f.saved.records.session).toMatchObject({ phase: "watching", reason: "active", turnId: "turn-1", goal: { state: "active", selectedKey: active.key } });
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+    f.idle(); await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "completed" } } as Omit<RecoveryEvent, "agent">);
+    await f.service.scanNow(); f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledOnce();
+  });
+  it.each(["starting", "no-history"])("waits for %s session metadata before changing a goal", async (state) => {
+    const f = fixture({ continueGoals: true }); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.track();
+    if (state === "starting") f.a.status = "initializing";
+    if (state === "no-history") f.a.persistence = false;
+    await expect(f.service.watchGoal("session", active.key!, false, true)).rejects.toThrow(/ready/);
+    expect(f.resumeBlockedGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("allows the native command with an omitted turn ID but still blocks an unverifiable continuation", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.track(); f.a.activeTurn = undefined;
+    await f.service.watchGoal("session", active.key!, false, true); expect(f.resumeBlockedGoal).toHaveBeenCalledOnce();
+    f.a.status = "idle"; await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "completed" } } as Omit<RecoveryEvent, "agent">);
+    await f.service.scanNow(); f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("unknown_state"); expect(f.send).not.toHaveBeenCalled();
+  });
   it("replaces an old observation gap after an explicit blocked-goal resume", async () => {
     const f = fixture({ continueGoals: true }); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.track(); f.idle(); await f.service.scanNow();
     expect(f.saved.records.session.reason).toBe("unknown_end");

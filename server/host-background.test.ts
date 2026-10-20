@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { openLocalHost, type RecoveryHost } from "./host";
 import { OpenCodeGoals } from "./opencode-goals";
+import { CodexGoals } from "./codex-goals";
 
 type Info = NonNullable<ReturnType<DaemonClient["getLastServerInfoMessage"]>>;
 let home: string;
@@ -51,6 +52,21 @@ describe("recovery host compatibility", () => {
     await expect(openLocalHost(home, process.pid)).rejects.toThrow(/background workspace/);
     expect(DaemonClient.prototype.fetchWorkspaces).not.toHaveBeenCalled();
     await expect(access(join(home, "plugin-data", "session-recovery", "worker.lock"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
+
+describe("native Codex goal commands", () => {
+  it.each([true, false])("sends a native resume during a running turn, turn ID present: %s", async (hasTurn) => {
+    vi.mocked(DaemonClient.prototype.getLastServerInfoMessage).mockReturnValue({ serverId: "scope-test", version, features: { backgroundWorkspaces: background, agentRequestReceipts: true } } as Info);
+    vi.spyOn(DaemonClient.prototype, "fetchAgent").mockResolvedValue({ agent: { id: "fixture", title: "Fixture", provider: "codex", labels: {},
+      workspaceId: "background-space", persistence: { sessionId: "native-fixture" }, status: "running", activeTurn: hasTurn ? { turnId: "current-turn" } : undefined, pendingPermissions: [], lastUserMessageAt: null }, project: null } as unknown as NonNullable<Awaited<ReturnType<DaemonClient["fetchAgent"]>>>);
+    const send = vi.spyOn(DaemonClient.prototype, "sendAgentMessage").mockResolvedValue(undefined);
+    vi.spyOn(CodexGoals.prototype, "resumeBlocked").mockImplementation(async (_provider, _thread, key, guard, submit) => { guard(); await submit(); return { state: "active", key, evidence: true, source: "codex" }; });
+    host = await openLocalHost(home, process.pid); const agent = await host.fetch("fixture");
+    expect(agent).toMatchObject({ status: "running", activeTurn: hasTurn ? "current-turn" : undefined });
+    expect(await host.resumeBlockedGoal!("fixture", "current-goal", agent!, () => {}, "fixture-resume-message")).toMatchObject({ state: "active", key: "current-goal" });
+    expect(send).toHaveBeenCalledExactlyOnceWith("fixture", "/goal resume", { messageId: "fixture-resume-message", activeTurnBehavior: "steer" });
+    expect(await host.fetch("fixture")).toMatchObject({ status: "running", activeTurn: hasTurn ? "current-turn" : undefined });
   });
 });
 
