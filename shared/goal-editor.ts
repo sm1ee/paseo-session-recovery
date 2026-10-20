@@ -10,6 +10,8 @@ export const goalEditorSchema = z.object({
   objective: z.string().nullable(), state: z.enum(["active", "paused", "blocked", "limited", "complete", "cleared", "unknown"]),
   tokenBudget: z.number().finite().nonnegative().nullable(), tokensUsed: z.number().finite().nonnegative().nullable(),
   ticket: z.string().nullable(), note: z.string().nullable(),
+  action: z.enum(["pause", "resume"]).nullable().optional(), actionTicket: z.string().nullable().optional(),
+  actionNote: z.string().nullable().optional(), key: z.string().nullable().optional(),
 });
 export type GoalEditorSnapshot = z.infer<typeof goalEditorSchema>;
 export const readGoalRpc = defineRpc({ name: "recovery.goal.read", input: z.object({ id: z.string().min(1) }), output: goalEditorSchema });

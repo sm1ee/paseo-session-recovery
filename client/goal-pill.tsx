@@ -1,44 +1,51 @@
-import type { PluginButtonIconProps, PluginClientContext } from "@getpaseo/plugin/client";
-import { goalControlRpc, unwatchGoalRpc, watchGoalRpc, type GoalControl } from "../shared/contracts";
+import type { PluginButtonContentProps, PluginButtonIconProps, PluginButtonRegistration, PluginClientContext } from "@getpaseo/plugin/client";
+import { goalControlRpc, type GoalControl } from "../shared/contracts";
+import { readGoalRpc } from "../shared/goal-editor";
+import { actOnGoalRpc } from "../shared/goal-actions";
 import { createGoalPillController, type GoalPillController } from "./goal-pill-controller";
 import { GoalPillIcon } from "./goal-pill-icon";
-
-function label(goal: GoalControl): string {
-  if (!goal.selected) return "Goal · Off";
-  if (goal.holdReason === "input") return "Goal · Waiting";
-  if (!goal.automatic || goal.state === "paused") return "Goal · Paused";
-  if (goal.state === "blocked") return "Goal · Blocked";
-  if (goal.state === "limited" || goal.attempts >= goal.maxAttempts) return "Goal · Limit";
-  if (goal.state !== "active" || goal.holdReason) return "Goal · Review";
-  return "Goal · On";
-}
+import { GoalEditorContent } from "./goal-editor";
+import { goalErrorText, goalPreviewLabel } from "./goal-presentation";
 
 export function contributeGoalPills(client: PluginClientContext): () => void {
   const lifetime = new AbortController();
   const controller: GoalPillController = createGoalPillController(
-    (id, fresh) => client.rpc(goalControlRpc, { id, fresh }),
+    (id, fresh) => client.rpc(goalControlRpc, { id, fresh, preview: true }),
     (id, workspaceId) => {
       let current: GoalControl | null = null;
+      let playback: PluginButtonRegistration | undefined;
       const observe = () => controller.mount(id);
       const Icon = (props: PluginButtonIconProps) => <GoalPillIcon {...props} observe={observe} />;
+      const Content = (props: PluginButtonContentProps) => <GoalEditorContent {...props} agentId={id}
+        onChanged={() => { void controller.refresh(id).catch(() => {}); }} />;
+      const act = async () => {
+        try {
+        const expected = current;
+        if (!expected?.key || !expected.nativeAction) throw new Error("Reload the current goal before changing it.");
+        const latest = await client.rpc(readGoalRpc, { id });
+        if (latest.key !== expected.key || latest.action !== expected.nativeAction) {
+          await controller.refresh(id).catch(() => {});
+          throw new Error("The goal changed. Review it before trying again.");
+        }
+        if (!latest.actionTicket) throw new Error(latest.note || latest.actionNote || "Native controls are unavailable. Open the goal to review its state.");
+        // OpenCode resume needs the sheet's explicit new-budget action.
+        if (latest.source === "opencode" && latest.action === "resume") throw new Error("Open this goal and review the new budget window before resuming.");
+        try { await client.rpc(actOnGoalRpc, { ticket: latest.actionTicket, confirmBudgetReset: false }); }
+        finally { await controller.refresh(id).catch(() => {}); }
+        } catch (error) { throw new Error(goalErrorText(error)); }
+      };
       const pill = client.addComposerPill({ id: "goal-continuation", agentId: id, workspaceId,
-        button: { title: "View current goal", icon: Icon, label: "Goal", behavior: { kind: "action", async onPress() {
-          if (!current) { client.openScreen({ screenId: "goal", params: { agentId: id } }); return; }
-          let goal = await controller.refresh(id);
-          const available = (value: GoalControl) => value.visible && (value.selected || value.canSelect && !!value.key);
-          // A turn can finish while the read is in flight. Retry inspection once;
-          // never retry a selection, resume command, or other mutation here.
-          if (!available(goal) && (goal.state === null || goal.state === "unknown")) goal = await controller.refresh(id);
-          if (!available(goal)) throw new Error(goal.note || "This goal is unavailable. Try again.");
-          try {
-            if (goal.selected) await client.rpc(unwatchGoalRpc, { id });
-            else await client.rpc(watchGoalRpc, { id, key: goal.key!, resetAttempts: false, resumeBlocked: true });
-          } finally { await controller.refresh(id).catch(() => {}); }
-        } } } });
-      return { remove: () => pill.remove(), update: (value) => {
+        button: { title: "Goal", icon: Icon, label: "Goal", behavior: { kind: "popover", Content } } });
+      return { remove: () => { pill.remove(); playback?.remove(); }, update: (value) => {
         current = value;
-        pill.update(value ? { label: label(value), title: value.selected ? `Turn goal continuation off${value.note ? `: ${value.note}` : ""}` : "Turn goal continuation on; resume a blocked Codex goal" }
-          : { label: "Goal", title: "View current goal" });
+        pill.update({ label: goalPreviewLabel(value), title: "Goal" });
+        const action = value?.nativeAction;
+        if (!action) { playback?.update({ visible: false }); return; }
+        const button = { title: action === "pause" ? "Pause goal" : "Resume goal",
+          icon: action === "pause" ? "Pause" : "Play", label: action === "pause" ? "Pause" : "Resume", visible: true,
+          behavior: action === "resume" && value.source === "opencode" ? { kind: "popover" as const, Content } : { kind: "action" as const, onPress: act } };
+        if (playback) playback.update(button);
+        else playback = client.addComposerPill({ id: "goal-playback", agentId: id, workspaceId, button });
       } };
     },
   );

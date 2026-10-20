@@ -23,7 +23,7 @@ export default function contribute(client: PluginClientContext) {
   const stopGoalCommands = contributeGoalCommands(client);
   function Screen(props: PluginScreenProps) { return <RecoveryScreen {...props} onOpenSettings={() => client.openSettings("preferences")} />; }
   client.addScreen({ id: "main", title: "session-recovery", Component: Screen });
-  client.addScreen({ id: "goal", title: "Current goal", Component: GoalEditorScreen });
+  client.addScreen({ id: "goal", title: "Goal", Component: GoalEditorScreen });
   if (Platform.OS === "web") client.addSidebarHeaderItem({ id: "main", title: "session-recovery", Component: RecoveryItem });
   client.addSettingsScreen({ id: "preferences", title: "Settings", icon: "Settings2", Component: RecoverySettings });
   client.addCommandCenterItem({ id: "open", title: "Open session-recovery", icon: "RotateCcw", context: "global", onSelect({ openScreen }) { openScreen({ screenId: "main" }); } });

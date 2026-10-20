@@ -11,7 +11,8 @@ import { busy, fingerprint, goalCommandReady, type Agent, type Workspace } from 
 import { FileStore, RecoveryError, type StateStore } from "./store";
 import { daemonCompatibilityError } from "./compatibility";
 import { localWebSocketFactory } from "./transport";
-import { readGoal, type GoalDetails, type GoalItem, type GoalReading, type GoalSource } from "./goals";
+import { readGoalDetails, type GoalDetails, type GoalItem, type GoalReading, type GoalSource } from "./goals";
+import type { GoalAction } from "../shared/goal-actions";
 import { CodexGoals } from "./codex-goals";
 import { OpenCodeGoals } from "./opencode-goals";
 import { ClaudeGoals } from "./claude-goals";
@@ -24,7 +25,8 @@ export interface RecoveryHost {
   workspace(id: string): Promise<Workspace | null>;
   goal?(id: string, options?: { allowTimeline?: boolean }): Promise<GoalReading>;
   supportsGoalCommand?(id: string, source?: GoalSource): Promise<boolean>;
-  goalDetails?(id: string): Promise<GoalDetails | null>;
+  goalDetails?(id: string, options?: { allowTimeline?: boolean }): Promise<GoalDetails | null>;
+  controlGoal?(id: string, revision: string, action: GoalAction, expected: Agent, check: () => void, messageId: string, submitted: () => void): Promise<GoalReading>;
   editGoal?(id: string, revision: string, objective: string, expected: Agent, check: () => void, messageId: string, submitted: () => void): Promise<GoalReading>;
   resumeBlockedGoal?(id: string, key: string, expected: Agent, check: () => void, messageId: string, submitted?: () => void): Promise<GoalReading>;
   shuttingDown(): Promise<boolean>;
@@ -162,6 +164,25 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
     if (compatibilityError) throw new RecoveryError(compatibilityError);
     const paseo = createPaseoApi(driver);
     const fetch = async (id: string) => { await check(); const result = await paseo.agents.ref(id).refresh(); await check(); return result?.agent ? metadata(result.agent) : null; };
+    const timelineDetails = async (id: string): Promise<GoalDetails> => {
+      const unknown: GoalDetails = { reading: { state: "unknown", key: null, evidence: true, source: "timeline" }, objective: null, revision: "", tokenBudget: null, tokensUsed: null };
+      let page = await driver.fetchAgentTimeline(id, { projection: "canonical", direction: "tail", limit: 200 });
+      const epoch = page.epoch;
+      let entries = [...page.entries];
+      const cursors = new Set<number>();
+      for (let n = 0; n < 10; n++) {
+        await check();
+        if (page.error || page.gap || page.staleCursor || page.epoch !== epoch || n === 0 && page.hasNewer) return unknown;
+        const details = readGoalDetails(entries.sort((a, b) => a.seqEnd - b.seqEnd).map((e) => e.item as GoalItem));
+        const { reading } = details;
+        if (reading.evidence && (reading.key || reading.state !== "active") || !page.hasOlder) return details;
+        if (!page.startCursor || cursors.has(page.startCursor.seq)) break;
+        cursors.add(page.startCursor.seq);
+        page = await driver.fetchAgentTimeline(id, { projection: "canonical", direction: "before", cursor: page.startCursor, limit: 200 });
+        entries = [...page.entries, ...entries];
+      }
+      return unknown;
+    };
     return {
       bootKey, serverId: lock.serverId, store: new FileStore(directory, lock.serverId), fetch,
       async goal(id, options) {
@@ -183,21 +204,8 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         // 화면의 자동 발견 조회는 휴면 대화를 복원하지 않는다.
         // 사용자의 명시적인 선택과 선택된 Goal의 실행 전 검사는 기존 경로를 쓴다.
         if (options?.allowTimeline === false) return { state: "unknown", key: null, evidence: false, source: "timeline" };
-        let page = await driver.fetchAgentTimeline(id, { projection: "canonical", direction: "tail", limit: 200 });
-        const epoch = page.epoch;
-        let entries = [...page.entries];
-        const cursors = new Set<number>();
-        for (let n = 0; n < 10; n++) {
-          await check();
-          if (page.error || page.gap || page.staleCursor || page.epoch !== epoch || n === 0 && page.hasNewer) return { state: "unknown", key: null, evidence: true };
-          const reading = readGoal(entries.sort((a, b) => a.seqEnd - b.seqEnd).map((e) => e.item as GoalItem));
-          if (reading.evidence && (reading.key || reading.state !== "active") || !page.hasOlder) return reading;
-          if (!page.startCursor || cursors.has(page.startCursor.seq)) break;
-          cursors.add(page.startCursor.seq);
-          page = await driver.fetchAgentTimeline(id, { projection: "canonical", direction: "before", cursor: page.startCursor, limit: 200 });
-          entries = [...page.entries, ...entries];
-        }
-        return { state: "unknown", key: null, evidence: true };
+        const { source: _source, ...reading } = (await timelineDetails(id)).reading;
+        return reading;
       },
       async workspace(id) {
         await check(); const w = await paseo.workspaces.ref(id).refresh(); await check();
@@ -211,12 +219,38 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         if (result.error) throw new RecoveryError("Could not check this session's native goal commands. Try again.");
         return nativeGoalCommand(result.commands, source);
       },
-      async goalDetails(id) {
+      async goalDetails(id, options) {
         await check();
         const agent = (await paseo.agents.ref(id).refresh())?.agent;
         if (!agent) return null;
         const details = await openCodeGoals.details(agent) ?? await claudeGoals.details(agent) ?? (agent.persistence?.sessionId ? await codexGoals.details(agent.provider, agent.persistence.sessionId) : null);
-        await check(); return details;
+        await check();
+        return details ?? (options?.allowTimeline === false ? null : await timelineDetails(id));
+      },
+      async controlGoal(id, revision, action, expected, guard, messageId, submitted) {
+        await check(); guard();
+        const agent = (await paseo.agents.ref(id).refresh())?.agent;
+        checkGoalSession(agent ? metadata(agent) : null, expected, "initial");
+        if (!agent?.persistence?.sessionId) throw new RecoveryError("The session's saved history is unavailable.");
+        const details = await openCodeGoals.details(agent) ?? await claudeGoals.details(agent) ?? await codexGoals.details(agent.provider, agent.persistence.sessionId);
+        const source = details?.reading.source;
+        if (source !== "codex" && source !== "opencode") throw new RecoveryError("This provider does not expose native pause and resume controls.");
+        const idleOnly = source === "opencode";
+        checkGoalSession(metadata(agent), expected, "initial", idleOnly);
+        const commands = await paseo.agents.ref(id).commands();
+        if (commands.error || !nativeGoalCommand(commands.commands, source)) throw new RecoveryError("Native goal commands are unavailable for this session.");
+        await check(); guard();
+        const send = async () => {
+          if (driver.getLastServerInfoMessage()?.features?.agentRequestReceipts !== true) throw new RecoveryError("This daemon does not advertise durable message receipts.");
+          checkGoalSession(await fetch(id), expected, "final", idleOnly);
+          const workspace = expected.workspaceId ? await paseo.workspaces.ref(expected.workspaceId).refresh() : null;
+          if (!workspace || workspace.archivingAt) throw new RecoveryError("This workspace is unavailable.");
+          await check(); guard(); submitted();
+          try { await driver.sendAgentMessage(id, `/goal ${action}`, { messageId, activeTurnBehavior: "steer" }); }
+          catch { throw new RecoveryError("The goal action delivery could not be confirmed. Check the conversation and reload before trying again."); }
+        };
+        return source === "opencode" ? openCodeGoals.control(agent, revision, action, guard, send)
+          : codexGoals.control(agent.provider, agent.persistence.sessionId, revision, action, guard, send);
       },
       async editGoal(id, revision, objective, expected, guard, messageId, submitted) {
         await check(); guard();

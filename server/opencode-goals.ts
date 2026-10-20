@@ -4,6 +4,7 @@ import { lstat, open, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { GoalDetails, GoalReading } from "./goals";
 import { goalObjectiveError } from "../shared/goal-editor";
+import type { GoalAction } from "../shared/goal-actions";
 
 const description = "Execute an explicit user goal with persistent progress and evidence-gated completion.";
 const unknown: GoalReading = { state: "unknown", key: null, evidence: true, source: "opencode" };
@@ -82,6 +83,26 @@ export class OpenCodeGoals {
     return (await this.load(agent))?.details.reading ?? null;
   }
   async details(agent: PaseoAgent): Promise<GoalDetails | null> { return (await this.load(agent))?.details ?? null; }
+  async control(agent: PaseoAgent, revision: string, action: GoalAction, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
+    const before = await this.load(agent); check();
+    if (!before?.record || typeof before.record.goalId !== "string" || !before.record.goalId || before.details.revision !== revision || !before.details.reading.key || !before.details.objective ||
+      !(action === "pause" ? before.details.reading.state === "active" : ["paused", "blocked"].includes(before.details.reading.state))) throw new Error("The OpenCode goal changed. Reload before trying again.");
+    await send(); check();
+    for (let n = 0; n < 20; n++) {
+      const after = await this.load(agent); check();
+      if (!after?.record || after.details.reading.key !== before.details.reading.key || after.record.goalId !== before.record.goalId ||
+        JSON.stringify(after.record.options) !== JSON.stringify(before.record.options)) throw new Error("The OpenCode goal identity or limits changed. Reload before trying again.");
+      // Resume deliberately starts the native plugin's new budget window.
+      // Pause must preserve the current window and its cumulative usage.
+      if (action === "pause" && (after.record.startedAt !== before.record.startedAt ||
+        after.record.runId !== before.record.runId ||
+        (after.record.turnCount as number) < (before.record.turnCount as number) || (after.record.totalTokens as number) < (before.record.totalTokens as number))) throw new Error("The OpenCode budget changed while pausing. Check its native state.");
+      if (after.details.reading.state === (action === "pause" ? "paused" : "active")) return after.details.reading;
+      if (!["active", "paused", "blocked"].includes(after.details.reading.state)) break;
+      await new Promise((resolve) => setTimeout(resolve, 250)); check();
+    }
+    throw new Error("OpenCode has not confirmed the goal action. Check the conversation and reload before trying again.");
+  }
   async edit(agent: PaseoAgent, revision: string, objective: string, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
     const invalid = goalObjectiveError(objective, "opencode"); if (invalid) throw new Error(invalid);
     const before = await this.load(agent); check();

@@ -30,6 +30,12 @@ function fixture(options: Record<string, unknown> = {}) {
   const editGoal = vi.fn(async (_id: string, _revision: string, _objective: string, _expected: Agent, check: () => void, _messageId: string, submitted: () => void): Promise<GoalReading> => {
     check(); submitted(); return { state: "active", key: "edited-goal", evidence: true, source: "codex" };
   });
+  const controlGoal = vi.fn(async (_id: string, _revision: string, action: "pause" | "resume", _expected: Agent, check: () => void, _messageId: string, submitted: () => void): Promise<GoalReading> => {
+    check(); submitted();
+    const reading: GoalReading = { ...details!.reading, state: action === "pause" ? "paused" : "active" };
+    details = { ...details!, reading }; goalReading = reading;
+    return reading;
+  });
   const resumeBlockedGoal = vi.fn(async (_id: string, key: string, _expected: Agent, check: () => void, _messageId: string, submitted?: () => void) => {
     check(); if (goalReading.state !== "blocked" || goalReading.key !== key) throw new Error("Goal changed");
     submitted?.();
@@ -40,13 +46,13 @@ function fixture(options: Record<string, unknown> = {}) {
   const hosts: RecoveryHost[] = [];
   const create = (bootKey: string) => {
     const host: RecoveryHost = { bootKey, serverId: "host", store, fetch, workspace: getWorkspace,
-      shuttingDown: vi.fn(async () => shuttingDown), goal, goalDetails, editGoal, supportsGoalCommand, resumeBlockedGoal, send, close: vi.fn(async () => {}) };
+      shuttingDown: vi.fn(async () => shuttingDown), goal, goalDetails, editGoal, controlGoal, supportsGoalCommand, resumeBlockedGoal, send, close: vi.fn(async () => {}) };
     hosts.push(host); service = new RecoveryService(async () => host, () => clock, false); return service;
   };
   create("boot-a");
   const event = (value: Omit<RecoveryEvent, "agent">) => service.observe({ ...value, agent: { ...hook, parentAgentId: a.parentId } } as RecoveryEvent);
   return {
-    a, others, workspace, settings, store, fetch, getWorkspace, goal, goalDetails, editGoal, supportsGoalCommand, resumeBlockedGoal, send, hosts,
+    a, others, workspace, settings, store, fetch, getWorkspace, goal, goalDetails, editGoal, controlGoal, supportsGoalCommand, resumeBlockedGoal, send, hosts,
     setDetails: (value: CodexGoalDetails | null) => { details = value; },
     setGoal: (reading: GoalReading) => { goalReading = reading; },
     get service() { return service; },
@@ -59,6 +65,81 @@ function fixture(options: Record<string, unknown> = {}) {
     row() { return service.status(statusInput.parse({})).rows[0]; },
   };
 }
+describe("목표 미리보기와 명시적인 네이티브 제어", () => {
+  async function controls(source: "codex" | "opencode" | "claude" = "codex", state: GoalReading["state"] = "active") {
+    const f = fixture({ enabled: false, continueGoals: false }); f.a.provider = source; f.a.sessionId = "native-fixture"; f.idle();
+    const reading: GoalReading = { state, key: "original-goal", evidence: true, source };
+    f.setGoal(reading); f.setDetails({ reading, objective: "Private fixture objective", revision: "native-revision", tokenBudget: 100, tokensUsed: 3 });
+    await f.service.configure(f.settings); return f;
+  }
+  it("마운트된 미리보기만 복원 없이 본문을 읽고 수동 조회와 캐시를 구분한다", async () => {
+    const f = await controls(), before = f.saved;
+    await f.service.goalControl("session"); expect(f.goalDetails).not.toHaveBeenCalled();
+    expect(await f.service.goalControl("session", false, false, true)).toMatchObject({ objective: "Private fixture objective", nativeAction: "pause", source: "codex" });
+    expect(f.goalDetails).toHaveBeenCalledExactlyOnceWith("session", { allowTimeline: false });
+    expect(f.saved).toEqual(before); expect(f.controlGoal).not.toHaveBeenCalled();
+    expect(JSON.stringify(f.saved)).not.toContain("Private fixture objective");
+  });
+  it("자동 이어가기가 꺼져 있어도 사용자가 네이티브 Goal을 일시정지할 수 있다", async () => {
+    const f = await controls(), view = await f.service.readGoalEditor("session");
+    expect(view).toMatchObject({ action: "pause", actionTicket: expect.any(String), key: "original-goal" });
+    await f.service.actOnGoal({ ticket: view.actionTicket! });
+    expect(f.controlGoal).toHaveBeenCalledOnce(); expect(f.saved.records.session.goal).toMatchObject({ state: "paused", selectedKey: null });
+    f.advance(120_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+    expect(JSON.stringify(f.saved)).not.toContain(view.actionTicket!); expect(JSON.stringify(f.saved)).not.toContain("Private fixture objective");
+  });
+  it("재개는 네이티브 Goal만 재개하며 Paseo 추가 이어가기를 선택하지 않는다", async () => {
+    const f = await controls("codex", "paused"), view = await f.service.readGoalEditor("session");
+    expect(view.action).toBe("resume"); await f.service.actOnGoal({ ticket: view.actionTicket! });
+    expect(f.saved.records.session.goal).toMatchObject({ state: "active", selectedKey: null }); expect(f.send).not.toHaveBeenCalled();
+    await expect(f.service.actOnGoal({ ticket: view.actionTicket! })).rejects.toThrow(/expired/); expect(f.controlGoal).toHaveBeenCalledOnce();
+  });
+  it("명시적인 OpenCode 재개만 새 예산 창을 승인한다", async () => {
+    const f = await controls("opencode", "paused"), first = await f.service.readGoalEditor("session");
+    expect(first.actionNote).toContain("budget window");
+    await expect(f.service.actOnGoal({ ticket: first.actionTicket! })).rejects.toThrow(/confirm/); expect(f.controlGoal).not.toHaveBeenCalled();
+    const view = await f.service.readGoalEditor("session"); await f.service.actOnGoal({ ticket: view.actionTicket!, confirmBudgetReset: true });
+    expect(f.controlGoal).toHaveBeenCalledOnce();
+  });
+  it.each(["claude", "timeline"] as const)("%s의 미지원 pause/resume 티켓을 발행하지 않는다", async (source) => {
+    const f = await controls(); f.setDetails({ reading: { state: "active", key: "original-goal", evidence: true, source }, objective: "Fixture", revision: "native", tokenBudget: null, tokensUsed: null });
+    const view = await f.service.readGoalEditor("session"); expect(view.objective).toBe("Fixture"); expect(view.actionTicket).toBeNull();
+    if (source === "timeline") expect(view.ticket).toBeNull();
+    expect(f.controlGoal).not.toHaveBeenCalled();
+  });
+  it("새 턴, 만료, 설정 변경 또는 대기 중 승인이 이전 제어를 막는다", async () => {
+    for (const mode of ["start", "expire", "settings", "permission"]) {
+      const f = await controls(), view = await f.service.readGoalEditor("session");
+      if (mode === "start") await f.event({ kind: "start", turnId: "different" } as Omit<RecoveryEvent, "agent">);
+      if (mode === "expire") f.advance(300_000);
+      if (mode === "settings") await f.service.configure(f.settings);
+      if (mode === "permission") await f.event({ kind: "permission", requestId: "approval" } as Omit<RecoveryEvent, "agent">);
+      await expect(f.service.actOnGoal({ ticket: view.actionTicket! })).rejects.toThrow(); expect(f.controlGoal).not.toHaveBeenCalled();
+    }
+  });
+  it("전송 의도를 디스크에 먼저 저장하고 불확실한 제어는 재시작 후에도 재전송하지 않는다", async () => {
+    const f = await controls(), view = await f.service.readGoalEditor("session");
+    f.controlGoal.mockImplementationOnce(async (_id, _revision, _action, _expected, guard, _messageId, submitted) => {
+      guard(); expect(f.saved.records.session.phase).toBe("sending"); submitted(); throw new Error("Receipt lost");
+    });
+    await expect(f.service.actOnGoal({ ticket: view.actionTicket! })).rejects.toThrow("Receipt lost");
+    expect(f.saved.records.session.reason).toBe("uncertain_send"); await f.restart(); f.advance(60_000); await f.service.scanNow();
+    expect((await f.service.readGoalEditor("session")).actionTicket).toBeNull(); expect(f.controlGoal).toHaveBeenCalledOnce(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("제출 전 거부된 제어는 기존 기록을 복원한다", async () => {
+    const f = await controls(), before = f.saved, view = await f.service.readGoalEditor("session");
+    f.controlGoal.mockRejectedValueOnce(new Error("Changed before submission"));
+    await expect(f.service.actOnGoal({ ticket: view.actionTicket! })).rejects.toThrow(); expect(f.saved).toEqual(before);
+  });
+  it("네이티브 일시정지는 별도로 관찰하던 중단 복구 기록을 지우지 않는다", async () => {
+    const f = await controls();
+    await f.event({ kind: "start", turnId: "interruption" } as Omit<RecoveryEvent, "agent">);
+    await f.event({ kind: "end", turnId: "interruption", outcome: { kind: "failed", error: { code: "ECONNRESET" } } } as Omit<RecoveryEvent, "agent">);
+    const previous = f.saved.records.session, view = await f.service.readGoalEditor("session");
+    await f.service.actOnGoal({ ticket: view.actionTicket! });
+    expect(f.saved.records.session).toMatchObject({ phase: previous.phase, reason: previous.reason, attempts: previous.attempts, goal: { state: "paused", selectedKey: null } });
+  });
+});
 describe("명시적인 Goal 편집", () => {
   async function editor() {
     const f = fixture({ continueGoals: true }); f.a.sessionId = "native-fixture"; f.idle();
@@ -72,6 +153,27 @@ describe("명시적인 Goal 편집", () => {
     expect(await f.service.readGoalEditor("session")).toMatchObject({ supported: true, objective: "Original fixture", ticket: expect.any(String) });
     expect(f.goalDetails).toHaveBeenCalledExactlyOnceWith("session"); expect(f.saved).toEqual(before);
     expect(f.editGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("조회 중 네이티브 Goal의 다음 턴이 시작돼도 본문을 보여주고 최신 턴으로 티켓을 발행한다", async () => {
+    const f = await editor();
+    f.goalDetails.mockImplementationOnce(async () => {
+      f.a.status = "running"; f.a.activeTurn = "native-next-turn";
+      await f.event({ kind: "start", turnId: "native-next-turn" } as Omit<RecoveryEvent, "agent">);
+      return { reading: { state: "active", key: "original-goal", evidence: true, source: "codex" }, objective: "Original fixture", revision: "native-revision", tokenBudget: 100, tokensUsed: 3 };
+    });
+    const view = await f.service.readGoalEditor("session"); expect(view).toMatchObject({ objective: "Original fixture", ticket: expect.any(String), actionTicket: expect.any(String) });
+    await f.service.editGoal({ ticket: view.ticket!, objective: "Edited fixture" }); expect(f.editGoal.mock.calls[0][3].activeTurn).toBe("native-next-turn");
+  });
+  it.each(["stop", "permission", "message"])("조회 도중 %s가 오면 본문은 읽기 전용으로 보여주고 오류나 수정 권한을 만들지 않는다", async (change) => {
+    const f = await editor();
+    f.goalDetails.mockImplementationOnce(async () => {
+      if (change === "stop") await f.event({ kind: "end", turnId: null, outcome: { kind: "canceled", reason: "user_stop" } } as Omit<RecoveryEvent, "agent">);
+      if (change === "permission") await f.event({ kind: "permission", requestId: "approval" } as Omit<RecoveryEvent, "agent">);
+      if (change === "message") { f.a.lastUserMessageAt = new Date(epoch + 1).toISOString(); await f.event({ kind: "start", turnId: "user-turn" } as Omit<RecoveryEvent, "agent">); }
+      return { reading: { state: "active", key: "original-goal", evidence: true, source: "codex" }, objective: "Original fixture", revision: "native-revision", tokenBudget: 100, tokensUsed: 3 };
+    });
+    expect(await f.service.readGoalEditor("session")).toMatchObject({ objective: "Original fixture", ticket: null, actionTicket: null });
+    expect(f.editGoal).not.toHaveBeenCalled(); expect(f.controlGoal).not.toHaveBeenCalled();
   });
   it("새 목표를 자동 선택하지 않고 이전 목표의 예약된 진행을 취소한다", async () => {
     const f = await editor(); await f.service.watchGoal("session");

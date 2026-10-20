@@ -75,9 +75,11 @@ export const goalControlSchema = z.object({
   state: rowSchema.shape.goalState, key: z.string().nullable(), selected: z.boolean(), canSelect: z.boolean(),
   automatic: z.boolean(), attempts: z.number().int().nonnegative(), maxAttempts: z.number().int().positive(), delaySeconds: z.number().int().positive(),
   note: z.string().nullable(), holdReason: reasonSchema.nullable().optional(),
+  objective: z.string().nullable().optional(), source: z.enum(["codex", "opencode", "claude", "timeline"]).nullable().optional(),
+  nativeAction: z.enum(["pause", "resume"]).nullable().optional(),
 });
 export type GoalControl = z.infer<typeof goalControlSchema>;
-export const goalControlRpc = defineRpc({ name: "recovery.goal.control", input: z.object({ id: z.string().min(1), fresh: z.boolean().default(false), inspect: z.boolean().default(false) }), output: goalControlSchema });
+export const goalControlRpc = defineRpc({ name: "recovery.goal.control", input: z.object({ id: z.string().min(1), fresh: z.boolean().default(false), inspect: z.boolean().default(false), preview: z.boolean().default(false) }), output: goalControlSchema });
 export const excludeRpc = defineRpc({ name: "recovery.exclude", input: z.object({ id: z.string().min(1), excluded: z.boolean() }), output: ok });
 export const dismissRpc = defineRpc({ name: "recovery.dismiss", input: z.object({ id: z.string().min(1) }), output: ok });
 export const prepareRpc = defineRpc({ name: "recovery.prepare", input: z.object({ id: z.string().min(1) }), output: z.object({ token: z.string(), title: z.string(), prompt: z.string(), expiresAt: z.number() }) });

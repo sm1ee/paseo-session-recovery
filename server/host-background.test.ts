@@ -66,6 +66,38 @@ describe("다중 제공자의 네이티브 Goal 편집", () => {
     });
   }
 });
+describe("네이티브 Goal 일시정지와 재개 전달", () => {
+  function controlFixture(source: "codex" | "opencode" | "claude") {
+    const agent = { id: "fixture", title: "Fixture", provider: source, labels: {}, workspaceId: "background-space", persistence: { sessionId: "native-fixture" },
+      status: "idle", activeTurn: null as null | { turnId: string }, pendingPermissions: [], archivedAt: null, lastUserMessageAt: null };
+    vi.mocked(DaemonClient.prototype.getLastServerInfoMessage).mockReturnValue({ serverId: "scope-test", version, features: { backgroundWorkspaces: true, agentRequestReceipts: true } } as Info);
+    vi.spyOn(DaemonClient.prototype, "fetchAgent").mockImplementation(async () => ({ agent: structuredClone(agent), project: null }) as unknown as NonNullable<Awaited<ReturnType<DaemonClient["fetchAgent"]>>>);
+    const descriptions = { codex: "Set, pause, resume, or clear the agent's goal", opencode: "Set a session-scoped goal and auto-continue until complete.", claude: "Set a goal — keep working until the condition is met" };
+    vi.spyOn(DaemonClient.prototype, "listCommands").mockResolvedValue({ agentId: "fixture", commands: [{ name: "goal", kind: source === "claude" ? "skill" : "command", description: descriptions[source], argumentHint: "" }], error: null, requestId: "fixture" });
+    const details = { reading: { state: "active" as const, key: "original", evidence: true, source }, objective: "Fixture", revision: "native", tokenBudget: 100, tokensUsed: 3 };
+    vi.spyOn(OpenCodeGoals.prototype, "details").mockResolvedValue(source === "opencode" ? details : null);
+    vi.spyOn(ClaudeGoals.prototype, "details").mockResolvedValue(source === "claude" ? details : null);
+    vi.spyOn(CodexGoals.prototype, "details").mockResolvedValue(details);
+    const send = vi.spyOn(DaemonClient.prototype, "sendAgentMessage").mockResolvedValue(undefined);
+    return { agent, send };
+  }
+  it.each(["codex", "opencode"] as const)("%s는 Goal 제어를 소유 연결로 한 번 전송한다", async (source) => {
+    const f = controlFixture(source);
+    const control = source === "codex" ? vi.spyOn(CodexGoals.prototype, "control") : vi.spyOn(OpenCodeGoals.prototype, "control");
+    control.mockImplementation(async (...args: unknown[]) => { const guard = args.at(-2) as () => void, submit = args.at(-1) as () => Promise<void>; guard(); await submit(); return { state: "paused", key: "original", evidence: true, source }; });
+    host = await openLocalHost(home, process.pid); const expected = (await host.fetch("fixture"))!, submitted = vi.fn();
+    await expect(host.controlGoal!("fixture", "native", "pause", expected, () => {}, "owned-control", submitted)).resolves.toMatchObject({ state: "paused" });
+    expect(f.send).toHaveBeenCalledExactlyOnceWith("fixture", "/goal pause", { messageId: "owned-control", activeTurnBehavior: "steer" }); expect(submitted).toHaveBeenCalledOnce();
+  });
+  it("Claude에는 pause를 목표 본문으로 전송하지 않는다", async () => {
+    const f = controlFixture("claude"); host = await openLocalHost(home, process.pid);
+    await expect(host.controlGoal!("fixture", "native", "pause", (await host.fetch("fixture"))!, () => {}, "not-sent", vi.fn())).rejects.toThrow(/does not expose/); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("OpenCode 턴이 진행 중이면 명령을 보내지 않는다", async () => {
+    const f = controlFixture("opencode"); f.agent.status = "running"; f.agent.activeTurn = { turnId: "ongoing" }; host = await openLocalHost(home, process.pid);
+    await expect(host.controlGoal!("fixture", "native", "pause", (await host.fetch("fixture"))!, () => {}, "not-sent", vi.fn())).rejects.toThrow(/session changed/); expect(f.send).not.toHaveBeenCalled();
+  });
+});
 afterEach(async () => { await host?.close(); host = undefined; vi.restoreAllMocks(); await rm(home, { recursive: true, force: true }); });
 
 describe("recovery host compatibility", () => {

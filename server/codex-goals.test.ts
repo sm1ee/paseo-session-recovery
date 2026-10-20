@@ -137,4 +137,32 @@ describe("Codex goal reader", () => {
     try { const before = await f.reader.details("fixture"); f.send.mockRejectedValueOnce(new Error("Receipt lost")); await expect(f.reader.edit("fixture", before.revision, "Edited fixture", () => {}, f.send)).rejects.toThrow("Receipt lost"); expect(f.send).toHaveBeenCalledOnce(); }
     finally { await f.close(); }
   });
+  it.each(["pause", "resume"] as const)("%s 제어는 소유 연결로 한 번 보내고 목표와 예산을 보존한다", async (action) => {
+    const f = await editFixture();
+    try {
+      await f.change({ status: action === "pause" ? "active" : "paused" });
+      const before = await f.reader.details("fixture");
+      f.send.mockImplementationOnce(async () => f.change({ status: action === "pause" ? "paused" : "active" }));
+      expect(await f.reader.control("fixture", before.revision, action, () => {}, f.send)).toMatchObject({ key: before.reading.key, state: action === "pause" ? "paused" : "active" });
+      const after = await f.reader.details("fixture");
+      expect(after.tokenBudget).toBe(before.tokenBudget); expect(after.tokensUsed).toBe(before.tokensUsed); expect(f.send).toHaveBeenCalledOnce();
+    } finally { await f.close(); }
+  });
+  it("다른 목표로 바뀌었거나 사용량이 소진되면 재개하지 않는다", async () => {
+    const f = await editFixture();
+    try {
+      const before = await f.reader.details("fixture"); await f.change({ objective: "Replacement" });
+      await expect(f.reader.control("fixture", before.revision, "resume", () => {}, f.send)).rejects.toThrow(/changed/);
+      await f.change({ tokensUsed: 20 }); const latest = await f.reader.details("fixture");
+      await expect(f.reader.control("fixture", latest.revision, "resume", () => {}, f.send)).rejects.toThrow(/budget/); expect(f.send).not.toHaveBeenCalled();
+    } finally { await f.close(); }
+  });
+  it("일시정지 중 예산 초기화와 목표 교체를 성공으로 보고하지 않는다", async () => {
+    const f = await editFixture();
+    try {
+      await f.change({ status: "active" }); const before = await f.reader.details("fixture");
+      f.send.mockImplementationOnce(async () => f.change({ status: "paused", tokensUsed: 0 }));
+      await expect(f.reader.control("fixture", before.revision, "pause", () => {}, f.send)).rejects.toThrow(/identity or budget/); expect(f.send).toHaveBeenCalledOnce();
+    } finally { await f.close(); }
+  });
 });

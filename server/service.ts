@@ -4,6 +4,7 @@ import { automaticBlock, backoff, busy, emptyState, fingerprint, goalCommandRead
 import { openLocalHost, type RecoveryHost } from "./host";
 import { RecoveryError } from "./store";
 import { goalLengthLimit, editGoalInput, type GoalEditorSnapshot } from "../shared/goal-editor";
+import { actOnGoalRpc, type GoalAction } from "../shared/goal-actions";
 
 interface HookAgent { id: string; title: string | null; provider: string; workspaceId: string | null; parentAgentId: string | null }
 export type RecoveryEvent =
@@ -15,6 +16,7 @@ export type RecoveryEvent =
 interface Ticket { id: string; revision: number; generation: number; expiresAt: number; fingerprint: string; prompt: string }
 interface NativeGoalResume { submitted: boolean; starts: number }
 interface GoalEditTicket { id: string; generation: number; changed: number; revision: string; expected: Agent; expiresAt: number }
+interface GoalActionTicket extends GoalEditTicket { action: GoalAction; source: "codex" | "opencode"; key: string }
 function suspendedGoal(r: RecordEntry): boolean {
   return isSelectedGoal(r) && ["review", "stopped"].includes(r.phase) && ["goal_paused", "goal_blocked", "goal_limited", "goal_unknown"].includes(r.reason);
 }
@@ -24,6 +26,7 @@ export class RecoveryService {
   private settings = preferences.schema.parse({});
   private generation = 0;
   private changes = new Map<string, number>();
+  private goalReadBlocks = new Map<string, number>();
   private tickets = new Map<string, Ticket>();
   private queue: Promise<unknown> = Promise.resolve();
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -35,11 +38,12 @@ export class RecoveryService {
   private scanQueued = false;
   private lastScanAt: number | null = null;
   private cursor = 0;
-  private controls = new Map<string, { at: number; generation: number; changed: number; value: GoalControl }>();
+  private controls = new Map<string, { at: number; generation: number; changed: number; preview: boolean; value: GoalControl }>();
   private controlRequests = new Map<string, object>();
   private controlReads = new Map<string, { signature: string; promise: Promise<GoalControl> }>();
   private nativeGoalResumes = new Map<string, NativeGoalResume>();
   private goalEditTickets = new Map<string, GoalEditTicket>();
+  private goalActionTickets = new Map<string, GoalActionTicket>();
   constructor(private readonly connect = openLocalHost, private readonly now = Date.now, private readonly automaticTimer = true) {}
   private enqueue<T>(work: () => Promise<T>, report = true): Promise<T> {
     const task = this.queue.then(work);
@@ -95,7 +99,7 @@ export class RecoveryService {
   }
   configure(settings: Preferences): Promise<void> {
     const generation = ++this.generation;
-    this.tickets.clear(); this.goalEditTickets.clear(); clearTimeout(this.timer);
+    this.tickets.clear(); this.goalEditTickets.clear(); this.goalActionTickets.clear(); clearTimeout(this.timer);
     return this.enqueue(async () => {
       if (this.stopped || generation !== this.generation) return;
       if (settings.daemonHome !== this.settings.daemonHome && this.host) { await this.host.close(); this.host = null; }
@@ -112,7 +116,7 @@ export class RecoveryService {
   }
   invalidSettings(): Promise<void> {
     this.validSettings = false;
-    ++this.generation; clearTimeout(this.timer); this.tickets.clear(); this.goalEditTickets.clear();
+    ++this.generation; clearTimeout(this.timer); this.tickets.clear(); this.goalEditTickets.clear(); this.goalActionTickets.clear();
     return this.enqueue(async () => { this.error = "Settings could not be read. Automatic recovery is paused."; if (this.host) await this.host.close(); this.host = null; });
   }
   private scheduleTimer(): void {
@@ -123,6 +127,7 @@ export class RecoveryService {
   observe(event: RecoveryEvent): Promise<void> {
     const at = this.now();
     this.changes.set(event.agent.id, (this.changes.get(event.agent.id) ?? 0) + 1);
+    if (event.kind !== "start" && !(event.kind === "end" && event.outcome.kind === "completed")) this.goalReadBlocks.set(event.agent.id, this.changes.get(event.agent.id)!);
     // Providers can start goal work as the native resume/edit command is handled.
     // Other events and user actions still invalidate the pending operation.
     const resuming = this.nativeGoalResumes.get(event.agent.id);
@@ -430,17 +435,18 @@ export class RecoveryService {
       return { ok: true };
     });
   }
-  goalControl(id: string, fresh = false, inspect = false): Promise<GoalControl> {
+  goalControl(id: string, fresh = false, inspect = false, preview = false): Promise<GoalControl> {
     // History inspection is an explicit action for one opened goal screen.
     // Background mounted-composer checks must never restore a conversation.
-    if (inspect) return this.inspectGoalControl(id, true, true);
+    if (inspect) return this.inspectGoalControl(id, true, true, preview);
     const signature = `${this.generation}:${this.changes.get(id) ?? 0}`;
-    const pending = this.controlReads.get(id);
+    const requestKey = `${id}:${preview}`;
+    const pending = this.controlReads.get(requestKey);
     if (!fresh && pending?.signature === signature) return pending.promise;
-    const promise = this.inspectGoalControl(id, fresh);
+    const promise = this.inspectGoalControl(id, fresh, false, preview);
     const entry = { signature, promise };
-    this.controlReads.set(id, entry);
-    const clear = () => { if (this.controlReads.get(id) === entry) this.controlReads.delete(id); };
+    this.controlReads.set(requestKey, entry);
+    const clear = () => { if (this.controlReads.get(requestKey) === entry) this.controlReads.delete(requestKey); };
     void promise.then(clear, clear);
     return promise;
   }
@@ -450,12 +456,13 @@ export class RecoveryService {
     const { host, generation, changed } = await this.action(async () => ({ host: await this.ready(), generation: this.generation, changed: this.changes.get(id) ?? 0 }));
     const a = await host.fetch(id); this.check(generation);
     if (!a || a.internal || a.archivedAt || !a.workspaceId) throw new RecoveryError("This session is unavailable. Open a current session and try again.");
-    const view: GoalEditorSnapshot = { id, title: a.title, provider: a.provider, supported: false, source: null, objective: null, state: "unknown", tokenBudget: null, tokensUsed: null, ticket: null, note: null };
+    const view: GoalEditorSnapshot = { id, title: a.title, provider: a.provider, supported: false, source: null, objective: null, state: "unknown", tokenBudget: null, tokensUsed: null, ticket: null, note: null, action: null, actionTicket: null, actionNote: null, key: null };
     const details = await host.goalDetails?.(id); this.check(generation);
     if (!details) return { ...view, note: "This provider does not expose a supported goal editor. Use its native goal controls." };
     const source = details.reading.source;
-    if (!source || source === "timeline") return { ...view, note: "The native goal provider could not be verified." };
-    Object.assign(view, { supported: true, source, objective: details.objective, state: details.reading.state, tokenBudget: details.tokenBudget, tokensUsed: details.tokensUsed });
+    Object.assign(view, { objective: details.objective, state: details.reading.state, tokenBudget: details.tokenBudget, tokensUsed: details.tokensUsed, key: details.reading.key });
+    if (!source || source === "timeline") return { ...view, note: "This provider exposes goal history for viewing. Editing and native pause/resume are unavailable through this plugin connection." };
+    Object.assign(view, { supported: true, source, actionNote: source === "claude" ? "Claude does not expose a separate native pause/resume command. Replacing its goal starts a new turn and resets its timer and counters." : null });
     if (details.reading.state === "unknown") return { ...view, note: "The current native goal could not be verified. Check its state in the conversation and reload." };
     if (!details.objective) return { ...view, note: source === "opencode" && !details.reading.modeId ? "Select the registered OpenCode Goal mode and set an objective with /goal <objective>." : "There is no current goal. Set one in the conversation with /goal <objective>." };
     if (!details.reading.key || !["active", "paused", "blocked"].includes(details.reading.state) || details.objective.length > goalLengthLimit(source)) return { ...view, note: "This goal is read-only in its current state. Review completed goals and native limits in the conversation." };
@@ -465,15 +472,82 @@ export class RecoveryService {
     const workspace = await host.workspace(a.workspaceId); this.check(generation);
     if (!workspace || workspace.archived || workspace.archiving || !await host.supportsGoalCommand?.(id, source) || !host.editGoal) return { ...view, note: "Native goal commands are unavailable for this session. Reload it when idle." };
     this.check(generation);
-    if ((this.changes.get(id) ?? 0) !== changed) throw new RecoveryError("The session changed while reading its goal. Reload the editor.");
+    let expected = a, ticketChanged = changed;
+    if ((this.changes.get(id) ?? 0) !== changed) {
+      // An active native goal can naturally finish/start turns during this
+      // read. Keep its text visible and refresh the ticket's session snapshot.
+      // Goal identity/revision is still rechecked by the adapter before writes.
+      if ((this.goalReadBlocks.get(id) ?? -1) > changed) return { ...view, note: "The session changed. Reload to edit or control this goal." };
+      const latest = await host.fetch(id); this.check(generation);
+      const current = this.saved.records[id];
+      const stable = ["id", "provider", "workspaceId", "parentId", "sessionId", "modeId", "lastUserMessageAt"] as const;
+      if ((this.goalReadBlocks.get(id) ?? -1) > changed || !latest || !stable.every((field) => latest[field] === a[field]) || latest.internal || latest.archivedAt ||
+        !goalCommandReady(latest) || current?.humanRequired || current?.reason === "user_stop" || current?.reason === "uncertain_send" ||
+        current?.phase === "sending" || current?.expectingStart || source !== "codex" && busy(latest)) return { ...view, note: "The session changed. Reload to edit or control this goal." };
+      expected = latest; ticketChanged = this.changes.get(id) ?? 0;
+    }
     const ticket = randomUUID(), now = this.now();
     for (const [key, value] of this.goalEditTickets) if (value.expiresAt <= now) this.goalEditTickets.delete(key);
     if (this.goalEditTickets.size >= 100) this.goalEditTickets.delete(this.goalEditTickets.keys().next().value!);
-    this.goalEditTickets.set(ticket, { id, generation, changed, revision: details.revision, expected: a, expiresAt: now + 300_000 });
+    this.goalEditTickets.set(ticket, { id, generation, changed: ticketChanged, revision: details.revision, expected, expiresAt: now + 300_000 });
+    if ((source === "codex" || source === "opencode") && host.controlGoal) {
+      const action: GoalAction = details.reading.state === "active" ? "pause" : "resume", actionTicket = randomUUID();
+      for (const [key, value] of this.goalActionTickets) if (value.expiresAt <= now) this.goalActionTickets.delete(key);
+      if (this.goalActionTickets.size >= 100) this.goalActionTickets.delete(this.goalActionTickets.keys().next().value!);
+      this.goalActionTickets.set(actionTicket, { id, generation, changed: ticketChanged, revision: details.revision, expected, expiresAt: now + 300_000, action, source, key: details.reading.key });
+      Object.assign(view, { action, actionTicket, actionNote: source === "opencode" && action === "resume" ? "OpenCode resume starts a new native turn, token, and time budget window. Review this before resuming."
+        : action === "pause" ? "Pause the native goal's continuation. A current turn may finish before work stops." : "Resume the native goal using its existing limits." });
+    }
     const note = source === "claude" ? "Replacing uses Claude's native /goal command and immediately starts a turn. Claude resets its goal timer, evaluated turn count, and token-spend baseline. Existing session limits are unchanged."
       : source === "opencode" ? "Saving uses OpenCode's native /goal edit command, preserves turn/token/time budgets and history, and starts work on the edited goal. Paused or blocked goals become active."
       : "Saving uses Codex's native /goal command and makes the edited goal active. Goal continuation must be selected again for the new objective.";
     return { ...view, ticket, note };
+  }
+  actOnGoal(input: { ticket: string; confirmBudgetReset?: boolean }): Promise<{ ok: true }> {
+    const parsed = actOnGoalRpc.input.parse(input), ticket = this.goalActionTickets.get(parsed.ticket);
+    this.goalActionTickets.delete(parsed.ticket);
+    return this.action(async () => {
+      this.check(ticket?.generation);
+      if (!ticket || ticket.expiresAt <= this.now()) throw new RecoveryError("These goal controls expired. Reload before trying again.");
+      if (ticket.source === "opencode" && ticket.action === "resume" && !parsed.confirmBudgetReset) throw new RecoveryError("Review and confirm OpenCode's new native budget window before resuming.");
+      const { id, generation, changed } = ticket;
+      const native: NativeGoalResume = { submitted: false, starts: 0 };
+      const guard = () => { this.check(generation); if ((this.changes.get(id) ?? 0) !== changed + native.starts) throw new RecoveryError("The session changed. Reload its goal controls."); };
+      guard(); const host = await this.ready(); guard();
+      const previous = this.saved.records[id];
+      if (!host.controlGoal || this.saved.excluded.includes(id) || previous?.humanRequired || previous?.phase === "sending" || previous?.expectingStart || previous?.reason === "uncertain_send") throw new RecoveryError("Resolve pending input, exclusions, or uncertain delivery before changing this goal.");
+      if (!previous && Object.keys(this.saved.records).length >= 2000) throw new RecoveryError("Too many sessions are being tracked. Review the recovery queue first.");
+      const at = this.now(), messageId = `session-recovery-control-${randomUUID()}`, a = ticket.expected;
+      // Persist intent before handing the command to the provider. A crash or
+      // lost receipt must never turn into an automatic retry or continuation.
+      const intent: RecordEntry = { id, title: a.title, provider: a.provider, workspaceId: a.workspaceId, parentId: a.parentId,
+        turnId: a.activeTurn ?? null, bootKey: host.bootKey, startedAt: at, lastSeenAt: at, phase: "sending", reason: "goal_check", dueAt: null,
+        attempts: previous?.attempts ?? 0, humanRequired: false, pendingIds: [], messageAt: a.lastUserMessageAt, attemptMessageId: messageId,
+        expectingStart: false, revision: (previous?.revision ?? 0) + 1,
+        goal: { key: ticket.key, state: "unknown", selectedKey: null, attempts: previous?.goal?.key === ticket.key ? previous.goal.attempts : 0 } };
+      this.saved.records[id] = intent; await this.persist();
+      this.nativeGoalResumes.set(id, native);
+      try {
+        const reading = await host.controlGoal(id, ticket.revision, ticket.action, a, guard, messageId, () => { native.submitted = true; }); guard();
+        if (reading.key !== ticket.key || reading.state !== (ticket.action === "pause" ? "paused" : "active")) throw new RecoveryError("The native goal action could not be confirmed. Reload and review its state.");
+        intent.goal!.state = reading.state;
+        if (previous) {
+          // Native controls clear only fallback goal selection. Preserve an
+          // independently tracked interruption, current turn, or user stop.
+          this.saved.records[id] = { ...previous, goal: intent.goal, revision: intent.revision + 1 };
+          if (previous.reason.startsWith("goal_")) this.set(this.saved.records[id], "completed", ticket.action === "pause" ? "goal_paused" : "goal_unselected");
+        } else this.set(intent, "completed", ticket.action === "pause" ? "goal_paused" : "goal_unselected");
+        await this.persist(); return { ok: true };
+      } catch (error) {
+        if (native.submitted || (this.changes.get(id) ?? 0) !== changed) this.review(intent, native.submitted ? "uncertain_send" : "goal_check");
+        else if (previous) this.saved.records[id] = previous;
+        else delete this.saved.records[id];
+        await this.persist(); throw error;
+      } finally {
+        this.nativeGoalResumes.delete(id); this.controls.delete(id);
+        this.changes.set(id, (this.changes.get(id) ?? 0) + 1);
+      }
+    });
   }
   editGoal(input: { ticket: string; objective: string }): Promise<{ ok: true }> {
     const { ticket: token, objective } = editGoalInput.parse(input);
@@ -513,25 +587,34 @@ export class RecoveryService {
       }
     });
   }
-  private inspectGoalControl(id: string, fresh: boolean, inspect = false): Promise<GoalControl> {
+  private inspectGoalControl(id: string, fresh: boolean, inspect = false, preview = false): Promise<GoalControl> {
     // Passive discovery must not hold up recovery actions while a provider is slow.
     const request = {}; this.controlRequests.set(id, request);
     return (async () => {
       const { host, generation, changed } = await this.action(async () => ({ host: await this.ready(), generation: this.generation, changed: this.changes.get(id) ?? 0 }));
       const cached = this.controls.get(id);
-      if (!fresh && cached && cached.generation === generation && cached.changed === changed && this.now() - cached.at < (cached.value.visible ? 15_000 : 300_000)) return cached.value;
+      if (!fresh && cached && (!preview || cached.preview) && cached.generation === generation && cached.changed === changed && this.now() - cached.at < (cached.value.visible ? 15_000 : 300_000)) return cached.value;
       const a = await host.fetch(id); this.check(generation);
       const r = this.saved.records[id];
       const value: GoalControl = { id, workspaceId: a?.workspaceId ?? null, visible: false, state: null, key: null, selected: false, canSelect: false,
         automatic: this.settings.enabled && this.settings.continueGoals, attempts: 0, maxAttempts: this.settings.goalMaxAttempts, delaySeconds: this.settings.goalDelaySeconds, note: null };
       if (a && !a.internal && !a.archivedAt && a.workspaceId) {
-        let reading = await host.goal?.(id, { allowTimeline: inspect }) ?? { state: "unknown" as const, key: null, evidence: false }; this.check(generation);
+        // Only mounted composers ask for previews. Native readers do not restore
+        // a conversation. Timeline-only providers stay behind explicit inspection.
+        const details = preview ? await host.goalDetails?.(id, { allowTimeline: false }) : null;
+        let reading = details?.reading ?? await host.goal?.(id, { allowTimeline: inspect }) ?? { state: "unknown" as const, key: null, evidence: false }; this.check(generation);
         const snapshotOnly = reading.source === "timeline" && !reading.evidence && reading.state === "unknown" && !!r?.goal?.selectedKey;
         // 선택된 비네이티브 Goal은 마지막 검사 결과로 해제 버튼을 유지한다.
         // 이 표시 결과는 자동 전송이나 새 Goal 선택의 증거로 쓰지 않는다.
         if (snapshotOnly) reading = { ...reading, state: r!.goal!.state, key: r!.goal!.key };
         // Inspection never opts a session in, schedules a turn, or writes a recovery record.
         if ((this.changes.get(id) ?? 0) !== changed) { value.note = "The session changed while checking its goal. Try again."; return value; }
+        if (preview) {
+          value.objective = details?.objective ?? null; value.source = reading.source ?? null;
+          value.nativeAction = !this.saved.excluded.includes(id) && !r?.humanRequired && r?.reason !== "uncertain_send" && r?.phase !== "sending" && !r?.expectingStart &&
+            goalCommandReady(a) && (reading.source === "codex" || reading.source === "opencode" && !busy(a)) && !!reading.key
+            ? reading.state === "active" ? "pause" : ["paused", "blocked"].includes(reading.state) ? "resume" : null : null;
+        }
         const terminal = reading.state === "complete" || reading.state === "cleared";
         const selected = !terminal && !!r?.goal?.selectedKey && (!reading.key || r.goal.selectedKey === reading.key);
         value.visible = !terminal && (reading.evidence && !!reading.key || selected);
@@ -556,7 +639,7 @@ export class RecoveryService {
       }
       if (this.controlRequests.get(id) === request) {
         if (this.controls.size >= 2000) this.controls.delete(this.controls.keys().next().value!);
-        this.controls.set(id, { at: this.now(), generation, changed, value });
+        this.controls.set(id, { at: this.now(), generation, changed, preview, value });
       }
       return value;
     })().finally(() => { if (this.controlRequests.get(id) === request) this.controlRequests.delete(id); });
@@ -605,7 +688,7 @@ export class RecoveryService {
       rows: filtered.slice(page * 30, page * 30 + 30), total: filtered.length, page, history: [...this.saved.history].reverse().slice(0, 30) };
   }
   async stop(): Promise<void> {
-    this.stopped = true; ++this.generation; clearTimeout(this.timer); this.tickets.clear(); this.goalEditTickets.clear(); await this.queue;
+    this.stopped = true; ++this.generation; clearTimeout(this.timer); this.tickets.clear(); this.goalEditTickets.clear(); this.goalActionTickets.clear(); await this.queue;
     const host = this.host; if (!host) return;
     try {
       if (!this.fatal && !await host.shuttingDown()) { for (const r of Object.values(this.saved.records)) if (["watching", "waiting"].includes(r.phase)) this.review(r, r.humanRequired ? "input" : "monitor_gap"); await this.persist(); }

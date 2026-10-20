@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { readGoal, type GoalDetails, type GoalReading } from "./goals";
 import { goalObjectiveError } from "../shared/goal-editor";
+import type { GoalAction } from "../shared/goal-actions";
 
 export type CodexGoalDetails = GoalDetails;
 
@@ -96,7 +97,8 @@ export class CodexGoalConnection {
       createdAt: goal.createdAt ?? goal.created_at ?? null, tokenBudget: goal.tokenBudget ?? null,
     })).digest("hex");
     const count = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
-    return { reading: this.decode(data), objective, revision, tokenBudget: count(goal.tokenBudget), tokensUsed: count(goal.tokensUsed) };
+    const identity = createHash("sha256").update(JSON.stringify({ id: goal.id ?? null, objective, createdAt: goal.createdAt ?? goal.created_at ?? null, tokenBudget: goal.tokenBudget ?? null })).digest("hex");
+    return { reading: this.decode(data), objective, revision, identity, tokenBudget: count(goal.tokenBudget), tokensUsed: count(goal.tokensUsed) };
   }
   async edit(threadId: string, revision: string, objective: string, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
     const invalid = goalObjectiveError(objective); if (invalid) throw new Error(invalid);
@@ -121,6 +123,22 @@ export class CodexGoalConnection {
       await new Promise((resolve) => setTimeout(resolve, 250)); check();
     }
     throw new Error("Codex has not confirmed the edited goal. Check the conversation and reload the editor before trying again.");
+  }
+  async control(threadId: string, revision: string, action: GoalAction, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
+    const before = await this.details(threadId); check();
+    if (before.revision !== revision || !before.reading.key || !before.objective ||
+      !(action === "pause" ? before.reading.state === "active" : ["paused", "blocked"].includes(before.reading.state))) throw new Error("The goal changed. Reload its controls before trying again.");
+    if (action === "resume" && (before.tokensUsed === null || before.tokenBudget !== null && (before.tokenBudget <= 0 || before.tokensUsed >= before.tokenBudget))) throw new Error("Review the native goal budget before resuming.");
+    await send(); check();
+    for (let n = 0; n < 20; n++) {
+      const after = await this.details(threadId); check();
+      if (after.identity !== before.identity || after.reading.key !== before.reading.key || after.objective !== before.objective || after.tokenBudget !== before.tokenBudget ||
+        before.tokensUsed !== null && (after.tokensUsed === null || after.tokensUsed < before.tokensUsed)) throw new Error("The goal identity or budget changed. Reload before trying again.");
+      if (after.reading.state === (action === "pause" ? "paused" : "active")) return after.reading;
+      if (!["active", "paused", "blocked"].includes(after.reading.state)) break;
+      await new Promise((resolve) => setTimeout(resolve, 250)); check();
+    }
+    throw new Error("Codex has not confirmed the goal action. Check the conversation and reload before trying again.");
   }
   private async get(threadId: string): Promise<Record<string, unknown>> {
     await this.start();
@@ -212,6 +230,11 @@ export class CodexGoals {
     try { reader = await this.reader(provider); } catch { throw new Error("Codex goal commands could not be initialized. Check the provider configuration."); }
     if (!reader) throw new Error("Goal editing is currently supported for native Codex sessions.");
     return reader.edit(threadId, revision, objective, check, send);
+  }
+  async control(provider: string, threadId: string, revision: string, action: GoalAction, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
+    const reader = await this.reader(provider);
+    if (!reader) throw new Error("Native goal controls are unavailable for this provider.");
+    return reader.control(threadId, revision, action, check, send);
   }
   async close(): Promise<void> { this.closed = true; for (const { reader } of this.readers.values()) await reader.close(); this.readers.clear(); }
 }

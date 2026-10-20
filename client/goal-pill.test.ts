@@ -1,110 +1,113 @@
-import type { PluginClientContext } from "@getpaseo/plugin/client";
+import type { PluginButton, PluginButtonIconProps, PluginClientContext } from "@getpaseo/plugin/client";
+import type { FunctionComponent, ReactElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { goalControlRpc, unwatchGoalRpc, watchGoalRpc, type GoalControl } from "../shared/contracts";
+import { actOnGoalRpc } from "../shared/goal-actions";
+import { readGoalRpc } from "../shared/goal-editor";
 import { contributeGoalPills } from "./goal-pill";
+import { goalErrorText, goalPreviewLabel } from "./goal-presentation";
 vi.mock("./goal-pill-icon", () => ({ GoalPillIcon: () => null }));
+vi.mock("./goal-editor", () => ({ GoalEditorContent: () => null }));
 
-const agent = { id: "session", workspaceId: "workspace", status: "idle" };
+const agent = { id: "session", workspaceId: "workspace", status: "idle", provider: "codex" };
 let cleanup: (() => void) | undefined;
 afterEach(() => { cleanup?.(); cleanup = undefined; vi.useRealTimers(); vi.restoreAllMocks(); });
-async function fixture() {
-  let goal: GoalControl = { id: agent.id, workspaceId: agent.workspaceId, visible: true, state: "active", key: "old-goal", selected: false, canSelect: true,
-    automatic: true, attempts: 0, maxAttempts: 10, delaySeconds: 60, note: null };
+async function fixture(patch: Partial<GoalControl> = {}) {
+  let goal: GoalControl = { id: agent.id, workspaceId: agent.workspaceId, visible: true, state: "active", key: "current-goal", selected: false, canSelect: true,
+    automatic: false, attempts: 0, maxAttempts: 10, delaySeconds: 60, note: null, objective: "Finish the fixture", source: "codex", nativeAction: "pause", ...patch };
+  let editor: Record<string, unknown> = {};
+  const buttons = new Map<string, PluginButton>();
   const update = vi.fn(), remove = vi.fn();
   let snapshot!: (value: { entries: Array<{ agent: typeof agent }> }) => void;
   const subscription = { subscribe: vi.fn((handlers) => { snapshot = handlers.snapshot; }) };
   const list = vi.fn(async () => ({ subscription }));
-  const rpc = vi.fn(async (contract, input) => {
+  const rpc = vi.fn(async (contract) => {
     if (contract === goalControlRpc) return { ...goal };
-    if (contract === watchGoalRpc) { goal = { ...goal, selected: true }; return { ok: true }; }
-    if (contract === unwatchGoalRpc) { goal = { ...goal, selected: false }; return { ok: true }; }
+    if (contract === readGoalRpc) return { key: goal.key, source: goal.source, action: goal.nativeAction, actionTicket: "one-use", ...editor };
+    if (contract === actOnGoalRpc) { goal = { ...goal, state: goal.nativeAction === "pause" ? "paused" : "active", nativeAction: goal.nativeAction === "pause" ? "resume" : "pause" }; return { ok: true }; }
     throw new Error("Unexpected RPC");
   });
-  const addComposerPill = vi.fn((_pill: Parameters<PluginClientContext["addComposerPill"]>[0]) => ({ update, remove }));
+  const addComposerPill = vi.fn((pill: Parameters<PluginClientContext["addComposerPill"]>[0]) => {
+    buttons.set(pill.id, pill.button);
+    return { update: (value: Partial<PluginButton>) => { update(value); buttons.set(pill.id, { ...buttons.get(pill.id)!, ...value }); }, remove };
+  });
   const client = { rpc, addComposerPill, paseo: { agents: { list } } } as unknown as PluginClientContext;
   cleanup = contributeGoalPills(client);
   await vi.waitFor(() => expect(snapshot).toBeTypeOf("function"));
   snapshot({ entries: [{ agent }] });
-  await vi.waitFor(() => expect(addComposerPill).toHaveBeenCalledOnce());
-  const behavior = addComposerPill.mock.calls[0][0].button.behavior;
-  if (behavior.kind !== "action") throw new Error("The goal pill must be a direct action");
-  return { list, rpc, update, press: behavior.onPress, set: (patch: Partial<GoalControl>) => { goal = { ...goal, ...patch }; } };
+  expect(rpc).not.toHaveBeenCalled();
+  const icon = buttons.get("goal-continuation")!.icon;
+  if (typeof icon !== "function") throw new Error("Goal mount observer missing");
+  ((icon as FunctionComponent<PluginButtonIconProps>)({} as PluginButtonIconProps) as ReactElement<{ observe(): () => void }>).props.observe();
+  await vi.waitFor(() => expect(rpc).toHaveBeenCalled());
+  await vi.waitFor(() => expect(buttons.get("goal-continuation")?.label).toBe(goalPreviewLabel(goal)));
+  const press = async () => {
+    const behavior = buttons.get("goal-playback")?.behavior;
+    if (behavior?.kind !== "action") throw new Error("Native playback action missing");
+    await behavior.onPress();
+  };
+  return { list, rpc, buttons, update, remove, press, set: (value: Partial<GoalControl>) => { goal = { ...goal, ...value }; }, setEditor: (value: Record<string, unknown>) => { editor = value; } };
 }
-describe("direct goal toggle", () => {
-  it.each(["omp", "claude", "opencode", "codex"])("%s 조회가 끝나기 전에도 Goal 진입을 만들고 눌러도 이어가기를 선택하지 않는다", async (provider) => {
-    const openScreen = vi.fn(), rpc = vi.fn(() => new Promise(() => {}));
-    const addComposerPill = vi.fn(() => ({ update: vi.fn(), remove: vi.fn() }));
+
+describe("목표 미리보기와 네이티브 재생 제어", () => {
+  it("본문을 정규화해 줄이고 상태는 추가 이어가기 선택과 독립적으로 표시한다", () => {
+    const base = { state: "active", objective: "한글🙂\n".repeat(40), selected: false, automatic: false } as GoalControl;
+    const label = goalPreviewLabel(base);
+    expect(label).toMatch(/^한글🙂 /); expect(label.endsWith("…")).toBe(true); expect(label).not.toContain("\n");
+    expect(label).not.toContain("Off"); expect(label).not.toContain("�");
+    expect(goalPreviewLabel(null)).toBe("Goal");
+  });
+  it("전송 계층의 requestType와 code는 사용자 오류 문구에 노출하지 않는다", () => {
+    expect(goalErrorText(new Error("Request failed: The session changed while reading its goal.\nrequestType=plugin.rpc.invoke.request\ncode=handler_error"))).toBe("Changed. Reload.");
+  });
+  it.each(["omp", "claude", "opencode", "codex"])("%s는 조회 전에 편집 시트 진입을 등록하고 전체 Goal RPC를 보내지 않는다", async (provider) => {
+    const rpc = vi.fn(() => new Promise(() => {})), addComposerPill = vi.fn(() => ({ update: vi.fn(), remove: vi.fn() }));
     const subscription = { subscribe: vi.fn((handlers) => handlers.snapshot({ entries: [{ agent: { ...agent, provider } }] })) };
-    const client = { openScreen, rpc, addComposerPill, paseo: { agents: { list: vi.fn(async () => ({ subscription })) } } } as unknown as PluginClientContext;
-    cleanup = contributeGoalPills(client);
+    cleanup = contributeGoalPills({ rpc, addComposerPill, paseo: { agents: { list: vi.fn(async () => ({ subscription })) } } } as unknown as PluginClientContext);
     await vi.waitFor(() => expect(addComposerPill).toHaveBeenCalledOnce());
     const entry = addComposerPill.mock.calls[0] as unknown as [Parameters<PluginClientContext["addComposerPill"]>[0]];
-    const behavior = entry[0].button.behavior;
-    if (behavior.kind !== "action") throw new Error("조회 진입은 단일 동작이어야 함");
-    await behavior.onPress();
-    expect(openScreen).toHaveBeenCalledExactlyOnceWith({ screenId: "goal", params: { agentId: agent.id } });
-    expect(rpc).not.toHaveBeenCalled();
+    expect(entry[0].button.behavior.kind).toBe("popover"); expect(rpc).not.toHaveBeenCalled();
   });
-  it("retries a failed initial directory lookup and stops retrying after cleanup", async () => {
-    vi.useFakeTimers(); const errors = vi.spyOn(console, "error").mockImplementation(() => {});
-    const goal: GoalControl = { id: agent.id, workspaceId: agent.workspaceId, visible: true, state: "active", key: "goal", selected: false, canSelect: true,
-      automatic: true, attempts: 0, maxAttempts: 10, delaySeconds: 60, note: null };
-    const addComposerPill = vi.fn(() => ({ update: vi.fn(), remove: vi.fn() }));
-    const subscription = { subscribe: vi.fn((handlers) => handlers.snapshot({ entries: [{ agent }] })) };
-    const list = vi.fn().mockRejectedValueOnce(new Error("Mobile connection interrupted")).mockResolvedValue({ subscription });
-    const client = { rpc: vi.fn(async () => goal), addComposerPill, paseo: { agents: { list } } } as unknown as PluginClientContext;
-    cleanup = contributeGoalPills(client); await vi.advanceTimersByTimeAsync(0);
-    expect(list).toHaveBeenCalledOnce(); expect(list.mock.calls[0][0].signal.aborted).toBe(true);
-    await vi.advanceTimersByTimeAsync(5000); expect(list).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(5000); expect(list).toHaveBeenCalledTimes(2); expect(addComposerPill).toHaveBeenCalledOnce();
-    cleanup(); cleanup = undefined; await vi.advanceTimersByTimeAsync(10_000);
-    expect(list.mock.calls[1][0].signal.aborted).toBe(true); expect(list).toHaveBeenCalledTimes(2); errors.mockRestore();
+  it("목표 문구는 편집 시트를 열며 이어가기를 켜거나 끄지 않는다", async () => {
+    const f = await fixture();
+    expect(f.buttons.get("goal-continuation")).toMatchObject({ label: "Finish the fixture", behavior: { kind: "popover" } });
+    expect(f.rpc).toHaveBeenCalledExactlyOnceWith(goalControlRpc, { id: agent.id, fresh: true, preview: true });
+    expect(f.rpc.mock.calls.some(([contract]) => contract === watchGoalRpc || contract === unwatchGoalRpc)).toBe(false);
   });
-  it("uses the complete active directory instead of the default first 200 sessions", async () => {
+  it("일시정지는 최신 Goal을 다시 확인해 네이티브 명령을 한 번만 요청한다", async () => {
+    const f = await fixture(); await f.press();
+    expect(f.rpc).toHaveBeenCalledWith(readGoalRpc, { id: agent.id });
+    expect(f.rpc).toHaveBeenCalledWith(actOnGoalRpc, { ticket: "one-use", confirmBudgetReset: false });
+    expect(f.rpc.mock.calls.filter(([contract]) => contract === actOnGoalRpc)).toHaveLength(1);
+    expect(f.buttons.get("goal-playback")).toMatchObject({ icon: "Play", label: "Resume" });
+  });
+  it.each([{ key: "replacement-goal" }, { action: "resume" }, { actionTicket: null, note: "Waiting for approval" }])("오래되거나 막힌 제어 %j는 다른 목표에 전송하지 않는다", async (editor) => {
+    const f = await fixture(); f.setEditor(editor); await expect(f.press()).rejects.toThrow();
+    expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc)).toBe(false);
+  });
+  it("확인되지 않은 제어 명령을 자동 재시도하지 않는다", async () => {
+    const f = await fixture(); f.rpc.mockImplementationOnce(async () => ({ key: "current-goal", source: "codex", action: "pause", actionTicket: "one-use" }));
+    f.rpc.mockImplementationOnce(async () => { throw new Error("Receipt lost"); });
+    await expect(f.press()).rejects.toThrow("Couldn’t confirm. Reload."); expect(f.rpc.mock.calls.filter(([contract]) => contract === actOnGoalRpc)).toHaveLength(1);
+  });
+  it("OpenCode 재개는 새 예산을 설명하는 편집 시트를 연다", async () => {
+    const f = await fixture({ source: "opencode", state: "paused", nativeAction: "resume" });
+    expect(f.buttons.get("goal-playback")).toMatchObject({ icon: "Play", label: "Resume", behavior: { kind: "popover" } });
+    expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc)).toBe(false);
+  });
+  it.each(["claude", "timeline"] as const)("%s의 미지원 제어를 재생이나 일시정지로 표시하지 않는다", async (source) => {
+    const f = await fixture({ source, nativeAction: null }); expect(f.buttons.has("goal-playback")).toBe(false);
+  });
+  it("전체 디렉터리는 등록에 사용하고 기본 첫 200개로 잘리지 않는다", async () => {
     const f = await fixture(); expect(f.list).toHaveBeenCalledWith(expect.objectContaining({ scope: "active", sync: {}, subscribe: {} }));
   });
-  it("switches on and off directly without a popover", async () => {
-    const f = await fixture(); await f.press();
-    expect(f.rpc).toHaveBeenCalledWith(watchGoalRpc, { id: agent.id, key: "old-goal", resetAttempts: false, resumeBlocked: true });
-    expect(f.update).toHaveBeenLastCalledWith(expect.objectContaining({ label: "Goal · On" }));
-    await f.press(); expect(f.rpc).toHaveBeenCalledWith(unwatchGoalRpc, { id: agent.id });
-    expect(f.update).toHaveBeenLastCalledWith(expect.objectContaining({ label: "Goal · Off" }));
-  });
-  it("reads the current objective again before selecting it", async () => {
-    const f = await fixture(); f.set({ key: "new-goal" }); await f.press();
-    expect(f.rpc).toHaveBeenCalledWith(watchGoalRpc, { id: agent.id, key: "new-goal", resetAttempts: false, resumeBlocked: true });
-  });
-  it("allows a selected but unverifiable goal to be turned off", async () => {
-    const f = await fixture(); f.set({ state: "unknown", selected: true, canSelect: false, key: null }); await f.press();
-    expect(f.rpc).toHaveBeenCalledWith(unwatchGoalRpc, { id: agent.id });
-  });
-  it("does not select an unavailable goal", async () => {
-    const f = await fixture(); f.set({ visible: false, canSelect: false, key: null });
-    await expect(f.press()).rejects.toThrow(/unavailable/);
-    expect(f.rpc.mock.calls.some(([contract]) => contract === watchGoalRpc || contract === unwatchGoalRpc)).toBe(false);
-  });
-  it("rechecks a transient goal lookup once without repeating the selection", async () => {
-    const f = await fixture();
-    f.rpc.mockImplementationOnce(async (contract) => {
-      expect(contract).toBe(goalControlRpc);
-      return { id: agent.id, workspaceId: agent.workspaceId, visible: false, state: null, key: null, selected: false, canSelect: false,
-        automatic: true, attempts: 0, maxAttempts: 10, delaySeconds: 60, note: "The session changed while checking its goal. Try again." };
-    });
-    await f.press();
-    expect(f.rpc.mock.calls.filter(([contract]) => contract === watchGoalRpc)).toHaveLength(1);
-    expect(f.update).toHaveBeenLastCalledWith(expect.objectContaining({ label: "Goal · On" }));
-  });
-  it("shows the actual selection blocker without retrying a command", async () => {
-    const f = await fixture(); f.set({ canSelect: false, note: "A previous continuation has uncertain delivery." });
-    await expect(f.press()).rejects.toThrow("A previous continuation has uncertain delivery.");
-    expect(f.rpc.mock.calls.some(([contract]) => contract === watchGoalRpc || contract === unwatchGoalRpc)).toBe(false);
-  });
-  it.each([
-    [{ state: "blocked" }, "Blocked"], [{ state: "paused" }, "Paused"], [{ state: "limited" }, "Limit"],
-    [{ state: "unknown" }, "Review"], [{ state: "active", holdReason: "input" }, "Waiting"],
-    [{ state: "active", automatic: false }, "Paused"], [{ state: "active", attempts: 10 }, "Limit"],
-  ] as const)("shows a compact %j hold without calling it On", async (patch, text) => {
-    const f = await fixture(); f.set(patch); await f.press();
-    expect(f.update).toHaveBeenLastCalledWith(expect.objectContaining({ label: `Goal · ${text}` }));
+  it("초기 연결 실패 시 관찰을 정리하고 재시도하며 종료 후에는 멈춘다", async () => {
+    vi.useFakeTimers(); vi.spyOn(console, "error").mockImplementation(() => {});
+    const subscription = { subscribe: vi.fn() }, list = vi.fn().mockRejectedValueOnce(new Error("Disconnected")).mockResolvedValue({ subscription });
+    cleanup = contributeGoalPills({ rpc: vi.fn(), addComposerPill: vi.fn(), paseo: { agents: { list } } } as unknown as PluginClientContext);
+    await vi.advanceTimersByTimeAsync(0); expect(list.mock.calls[0][0].signal.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(5000); expect(list).toHaveBeenCalledTimes(2);
+    cleanup(); cleanup = undefined; await vi.advanceTimersByTimeAsync(10_000);
+    expect(list.mock.calls[1][0].signal.aborted).toBe(true); expect(list).toHaveBeenCalledTimes(2);
   });
 });

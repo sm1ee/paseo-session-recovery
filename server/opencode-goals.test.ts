@@ -83,6 +83,25 @@ describe("read-only OpenCode goal snapshots", () => {
     agent = { provider: "opencode", cwd, currentModeId: "goal", availableModes: [mode], persistence: { sessionId } } as PaseoAgent;
   });
   afterEach(async () => { await rm(home, { recursive: true, force: true }); });
+  it("사용자가 요청한 재개만 새 네이티브 예산 창으로 확인한다", async () => {
+    const before = await reader.details(agent), data = JSON.parse(await readFile(path, "utf8"));
+    const send = vi.fn(async () => { data.goals[0] = { ...data.goals[0], stopped: false, stopReason: "", turnCount: 0, totalTokens: 0, startedAt: Date.now() + 1 }; await writeFile(path, JSON.stringify(data)); });
+    expect(await reader.control(agent, before!.revision, "resume", () => {}, send)).toMatchObject({ state: "active", key: before!.reading.key });
+    expect(send).toHaveBeenCalledOnce();
+  });
+  it("일시정지는 기존 예산 창과 사용량을 보존해야 한다", async () => {
+    const data = JSON.parse(await readFile(path, "utf8")); data.goals[0].stopped = false; data.goals[0].stopReason = ""; await writeFile(path, JSON.stringify(data));
+    const before = await reader.details(agent), send = vi.fn(async () => { data.goals[0].stopped = true; data.goals[0].stopReason = "paused"; await writeFile(path, JSON.stringify(data)); });
+    expect(await reader.control(agent, before!.revision, "pause", () => {}, send)).toMatchObject({ state: "paused" }); expect(send).toHaveBeenCalledOnce();
+    data.goals[0].stopped = false; await writeFile(path, JSON.stringify(data)); const current = await reader.details(agent);
+    const reset = vi.fn(async () => { data.goals[0].stopped = true; data.goals[0].totalTokens = 0; await writeFile(path, JSON.stringify(data)); });
+    await expect(reader.control(agent, current!.revision, "pause", () => {}, reset)).rejects.toThrow(/budget changed/);
+  });
+  it("다른 목표나 불확실한 제어를 재전송하지 않는다", async () => {
+    const before = await reader.details(agent), send = vi.fn(async () => { throw new Error("Receipt lost"); });
+    await expect(reader.control(agent, "old-revision", "resume", () => {}, send)).rejects.toThrow(/changed/); expect(send).not.toHaveBeenCalled();
+    await expect(reader.control(agent, before!.revision, "resume", () => {}, send)).rejects.toThrow("Receipt lost"); expect(send).toHaveBeenCalledOnce();
+  });
   it("reads the native session shard without changing its state or creating a lease", async () => {
     const before = await readFile(path, "utf8"), info = await lstat(path);
     expect(await reader.read(agent)).toMatchObject({ state: "paused", modeId: "goal", key: expect.any(String) });

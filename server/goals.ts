@@ -5,6 +5,7 @@ export type GoalSource = "codex" | "opencode" | "claude";
 export interface GoalReading { state: GoalState; key: string | null; evidence: boolean; modeId?: string; source?: GoalSource | "timeline"; nativeContinuation?: boolean }
 export interface GoalDetails {
   reading: GoalReading; objective: string | null; revision: string;
+  identity?: string;
   tokenBudget: number | null; tokensUsed: number | null;
 }
 export interface GoalItem { type: string; [key: string]: unknown }
@@ -43,15 +44,18 @@ function result(value: unknown, depth = 0): Record<string, unknown> | null {
   }
   return null;
 }
-export function readGoal(items: readonly GoalItem[]): GoalReading {
+function goalSnapshot(items: readonly GoalItem[]): GoalDetails {
   let reading: GoalReading = { state: "unknown", key: null, evidence: false };
   let identity: Record<string, unknown> = {};
+  let tokenBudget: number | null = null, tokensUsed: number | null = null;
   let command: string | null = null;
   const update = (data: Record<string, unknown>, fallback: Record<string, unknown> = {}, reset = false) => {
     let state = status(data.status);
-    const tokenBudget = data.tokenBudget ?? data.token_budget;
-    const tokensUsed = data.tokensUsed ?? data.tokens_used;
-    if (state === "active" && typeof tokenBudget === "number" && tokenBudget > 0 && typeof tokensUsed === "number" && tokensUsed >= tokenBudget) state = "limited";
+    const budget = data.tokenBudget ?? data.token_budget, used = data.tokensUsed ?? data.tokens_used;
+    if (reset) { tokenBudget = null; tokensUsed = null; }
+    if (typeof budget === "number" && Number.isFinite(budget) && budget >= 0) tokenBudget = budget;
+    if (typeof used === "number" && Number.isFinite(used) && used >= 0) tokensUsed = used;
+    if (state === "active" && tokenBudget !== null && tokenBudget > 0 && tokensUsed !== null && tokensUsed >= tokenBudget) state = "limited";
     const next: Record<string, unknown> = reset ? {} : { ...identity };
     for (const key of ["id", "objective", "createdAt", "created_at"]) {
       const value = data[key] ?? fallback[key];
@@ -103,5 +107,11 @@ export function readGoal(items: readonly GoalItem[]): GoalReading {
     const found = result(detail?.output ?? (detail?.type === "plain_text" ? detail.text : undefined));
     update(found ?? { status: "unknown" }, name === "create_goal" || input.op === "create" ? input : {}, name === "create_goal" || input.op === "create");
   }
-  return reading;
+  const objective = !["unknown", "cleared"].includes(reading.state) && typeof identity.objective === "string" && identity.objective.trim() ? identity.objective : null;
+  return { reading, objective, tokenBudget, tokensUsed, revision: createHash("sha256").update(JSON.stringify({ identity, state: reading.state, tokenBudget })).digest("hex") };
+}
+export function readGoal(items: readonly GoalItem[]): GoalReading { return goalSnapshot(items).reading; }
+export function readGoalDetails(items: readonly GoalItem[]): GoalDetails {
+  const details = goalSnapshot(items);
+  return { ...details, reading: { ...details.reading, source: "timeline" } };
 }
