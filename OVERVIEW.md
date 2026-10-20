@@ -1,5 +1,7 @@
 session-recovery tracks running Paseo turns and continues unfinished sessions after the daemon restarts. It starts tracking with the next observed turn. Existing idle sessions are left alone.
 
+![Recovery dashboard](assets/dashboard.png)
+
 Automatic recovery is on by default for main sessions, with a 60-second delay, up to three attempts per interruption, and a 24-hour recovery window. The delay doubles after each attempt, up to 15 minutes. Subagent recovery and retries for recognized temporary provider errors can be enabled separately.
 
 The recovery screen shows scheduled continuations, sessions that need review, exclusions, and recent activity. You can preview a continuation before sending it manually, dismiss a candidate, or exclude a session from future recovery. Stopped turns, completed turns, questions, and approvals are excluded from automatic recovery. Uncertain delivery requires checking the conversation.

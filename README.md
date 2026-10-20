@@ -2,6 +2,8 @@
 
 Continue interrupted Paseo sessions after a daemon restart. The plugin records observed turns and sends a continuation to unfinished sessions after a delay. It does not wake old idle sessions on installation.
 
+![Recovery dashboard](assets/dashboard.png)
+
 ## Defaults
 
 | Setting | Default |

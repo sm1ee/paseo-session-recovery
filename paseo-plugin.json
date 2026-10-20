@@ -3,7 +3,7 @@
   "name": "session-recovery",
   "description": "Track interrupted sessions and resume unfinished work after a daemon restart.",
   "build": [["npm", "ci", "--ignore-scripts", "--omit=dev"]],
-  "media": [],
+  "media": ["assets/dashboard.png"],
   "requirements": {
     "paseo": ">=0.11.4 <0.12.0"
   }
