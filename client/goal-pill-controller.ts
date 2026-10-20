@@ -75,7 +75,14 @@ export function createGoalPillController(read: (id: string, fresh: boolean) => P
           const fresh = target.fresh; target.fresh = false;
           target.nextCheck = now() + (target.agent.status === "running" || target.pill ? 15_000 : 60_000);
           const revision = target.revision + 1;
-          try { await refresh(id, fresh); }
+          try {
+            const value = await refresh(id, fresh);
+            // Goal이 없는 대화는 목록 변경 전까지 자주 재조회하지 않는다.
+            // 느린 요청의 완료 직후 같은 대화를 다시 읽는 루프도 방지한다.
+            if (targets.get(id) === target && target.revision === revision && !target.fresh) {
+              target.nextCheck = now() + (value.visible ? 15_000 : 300_000);
+            }
+          }
           catch {
             // A failed lookup must not leave an actionable stale control behind.
             if (targets.get(id) === target && target.revision === revision) { target.pill?.remove(); target.pill = undefined; }

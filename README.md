@@ -24,6 +24,8 @@ The delay doubles after each attempt, up to 15 minutes. Attempt counts survive d
 
 Open **session-recovery** in the sidebar. Settings are in the upper-right corner and under Paseo's plugin settings.
 
+The sidebar shortcut is hidden in the iOS and Android apps. Use **Open session-recovery** in the Command Center to open it there. The per-session Goal toggle remains available.
+
 - **Recovery queue:** scheduled continuations and interruptions that need review.
 - **Watching:** observed turns, including pending user input.
 - **Goals:** recorded goal states and their continuation counts.
@@ -61,6 +63,8 @@ OpenCode already has its own goal loop. This toggle controls Paseo's fallback me
 OpenCode state is read from `<session cwd>/.opencode/goals/state.json.sessions/<hashed native session ID>/state.json`, or the corresponding location under `OPENCODE_GOAL_STATE_PATH` in the provider environment. Custom providers extending OpenCode are supported. Snapshots are bounded to 2 MiB and checked against the native lifecycle ledger's modification time. Missing, changed, malformed, unsupported, or outdated snapshots require review. Persistence must be enabled. Legacy global state and JavaScript-only `stateFilePath` overrides are not discovered; expose a custom location through `OPENCODE_GOAL_STATE_PATH`. The upstream source and state format were used as the integration reference; the reader does not import or execute the upstream plugin.
 
 For OMP, the plugin reads structured `goal` tool results and Paseo's `omp_goal_updated` timeline records. It also reads structured `create_goal`, `get_goal`, and `update_goal` results, including compatible Pi goal extensions. Detection depends on the provider exposing these records in Paseo. Ordinary chat text, plans, and to-do lists are not treated as goals. Conversation inspection is bounded to the most recent 2,000 canonical timeline entries; an unverifiable state requires review.
+
+Automatic composer discovery reads native goal state only and never restores a conversation to find a goal. For OMP and other providers that expose goals through conversation records, use **Continue this session's goal** in the Command Center to inspect and select one explicitly. Selected goals keep their automatic checks before continuation. Their composer toggle can show the last checked state without loading the conversation. Concurrent background checks for the same session share a result; sessions without a visible goal are checked again after five minutes or a relevant session change.
 
 Paused, blocked, completed, cleared, and limited goals are not automatically resumed. Only an explicit toggle-on action can reactivate a blocked Codex goal. Questions, approvals, direct stops, exclusions, and uncertain delivery also block continuation. The continuation message asks the agent to verify its work before marking the goal complete. The plugin cannot independently prove that a provider's completed goal was actually achieved.
 

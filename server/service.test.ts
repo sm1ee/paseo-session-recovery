@@ -22,7 +22,7 @@ function fixture(options: Record<string, unknown> = {}) {
   const store = { load: vi.fn(async () => structuredClone(saved)), save: vi.fn(async (s: SavedState) => { saved = structuredClone(s); }) };
   const fetch = vi.fn(async (id: string) => structuredClone(id === a.id ? a : others.get(id) ?? null));
   const getWorkspace = vi.fn(async () => structuredClone(workspace));
-  const goal = vi.fn(async () => structuredClone(goalReading));
+  const goal = vi.fn(async (_id: string, _options?: { allowTimeline?: boolean }) => structuredClone(goalReading));
   const supportsGoalCommand = vi.fn(async () => true);
   const resumeBlockedGoal = vi.fn(async (_id: string, key: string, _expected: Agent, check: () => void, _messageId: string, submitted?: () => void) => {
     check(); if (goalReading.state !== "blocked" || goalReading.key !== key) throw new Error("Goal changed");
@@ -54,6 +54,42 @@ function fixture(options: Record<string, unknown> = {}) {
 }
 describe("goal composer inspection", () => {
   const active: GoalReading = { state: "active", key: "current-goal", evidence: true };
+  it("수동 새로고침을 포함한 표시 조회는 대화 복원을 요청하지 않는다", async () => {
+    const f = fixture(); await f.service.configure(f.settings);
+    await f.service.goalControl("session"); await f.service.goalControl("session", true);
+    expect(f.goal).toHaveBeenCalledTimes(2);
+    expect(f.goal.mock.calls.every(([, options]) => options?.allowTimeline === false)).toBe(true);
+    expect(f.send).not.toHaveBeenCalled();
+  });
+  it("여러 클라이언트의 같은 대화 조회를 공유한다", async () => {
+    const f = fixture(); await f.service.configure(f.settings);
+    let release!: (reading: GoalReading) => void;
+    f.goal.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const first = f.service.goalControl("session");
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    const second = f.service.goalControl("session");
+    release(active);
+    expect(await second).toEqual(await first);
+    expect(f.goal).toHaveBeenCalledOnce(); expect(f.fetch).toHaveBeenCalledOnce();
+  });
+  it("Goal이 없는 대화의 결과를 캐시하고 직접 조회 시 갱신한다", async () => {
+    const f = fixture(); await f.service.configure(f.settings);
+    await f.service.goalControl("session");
+    f.advance(299_999); f.setGoal(active);
+    expect(await f.service.goalControl("session")).toMatchObject({ visible: false });
+    expect(f.goal).toHaveBeenCalledOnce();
+    expect(await f.service.goalControl("session", true)).toMatchObject({ visible: true, key: active.key });
+    expect(f.goal).toHaveBeenCalledTimes(2);
+  });
+  it("선택된 OMP Goal의 표시가 대화를 복원하지 않아도 자동 진행 검사는 유지한다", async () => {
+    const f = fixture({ continueGoals: true }); f.a.provider = "omp"; f.idle(); f.setGoal(active);
+    await f.service.configure(f.settings); await f.service.watchGoal("session");
+    f.goal.mockImplementation(async (_id, options) => options?.allowTimeline === false ? { state: "unknown", key: null, evidence: false, source: "timeline" } : active);
+    expect(await f.service.goalControl("session")).toMatchObject({ visible: true, state: "active", selected: true, canSelect: false, note: expect.stringContaining("last checked") });
+    f.advance(60_000); await f.service.scanNow();
+    expect(f.send).toHaveBeenCalledOnce();
+    expect(f.goal.mock.calls.some(([, options]) => options === undefined)).toBe(true);
+  });
   it("does not show a pill or track a session without goal evidence", async () => {
     const f = fixture(); await f.service.configure(f.settings);
     expect(await f.service.goalControl("session")).toMatchObject({ visible: false, selected: false, canSelect: false });
@@ -191,11 +227,44 @@ describe("goal composer inspection", () => {
   });
   it("keeps an unconfirmed native resume command in review without replaying it", async () => {
     const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.service.configure(f.settings);
-    f.resumeBlockedGoal.mockRejectedValueOnce(new Error("Receipt lost"));
+    f.resumeBlockedGoal.mockImplementationOnce(async (_id, _key, _expected, _check, _messageId, submitted) => { submitted?.(); throw new Error("Receipt lost"); });
     await expect(f.service.watchGoal("session", active.key!, false, true)).rejects.toThrow("Receipt lost");
     expect(f.saved.records.session.reason).toBe("uncertain_send");
     await f.restart("boot-a"); f.advance(60_000); await f.service.scanNow();
     expect(f.resumeBlockedGoal).toHaveBeenCalledOnce(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("removes an unsent native goal intent and allows an explicit retry", async () => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.service.configure(f.settings);
+    f.resumeBlockedGoal.mockRejectedValueOnce(new RecoveryError("Preflight changed"));
+    await expect(f.service.watchGoal("session", active.key!, false, true)).rejects.toThrow("Preflight changed");
+    expect(f.saved.records.session).toBeUndefined(); expect(f.saved.history.some((h) => h.reason === "uncertain_send")).toBe(false);
+    expect(await f.service.goalControl("session", true)).toMatchObject({ selected: false, canSelect: true });
+    await f.service.watchGoal("session", active.key!, false, true); expect(f.resumeBlockedGoal).toHaveBeenCalledTimes(2);
+  });
+  it.each([false, true])("restores the previous goal record after an unsent command, previously selected: %s", async (selected) => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.service.configure(f.settings);
+    await f.service.watchGoal("session", active.key!); if (!selected) await f.service.unwatchGoal("session");
+    const saved = f.saved; saved.records.session.attempts = 2; saved.records.session.goal!.attempts = 1; f.setSaved(saved); await f.restart("boot-a");
+    const before = f.saved.records.session;
+    f.resumeBlockedGoal.mockRejectedValueOnce(new RecoveryError("Preflight changed"));
+    await expect(f.service.watchGoal("session", active.key!, true, true)).rejects.toThrow("Preflight changed");
+    expect(f.saved.records.session).toEqual(before);
+  });
+  it.each(["stop", "permission", "unwatch"] as const)("preserves a queued %s after an unsent first goal toggle", async (block) => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.service.configure(f.settings);
+    let pending!: Promise<unknown>;
+    f.resumeBlockedGoal.mockImplementationOnce(async (_id, _key, _expected, check) => {
+      if (block === "stop") pending = f.event({ kind: "end", turnId: "fixture-turn", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
+      else if (block === "permission") { f.a.pendingPermissions = 1; pending = f.event({ kind: "permission", requestId: "approval" } as Omit<RecoveryEvent, "agent">); }
+      else pending = f.service.unwatchGoal("session");
+      check(); throw new Error("Expected guard failure");
+    });
+    await expect(f.service.watchGoal("session", active.key!, false, true)).rejects.toThrow(/changed/); await pending;
+    expect(f.saved.records.session.attemptMessageId).toBeNull(); expect(f.saved.records.session.reason).not.toBe("uncertain_send");
+    if (block === "stop") expect(f.saved.records.session.reason).toBe("user_stop");
+    if (block === "permission") expect(f.saved.records.session).toMatchObject({ humanRequired: true, pendingIds: ["approval"] });
+    expect(f.saved.records.session.goal?.selectedKey).toBeNull();
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
   });
   it.each(["paused", "limited", "unknown"] as const)("does not reactivate a native %s goal from the toggle", async (state) => {
     const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, source: "codex", state }); await f.service.configure(f.settings);

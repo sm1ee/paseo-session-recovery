@@ -1,5 +1,6 @@
 import type { PluginClientContext, PluginScreenProps, PluginSidebarItemProps } from "@getpaseo/plugin/client";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
+import { Platform } from "react-native";
 import { RecoveryScreen } from "./client/screen";
 import { RecoverySettings } from "./client/settings";
 import { contributeGoalPills } from "./client/goal-pill";
@@ -19,7 +20,7 @@ export default function contribute(client: PluginClientContext) {
   const stopGoalPills = contributeGoalPills(client);
   function Screen(props: PluginScreenProps) { return <RecoveryScreen {...props} onOpenSettings={() => client.openSettings("preferences")} />; }
   client.addScreen({ id: "main", title: "session-recovery", Component: Screen });
-  client.addSidebarHeaderItem({ id: "main", title: "session-recovery", Component: RecoveryItem });
+  if (Platform.OS === "web") client.addSidebarHeaderItem({ id: "main", title: "session-recovery", Component: RecoveryItem });
   client.addSettingsScreen({ id: "preferences", title: "Settings", icon: "Settings2", Component: RecoverySettings });
   client.addCommandCenterItem({ id: "open", title: "Open session-recovery", icon: "RotateCcw", context: "global", onSelect({ openScreen }) { openScreen({ screenId: "main" }); } });
   client.addCommandCenterItem({ id: "settings", title: "session-recovery settings", icon: "Settings2", context: "global", onSelect({ openSettings }) { openSettings("preferences"); } });

@@ -64,13 +64,20 @@ describe("goal composer pill lifecycle", () => {
     const f = fixture(); let release!: (value: GoalControl) => void;
     f.read.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
     const first = f.controller.poll(); await f.controller.poll(); expect(f.read).toHaveBeenCalledOnce();
-    release(control()); await first; f.advance(59_999); await f.controller.poll(); expect(f.read).toHaveBeenCalledOnce();
+    release(control()); await first; f.advance(299_999); await f.controller.poll(); expect(f.read).toHaveBeenCalledOnce();
     f.advance(1); await f.controller.poll(); expect(f.read).toHaveBeenCalledTimes(2);
   });
   it("refreshes active goals sooner and hides stale controls on a lookup failure", async () => {
     const f = fixture(); f.controller.upsert({ ...agent, status: "running" }); f.set({ visible: true }); await f.controller.poll();
     f.advance(15_000); f.read.mockRejectedValueOnce(new Error("offline")); await f.controller.poll();
     expect(f.registrations[0].remove).toHaveBeenCalledOnce();
+  });
+  it("느린 조회가 끝난 시점부터 다음 조회 간격을 계산한다", async () => {
+    const f = fixture(); let release!: (value: GoalControl) => void;
+    f.read.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const pending = f.controller.poll(); f.advance(400_000); release(control()); await pending;
+    await f.controller.poll(); expect(f.read).toHaveBeenCalledOnce();
+    f.advance(300_000); await f.controller.poll(); expect(f.read).toHaveBeenCalledTimes(2);
   });
   it("refreshes a mode change immediately, bypassing the cached idle result", async () => {
     const f = fixture(); f.controller.upsert({ ...agent, currentModeId: "build" }); await f.controller.poll();

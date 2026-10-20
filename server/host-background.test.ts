@@ -56,6 +56,51 @@ describe("recovery host compatibility", () => {
 });
 
 describe("native Codex goal commands", () => {
+  function nativeFixture() {
+    vi.mocked(DaemonClient.prototype.getLastServerInfoMessage).mockReturnValue({ serverId: "scope-test", version, features: { backgroundWorkspaces: background, agentRequestReceipts: true } } as Info);
+    const agent = { id: "fixture", title: "Fixture", provider: "codex", labels: {} as Record<string, string>, workspaceId: "background-space",
+      persistence: { sessionId: "native-fixture" }, status: "running", activeTurn: undefined as { turnId: string } | null | undefined,
+      pendingPermissions: [] as unknown[], archivedAt: null as string | null, lastUserMessageAt: null as string | null,
+      attentionReason: null as string | null, attentionTimestamp: null as string | null, internal: false };
+    vi.spyOn(DaemonClient.prototype, "fetchAgent").mockImplementation(async () => ({ agent: structuredClone(agent), project: null }) as unknown as NonNullable<Awaited<ReturnType<DaemonClient["fetchAgent"]>>>);
+    const send = vi.spyOn(DaemonClient.prototype, "sendAgentMessage").mockResolvedValue(undefined);
+    const commands = vi.spyOn(DaemonClient.prototype, "listCommands").mockResolvedValue({ agentId: "fixture", commands: [{ name: "goal", kind: "command", description: "Set, pause, resume, or clear the agent's goal", argumentHint: "[<objective>|pause|resume|clear]" }], error: null, requestId: "fixture" });
+    vi.spyOn(CodexGoals.prototype, "resumeBlocked").mockImplementation(async (_provider, _thread, key, guard, submit) => { guard(); await submit(); return { state: "active", key, evidence: true, source: "codex" }; });
+    return { agent, send, commands };
+  }
+  it.each(["initial", "final"])("allows refreshed presentation and turn metadata at the %s native command check", async (stage) => {
+    const f = nativeFixture(); host = await openLocalHost(home, process.pid); const expected = await host.fetch("fixture");
+    const update = () => { f.agent.title = "Updated fixture title"; f.agent.status = "idle"; f.agent.activeTurn = null;
+      f.agent.attentionReason = "finished"; f.agent.attentionTimestamp = "2026-10-20T00:00:00Z"; };
+    if (stage === "initial") update();
+    else f.commands.mockImplementationOnce(async () => { update(); return { agentId: "fixture", commands: [{ name: "goal", kind: "command", description: "Set, pause, resume, or clear the agent's goal", argumentHint: "" }], error: null, requestId: "fixture" }; });
+    await expect(host.resumeBlockedGoal!("fixture", "current-goal", expected!, () => {}, "fixture-resume-message")).resolves.toMatchObject({ state: "active" });
+    expect(f.send).toHaveBeenCalledOnce();
+  });
+  it.each(["initial", "final"])("rejects protected session changes at the %s native command check", async (stage) => {
+    const f = nativeFixture(); host = await openLocalHost(home, process.pid); const expected = await host.fetch("fixture");
+    const variants = [
+      { id: "another-agent" }, { provider: "another-provider" }, { workspaceId: "another-space" },
+      { labels: { "paseo.parent-agent-id": "another-parent" } }, { persistence: { sessionId: "another-native-thread" } },
+      { lastUserMessageAt: "2026-10-20T00:00:01Z" }, { pendingPermissions: [{}] }, { archivedAt: "2026-10-20T00:00:01Z" },
+      { internal: true }, { status: "initializing" },
+    ];
+    const original = structuredClone(f.agent);
+    for (const change of variants) {
+      Object.assign(f.agent, original);
+      if (stage === "initial") Object.assign(f.agent, change);
+      else f.commands.mockImplementationOnce(async () => { Object.assign(f.agent, change); return { agentId: "fixture", commands: [{ name: "goal", kind: "command", description: "Set, pause, resume, or clear the agent's goal", argumentHint: "" }], error: null, requestId: "fixture" }; });
+      const submitted = vi.fn();
+      await expect(host.resumeBlockedGoal!("fixture", "current-goal", expected!, () => {}, "fixture-resume-message", submitted)).rejects.toThrow(/session changed/);
+      expect(submitted).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+    }
+  });
+  it("keeps the full snapshot check for ordinary continuation messages", async () => {
+    const f = nativeFixture(); f.agent.status = "idle"; f.agent.activeTurn = null;
+    host = await openLocalHost(home, process.pid); const expected = await host.fetch("fixture"); f.agent.title = "Changed title";
+    await expect(host.send("fixture", "Continue", "fixture-message", expected!, () => {})).rejects.toThrow(/session changed/);
+    expect(f.send).not.toHaveBeenCalled();
+  });
   it.each([true, false])("sends a native resume during a running turn, turn ID present: %s", async (hasTurn) => {
     vi.mocked(DaemonClient.prototype.getLastServerInfoMessage).mockReturnValue({ serverId: "scope-test", version, features: { backgroundWorkspaces: background, agentRequestReceipts: true } } as Info);
     vi.spyOn(DaemonClient.prototype, "fetchAgent").mockResolvedValue({ agent: { id: "fixture", title: "Fixture", provider: "codex", labels: {},
@@ -86,6 +131,25 @@ describe("conversation goal lookup", () => {
   function goalTool(name: string, output: unknown) { return { type: "tool_call", name, status: "completed", callId: name, detail: { type: "unknown", input: {}, output } }; }
   beforeEach(() => {
     vi.spyOn(DaemonClient.prototype, "fetchAgent").mockResolvedValue({ agent: { id: "fixture", provider: "omp", labels: {}, persistence: null } } as NonNullable<Awaited<ReturnType<DaemonClient["fetchAgent"]>>>);
+  });
+  it.each([false, true])("자동 발견 조회는 OMP 대화를 복원하지 않는다. 하위 대화: %s", async (child) => {
+    vi.mocked(DaemonClient.prototype.fetchAgent).mockResolvedValue({ agent: { id: "fixture", provider: "omp", labels: child ? { "paseo.parent-agent-id": "parent" } : {}, persistence: { sessionId: "stored-session" } } } as NonNullable<Awaited<ReturnType<DaemonClient["fetchAgent"]>>>);
+    vi.spyOn(OpenCodeGoals.prototype, "read").mockResolvedValue(null);
+    vi.spyOn(CodexGoals.prototype, "read").mockResolvedValue(null);
+    const timeline = vi.spyOn(DaemonClient.prototype, "fetchAgentTimeline").mockRejectedValue(new Error("대화 복원이 실행되면 안 된다"));
+    host = await openLocalHost(home, process.pid);
+    expect(await host.goal!("fixture", { allowTimeline: false })).toEqual({ state: "unknown", key: null, evidence: false, source: "timeline" });
+    expect(timeline).not.toHaveBeenCalled();
+  });
+  it("자동 발견 조회에서도 네이티브 Codex Goal을 읽는다", async () => {
+    vi.mocked(DaemonClient.prototype.fetchAgent).mockResolvedValue({ agent: { id: "fixture", provider: "codex", labels: {}, persistence: { sessionId: "native-session" } } } as NonNullable<Awaited<ReturnType<DaemonClient["fetchAgent"]>>>);
+    vi.spyOn(OpenCodeGoals.prototype, "read").mockResolvedValue(null);
+    const reading = { state: "active" as const, key: "native-goal", evidence: true, source: "codex" as const };
+    vi.spyOn(CodexGoals.prototype, "read").mockResolvedValue(reading);
+    const timeline = vi.spyOn(DaemonClient.prototype, "fetchAgentTimeline");
+    host = await openLocalHost(home, process.pid);
+    expect(await host.goal!("fixture", { allowTimeline: false })).toEqual(reading);
+    expect(timeline).not.toHaveBeenCalled();
   });
   it("finds the objective across canonical pages without dropping later status changes", async () => {
     const tail = page([{ seqStart: 201, item: goalTool("get_goal", { status: "active" }) }], true);

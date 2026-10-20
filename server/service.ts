@@ -35,6 +35,7 @@ export class RecoveryService {
   private cursor = 0;
   private controls = new Map<string, { at: number; generation: number; changed: number; value: GoalControl }>();
   private controlRequests = new Map<string, object>();
+  private controlReads = new Map<string, { signature: string; promise: Promise<GoalControl> }>();
   private nativeGoalResumes = new Map<string, NativeGoalResume>();
   constructor(private readonly connect = openLocalHost, private readonly now = Date.now, private readonly automaticTimer = true) {}
   private enqueue<T>(work: () => Promise<T>, report = true): Promise<T> {
@@ -379,7 +380,16 @@ export class RecoveryService {
           if (!latest || latest.provider !== a.provider || latest.workspaceId !== a.workspaceId || latest.parentId !== a.parentId || latest.archivedAt) throw new RecoveryError("The session changed while its goal resumed. Check it before continuing.");
           a = latest;
         } catch (error) {
-          this.review(intent, "uncertain_send"); await this.persist(); throw error;
+          if (nativeResume.submitted) this.review(intent, "uncertain_send");
+          else if (existing) this.saved.records[id] = existing;
+          else if (this.changes.get(id) === changed) delete this.saved.records[id];
+          else {
+            // Keep a record for queued lifecycle events to update. It carries
+            // neither a submitted message nor a new automatic goal selection.
+            intent.attemptMessageId = null; intent.goal!.selectedKey = null;
+            this.set(intent, "review", "goal_blocked");
+          }
+          await this.persist(); throw error;
         } finally { this.nativeGoalResumes.delete(id); }
       }
       const previous = this.saved.records[id]; const at = this.now();
@@ -414,18 +424,33 @@ export class RecoveryService {
     });
   }
   goalControl(id: string, fresh = false): Promise<GoalControl> {
+    const signature = `${this.generation}:${this.changes.get(id) ?? 0}`;
+    const pending = this.controlReads.get(id);
+    if (!fresh && pending?.signature === signature) return pending.promise;
+    const promise = this.inspectGoalControl(id, fresh);
+    const entry = { signature, promise };
+    this.controlReads.set(id, entry);
+    const clear = () => { if (this.controlReads.get(id) === entry) this.controlReads.delete(id); };
+    void promise.then(clear, clear);
+    return promise;
+  }
+  private inspectGoalControl(id: string, fresh: boolean): Promise<GoalControl> {
     // Passive discovery must not hold up recovery actions while a provider is slow.
     const request = {}; this.controlRequests.set(id, request);
     return (async () => {
       const { host, generation, changed } = await this.action(async () => ({ host: await this.ready(), generation: this.generation, changed: this.changes.get(id) ?? 0 }));
       const cached = this.controls.get(id);
-      if (!fresh && cached && cached.generation === generation && cached.changed === changed && this.now() - cached.at < 10_000) return cached.value;
+      if (!fresh && cached && cached.generation === generation && cached.changed === changed && this.now() - cached.at < (cached.value.visible ? 15_000 : 300_000)) return cached.value;
       const a = await host.fetch(id); this.check(generation);
       const r = this.saved.records[id];
       const value: GoalControl = { id, workspaceId: a?.workspaceId ?? null, visible: false, state: null, key: null, selected: false, canSelect: false,
         automatic: this.settings.enabled && this.settings.continueGoals, attempts: 0, maxAttempts: this.settings.goalMaxAttempts, delaySeconds: this.settings.goalDelaySeconds, note: null };
       if (a && !a.internal && !a.archivedAt && a.workspaceId) {
-        const reading = await host.goal?.(id) ?? { state: "unknown" as const, key: null, evidence: false }; this.check(generation);
+        let reading = await host.goal?.(id, { allowTimeline: false }) ?? { state: "unknown" as const, key: null, evidence: false }; this.check(generation);
+        const snapshotOnly = reading.source === "timeline" && !reading.evidence && reading.state === "unknown" && !!r?.goal?.selectedKey;
+        // 선택된 비네이티브 Goal은 마지막 검사 결과로 해제 버튼을 유지한다.
+        // 이 표시 결과는 자동 전송이나 새 Goal 선택의 증거로 쓰지 않는다.
+        if (snapshotOnly) reading = { ...reading, state: r!.goal!.state, key: r!.goal!.key };
         // Inspection never opts a session in, schedules a turn, or writes a recovery record.
         if ((this.changes.get(id) ?? 0) !== changed) { value.note = "The session changed while checking its goal. Try again."; return value; }
         const terminal = reading.state === "complete" || reading.state === "cleared";
@@ -443,6 +468,7 @@ export class RecoveryService {
           : r?.reason === "user_stop" || r?.phase === "review" && !r.reason.startsWith("goal_") ? r.reason : null;
         value.note = excluded ? reasonText.excluded : uncertain ? reasonText.uncertain_send : !value.automatic ? "Automatic goal continuation is off in Settings."
           : r?.humanRequired || a.pendingPermissions > 0 ? reasonText.input : value.attempts >= value.maxAttempts ? reasonText.goal_limit
+          : snapshotOnly ? "Showing the last checked goal state. Automatic continuation verifies the current state again before sending."
           : reading.source === "opencode" ? value.state === "active" ? reading.nativeContinuation ? "OpenCode is managing continuation. Paseo will not send an extra message while the native continuation or child-session guard is in effect."
             : "OpenCode also runs its own goal loop. This toggle controls Paseo's fallback continuation."
             : value.state === "unknown" ? "OpenCode's current goal state could not be verified. Automatic continuation is paused."

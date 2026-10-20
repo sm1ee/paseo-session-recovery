@@ -21,7 +21,7 @@ export interface RecoveryHost {
   store: StateStore;
   fetch(id: string): Promise<Agent | null>;
   workspace(id: string): Promise<Workspace | null>;
-  goal?(id: string): Promise<GoalReading>;
+  goal?(id: string, options?: { allowTimeline?: boolean }): Promise<GoalReading>;
   supportsGoalCommand?(id: string): Promise<boolean>;
   resumeBlockedGoal?(id: string, key: string, expected: Agent, check: () => void, messageId: string, submitted?: () => void): Promise<GoalReading>;
   shuttingDown(): Promise<boolean>;
@@ -36,9 +36,20 @@ export function metadata(a: PaseoAgent): Agent {
     pendingPermissions: Array.isArray(a.pendingPermissions) ? a.pendingPermissions.length : -1,
     archivedAt: a.archivedAt ?? null, lastUserMessageAt: a.lastUserMessageAt,
     attentionReason: a.attentionReason ?? null, attentionTimestamp: a.attentionTimestamp ?? null,
-    persistence: Boolean(a.persistence?.sessionId), internal: "internal" in a && a.internal === true,
+    persistence: Boolean(a.persistence?.sessionId), sessionId: a.persistence?.sessionId ?? null, internal: "internal" in a && a.internal === true,
     modeId: a.currentModeId === undefined ? a.runtimeInfo?.modeId ?? null : a.currentModeId,
   };
+}
+function checkGoalSession(current: Agent | null, expected: Agent, stage: "initial" | "final"): asserts current is Agent {
+  // A native command changes the goal on an existing thread without allocating
+  // a continuation turn. Titles, attention and hydrated turn metadata can change
+  // during lookup. Lifecycle guards still protect stops, approvals and new turns.
+  const stable = ["id", "provider", "workspaceId", "parentId", "sessionId", "lastUserMessageAt"] as const;
+  if (current && expected.sessionId && stable.every((field) => current[field] === expected[field]) &&
+    goalCommandReady(current) && !current.archivedAt && !current.internal) return;
+  console.warn("Native goal resume preflight rejected", { stage,
+    changedFields: current ? Object.keys({ ...expected, ...current }).filter((field) => current[field as keyof Agent] !== expected[field as keyof Agent]) : ["missing"] });
+  throw new RecoveryError("The session changed before its goal could resume. Check it and try again.");
 }
 export function resolveHome(configured: string): string {
   const raw = configured.trim() || process.env.PASEO_HOME || join(homedir(), ".paseo");
@@ -141,7 +152,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
     const fetch = async (id: string) => { await check(); const result = await paseo.agents.ref(id).refresh(); await check(); return result?.agent ? metadata(result.agent) : null; };
     return {
       bootKey, serverId: lock.serverId, store: new FileStore(directory, lock.serverId), fetch,
-      async goal(id) {
+      async goal(id, options) {
         await check();
         const agent = (await paseo.agents.ref(id).refresh())?.agent;
         if (!agent) return { state: "unknown", key: null, evidence: true };
@@ -153,6 +164,9 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
           await check();
           if (native) return native;
         }
+        // 화면의 자동 발견 조회는 휴면 대화를 복원하지 않는다.
+        // 사용자의 명시적인 선택과 선택된 Goal의 실행 전 검사는 기존 경로를 쓴다.
+        if (options?.allowTimeline === false) return { state: "unknown", key: null, evidence: false, source: "timeline" };
         let page = await driver.fetchAgentTimeline(id, { projection: "canonical", direction: "tail", limit: 200 });
         const epoch = page.epoch;
         let entries = [...page.entries];
@@ -185,7 +199,8 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         await check(); guard();
         const agent = (await paseo.agents.ref(id).refresh())?.agent;
         const latest = agent ? metadata(agent) : null;
-        if (!agent?.persistence?.sessionId || !latest || !goalCommandReady(latest) || latest.archivedAt || fingerprint(latest) !== fingerprint(expected)) throw new RecoveryError("The session changed before its goal could resume. Check it and try again.");
+        checkGoalSession(latest, expected, "initial");
+        if (!agent?.persistence?.sessionId) throw new RecoveryError("The session's saved history is unavailable.");
         const workspace = latest.workspaceId ? await paseo.workspaces.ref(latest.workspaceId).refresh() : null;
         if (!workspace || workspace.archivingAt) throw new RecoveryError("This workspace is unavailable.");
         const commands = await paseo.agents.ref(id).commands();
@@ -195,7 +210,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
           return await codexGoals.resumeBlocked(agent.provider, agent.persistence.sessionId, key, guard, async () => {
             if (driver.getLastServerInfoMessage()?.features?.agentRequestReceipts !== true) throw new RecoveryError("This daemon does not advertise durable message receipts.");
             const current = await fetch(id);
-            if (!current || !goalCommandReady(current) || current.archivedAt || fingerprint(current) !== fingerprint(expected)) throw new RecoveryError("The session changed before its goal could resume. Check it and try again.");
+            checkGoalSession(current, expected, "final");
             await check(); guard();
             submitted?.();
             await driver.sendAgentMessage(id, "/goal resume", { messageId, activeTurnBehavior: "steer" });

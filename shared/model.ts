@@ -22,7 +22,7 @@ export interface Agent {
   id: string; title: string; provider: string; workspaceId: string | null; parentId: string | null;
   status: string; activeTurn: string | null | undefined; pendingPermissions: number; archivedAt: string | null;
   lastUserMessageAt: string | null; attentionReason: string | null; attentionTimestamp: string | null;
-  persistence: boolean; internal: boolean; modeId?: string | null;
+  persistence: boolean; sessionId?: string | null; internal: boolean; modeId?: string | null;
 }
 export interface Workspace { id: string; archived: boolean; archiving: boolean }
 export function time(value: string | null): number { const result = value ? Date.parse(value) : NaN; return Number.isFinite(result) ? result : 0; }
