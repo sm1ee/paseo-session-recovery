@@ -98,7 +98,7 @@ paseo plugin install /absolute/path/to/paseo-session-recovery
 
 Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed. Goal controls retry a failed initial session lookup and restore previously visible goals first after reconnecting, including on mobile clients.
 
-For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.4.4`. The public registry listing requires a separate review.
+For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.4.5`. The public registry listing requires a separate review.
 
 ## Local data
 
@@ -115,7 +115,10 @@ A Paseo update does not normally require a plugin update. This plugin checks its
 ```sh
 npm ci --ignore-scripts
 npm run typecheck
+npm run test:mobile
 npm test
 ```
 
 Tests simulate restarts, stops, approvals, lost responses, retry limits, concurrent user actions, and storage failures. They do not restart the real daemon or resume user sessions.
+
+The mobile check compiles the client module graph with React Native's Hermes compiler without running plugin code. CI runs it with both supported Paseo SDK versions.

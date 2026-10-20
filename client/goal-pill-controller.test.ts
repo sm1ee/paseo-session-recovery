@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { GoalPillController, type PillRegistration } from "./goal-pill-controller";
+import { createGoalPillController, type PillRegistration } from "./goal-pill-controller";
 import type { GoalControl } from "../shared/contracts";
 
 const agent = { id: "session", workspaceId: "workspace", status: "idle" };
@@ -10,7 +10,7 @@ function fixture() {
   const read = vi.fn(async (_id: string, _fresh: boolean) => value);
   const registrations: Array<PillRegistration & { update: ReturnType<typeof vi.fn>; remove: ReturnType<typeof vi.fn> }> = [];
   const add = vi.fn(() => { const r = { update: vi.fn(), remove: vi.fn() }; registrations.push(r); return r; });
-  const controller = new GoalPillController(read, add, () => now);
+  const controller = createGoalPillController(read, add, () => now);
   controller.upsert(agent);
   return { read, add, registrations, controller, advance: (ms: number) => { now += ms; }, set: (patch: Partial<GoalControl>) => { value = control(patch); } };
 }

@@ -1,6 +1,6 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { goalControlRpc, unwatchGoalRpc, watchGoalRpc, type GoalControl } from "../shared/contracts";
-import { GoalPillController } from "./goal-pill-controller";
+import { createGoalPillController, type GoalPillController } from "./goal-pill-controller";
 
 function label(goal: GoalControl): string {
   if (!goal.selected) return "Goal · Off";
@@ -14,7 +14,7 @@ function label(goal: GoalControl): string {
 
 export function contributeGoalPills(client: PluginClientContext): () => void {
   const lifetime = new AbortController();
-  const controller: GoalPillController = new GoalPillController(
+  const controller: GoalPillController = createGoalPillController(
     (id, fresh) => client.rpc(goalControlRpc, { id, fresh }),
     (id, workspaceId) => {
       const pill = client.addComposerPill({ id: "goal-continuation", agentId: id, workspaceId,
