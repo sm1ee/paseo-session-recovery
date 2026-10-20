@@ -48,6 +48,12 @@ After a normal turn ends, the plugin checks the goal, waits for the configured d
 
 Codex goals are read through the official `thread/goal/get` API. A local subprocess uses the configured Codex command and environment. It receives only initialization and goal lookup requests; it never loads or resumes a thread. Codex must support the goals feature and this API. An unavailable or unrecognized response requires review.
 
+OpenCode uses the **Goal** agent mode supplied by [opencode-goal-plugin](https://github.com/william-ricchiuti/OpenCode-goal-plugin). The plugin reads that mode's focused objective from its version 1 native session snapshot. Choosing Goal mode alone does not create an objective; set one with `/goal <objective>` first. Build, Plan, unrelated custom modes, and background or queued objectives are excluded. Leaving Goal mode blocks pending goal continuation. A renamed goal agent is supported when it retains the upstream mode registration.
+
+OpenCode already has its own goal loop. This toggle controls Paseo's fallback messages; turning it off does not pause OpenCode's own loop. A native continuation claim or child-session guard prevents an extra Paseo message. Native pauses, blockers, restarts, and limits are respected. Use OpenCode's `/goal pause` to pause its loop. Review a stopped goal before using `/goal resume`, which starts a new native budget window. This plugin never sends those control commands or resets native budgets automatically.
+
+OpenCode state is read from `<session cwd>/.opencode/goals/state.json.sessions/<hashed native session ID>/state.json`, or the corresponding location under `OPENCODE_GOAL_STATE_PATH` in the provider environment. Custom providers extending OpenCode are supported. Snapshots are bounded to 2 MiB and checked against the native lifecycle ledger's modification time. Missing, changed, malformed, unsupported, or outdated snapshots require review. Persistence must be enabled. Legacy global state and JavaScript-only `stateFilePath` overrides are not discovered; expose a custom location through `OPENCODE_GOAL_STATE_PATH`. The upstream source and state format were used as the integration reference; the reader does not import or execute the upstream plugin.
+
 For OMP, the plugin reads structured `goal` tool results and Paseo's `omp_goal_updated` timeline records. It also reads structured `create_goal`, `get_goal`, and `update_goal` results, including compatible Pi goal extensions. Detection depends on the provider exposing these records in Paseo. Ordinary chat text, plans, and to-do lists are not treated as goals. Conversation inspection is bounded to the most recent 2,000 canonical timeline entries; an unverifiable state requires review.
 
 Paused, blocked, completed, cleared, and limited goals are not automatically resumed. Questions, approvals, direct stops, exclusions, and uncertain delivery also block continuation. The continuation message asks the agent to verify its work before marking the goal complete. The plugin cannot independently prove that a provider's completed goal was actually achieved.
@@ -86,11 +92,11 @@ paseo plugin install /absolute/path/to/paseo-session-recovery
 
 Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed.
 
-For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.3.2`. The public registry listing requires a separate review.
+For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.4.0`. The public registry listing requires a separate review.
 
 ## Local data
 
-Session IDs, titles, providers, turn IDs, timestamps, attempt counts, exclusions, goal fingerprints, selections and states, and recent outcomes stay under `plugin-data/session-recovery/` in the daemon's Paseo home. `state.json` is the journal, `holds.json` is the cleanup protection list, and `worker.lock` prevents duplicate monitors. Files use owner-only permissions. Journal writes use sync and atomic rename.
+Session IDs, titles, providers, turn IDs, timestamps, attempt counts, exclusions, goal fingerprints, selections, states and mode IDs, and recent outcomes stay under `plugin-data/session-recovery/` in the daemon's Paseo home. `state.json` is the journal, `holds.json` is the cleanup protection list, and `worker.lock` prevents duplicate monitors. Files use owner-only permissions. Journal writes use sync and atomic rename.
 
 Composer visibility checks, goal continuation, and explicit goal selection inspect supported goal state and conversation records in memory. Connected clients check the unarchived session directory. Running sessions and visible goal controls are checked about every 15 seconds; other idle sessions about every minute. The daemon briefly caches these read-only results. Discovery does not select, schedule, or resume sessions, and still works when the automatic continuation setting is off. Conversation bodies, goal objectives, raw provider errors, API tokens, and credentials are not stored in the journal. The local credential is read in memory to authenticate to the owning daemon's loopback listener or Unix socket. Continuations go through the session's existing provider. No separate model or external review service is used.
 

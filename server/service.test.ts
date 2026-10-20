@@ -81,6 +81,36 @@ describe("goal composer inspection", () => {
     await f.service.scanNow(); expect(f.saved.records.session.reason).toBe("goal_active");
     f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledOnce();
   });
+  it("can select an OpenCode goal paused by user intervention without resuming or resetting it", async () => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.a.modeId = "goal";
+    f.setGoal({ ...active, source: "opencode", modeId: "goal", state: "paused" }); await f.service.configure(f.settings);
+    expect(await f.service.goalControl("session")).toMatchObject({ visible: true, state: "paused", canSelect: true });
+    await f.service.watchGoal("session", active.key!);
+    expect(await f.service.goalControl("session")).toMatchObject({ selected: true, note: expect.stringContaining("does not resume") });
+    f.advance(120_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("leaves a native OpenCode continuation claim to its existing loop", async () => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.a.modeId = "goal";
+    f.setGoal({ ...active, source: "opencode", modeId: "goal", nativeContinuation: true }); await f.service.configure(f.settings);
+    await f.service.watchGoal("session", active.key!);
+    f.advance(60_000); await f.service.scanNow(); f.advance(60_000); await f.service.scanNow();
+    expect(f.send).not.toHaveBeenCalled(); expect(f.saved.records.session.goal?.attempts).toBe(0);
+    expect(await f.service.goalControl("session", true)).toMatchObject({ selected: true, state: "active", note: expect.stringContaining("OpenCode is managing") });
+  });
+  it("blocks a continuation if OpenCode leaves Goal mode between the goal read and final session check", async () => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.a.modeId = "goal";
+    f.setGoal({ ...active, source: "opencode", modeId: "goal" }); await f.service.configure(f.settings); await f.service.watchGoal("session", active.key!);
+    f.a.modeId = "build"; f.advance(60_000); await f.service.scanNow();
+    expect(f.send).not.toHaveBeenCalled(); expect(f.saved.records.session.reason).toBe("unknown_state");
+  });
+  it("removes an OpenCode selection when its mode no longer exposes the current goal", async () => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.a.modeId = "goal";
+    f.setGoal({ ...active, source: "opencode", modeId: "goal" }); await f.service.configure(f.settings); await f.service.watchGoal("session", active.key!);
+    f.a.modeId = "build"; f.setGoal({ state: "cleared", key: null, evidence: false, source: "opencode" });
+    await f.service.scanNow();
+    expect(await f.service.goalControl("session", true)).toMatchObject({ visible: false, selected: false });
+    expect(f.saved.records.session.goal?.selectedKey).toBeNull(); expect(f.send).not.toHaveBeenCalled();
+  });
   it("shows an unverified selected goal only so its selection can be turned off", async () => {
     const f = fixture(); f.setGoal(active); await f.track(); await f.service.watchGoal("session");
     f.setGoal({ state: "unknown", key: null, evidence: false });

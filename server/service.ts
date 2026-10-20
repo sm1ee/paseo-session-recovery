@@ -188,7 +188,8 @@ export class RecoveryService {
     const previous = r.goal;
     const state = reading.state === "active" && !reading.key ? "unknown" : reading.state;
     const selectedKey = state === "complete" || state === "cleared" ? null : previous?.selectedKey && (!reading.key || previous.selectedKey === reading.key) ? previous.selectedKey : null;
-    r.goal = { key: reading.key ?? previous?.key ?? null, state, selectedKey, attempts: !reading.key || previous?.key === reading.key || previous?.selectedKey === reading.key ? previous?.attempts ?? 0 : 0 };
+    r.goal = { key: reading.key ?? previous?.key ?? null, state, selectedKey, attempts: !reading.key || previous?.key === reading.key || previous?.selectedKey === reading.key ? previous?.attempts ?? 0 : 0,
+      ...(reading.modeId ? { modeId: reading.modeId } : {}) };
     if (state === "active") {
       if (!isSelectedGoal(r)) { this.set(r, "completed", "goal_unselected"); this.audit(r, "completed"); return; }
       if (!this.settings.continueGoals) { this.review(r, "goal_disabled"); return; }
@@ -271,6 +272,11 @@ export class RecoveryService {
         if (manual) throw new RecoveryError("The goal changed after the preview. Check its latest state.");
         return;
       }
+      if (reading.nativeContinuation) {
+        if (manual) throw new RecoveryError("OpenCode is managing this goal's continuation. Review its native goal state before sending another message.");
+        r.dueAt = this.now() + this.settings.goalDelaySeconds * 1000;
+        return;
+      }
     }
     const result = await this.verified(r, host); guard();
     if (result.reason || !result.agent) {
@@ -317,11 +323,12 @@ export class RecoveryService {
       if (!existing && Object.keys(this.saved.records).length >= 2000) throw new RecoveryError("Too many sessions are being tracked. Review existing candidates before watching another goal.");
       if (existing?.expectingStart || existing?.phase === "sending" || existing?.reason === "uncertain_send") throw new RecoveryError("A previous continuation has uncertain delivery. Check the conversation and dismiss that candidate before watching its goal again.");
       const reading = await host.goal?.(id);
-      if (!reading?.evidence) throw new RecoveryError("No supported goal state was found in the recent conversation. Goal tools must expose their result in Paseo.");
+      if (!reading?.evidence) throw new RecoveryError("No supported current goal was found. Set a goal in the provider before selecting it here.");
       if (!reading.key || reading.state === "complete" || reading.state === "cleared") throw new RecoveryError("The current goal could not be verified or has already ended. Open the session and check its goal.");
       if (expectedKey && expectedKey !== reading.key) throw new RecoveryError("The goal changed. Refresh and select the new goal if you want to continue it.");
       const previous = this.saved.records[id]; const at = this.now();
-      const goal = { key: reading.key, state: reading.state, selectedKey: reading.key, attempts: !resetAttempts && previous?.goal?.key === reading.key ? previous.goal.attempts : 0 };
+      const goal = { key: reading.key, state: reading.state, selectedKey: reading.key, attempts: !resetAttempts && previous?.goal?.key === reading.key ? previous.goal.attempts : 0,
+        ...(reading.modeId ? { modeId: reading.modeId } : {}) };
       // Selecting a goal must not replace an unresolved interruption or approval.
       if (previous && OPEN_PHASES.has(previous.phase) && !previous.reason.startsWith("goal_") && !["watching", "waiting"].includes(previous.phase)) {
         previous.goal = goal; previous.revision++; await this.persist(); return { ok: true };
@@ -375,6 +382,10 @@ export class RecoveryService {
         value.canSelect = value.visible && reading.evidence && !!reading.key && !excluded && !uncertain;
         value.note = excluded ? reasonText.excluded : uncertain ? reasonText.uncertain_send : !value.automatic ? "Automatic goal continuation is off in Settings."
           : r?.humanRequired || a.pendingPermissions > 0 ? reasonText.input : value.attempts >= value.maxAttempts ? reasonText.goal_limit
+          : reading.source === "opencode" ? value.state === "active" ? reading.nativeContinuation ? "OpenCode is managing continuation. Paseo will not send an extra message while the native continuation or child-session guard is in effect."
+            : "OpenCode also runs its own goal loop. This toggle controls Paseo's fallback continuation."
+            : value.state === "unknown" ? "OpenCode's current goal state could not be verified. Automatic continuation is paused."
+            : "OpenCode has paused or stopped this goal. This toggle does not resume it or reset its native limits. Review it in OpenCode; /goal resume starts a new native budget window."
           : value.state !== "active" ? reasonText[value.state === "paused" ? "goal_paused" : value.state === "blocked" ? "goal_blocked" : value.state === "limited" ? "goal_limited" : "goal_unknown"] : null;
       }
       if (this.controls.size >= 2000) this.controls.delete(this.controls.keys().next().value!);

@@ -13,6 +13,7 @@ import { daemonCompatibilityError } from "./compatibility";
 import { localWebSocketFactory } from "./transport";
 import { readGoal, type GoalItem, type GoalReading } from "./goals";
 import { CodexGoals } from "./codex-goals";
+import { OpenCodeGoals } from "./opencode-goals";
 
 export interface RecoveryHost {
   bootKey: string;
@@ -34,6 +35,7 @@ export function metadata(a: PaseoAgent): Agent {
     archivedAt: a.archivedAt ?? null, lastUserMessageAt: a.lastUserMessageAt,
     attentionReason: a.attentionReason ?? null, attentionTimestamp: a.attentionTimestamp ?? null,
     persistence: Boolean(a.persistence?.sessionId), internal: "internal" in a && a.internal === true,
+    modeId: a.currentModeId === undefined ? a.runtimeInfo?.modeId ?? null : a.currentModeId,
   };
 }
 export function resolveHome(configured: string): string {
@@ -123,6 +125,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
   });
   let closed = false;
   const codexGoals = new CodexGoals(home);
+  const openCodeGoals = new OpenCodeGoals(home);
   const close = async () => { if (closed) return; closed = true; await codexGoals.close(); await driver.close().finally(release); };
   const check = async () => {
     await identity();
@@ -140,6 +143,9 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         await check();
         const agent = (await paseo.agents.ref(id).refresh())?.agent;
         if (!agent) return { state: "unknown", key: null, evidence: true };
+        const openCode = await openCodeGoals.read(agent);
+        await check();
+        if (openCode) return openCode;
         if (agent.persistence?.sessionId) {
           const native = await codexGoals.read(agent.provider, agent.persistence.sessionId);
           await check();

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { openLocalHost, type RecoveryHost } from "./host";
+import { OpenCodeGoals } from "./opencode-goals";
 
 type Info = NonNullable<ReturnType<DaemonClient["getLastServerInfoMessage"]>>;
 let home: string;
@@ -89,5 +90,12 @@ describe("conversation goal lookup", () => {
     ]));
     host = await openLocalHost(home, process.pid);
     expect((await host.goal!("fixture")).state).toBe("complete");
+  });
+  it("uses the OpenCode mode adapter before conversation tools, including when the native goal is paused", async () => {
+    const reading = { state: "paused" as const, key: "native-goal", evidence: true, modeId: "goal", source: "opencode" as const };
+    vi.spyOn(OpenCodeGoals.prototype, "read").mockResolvedValue(reading);
+    const timeline = vi.spyOn(DaemonClient.prototype, "fetchAgentTimeline");
+    host = await openLocalHost(home, process.pid);
+    expect(await host.goal!("fixture")).toEqual(reading); expect(timeline).not.toHaveBeenCalled();
   });
 });

@@ -10,7 +10,7 @@ export const recordSchema = z.object({
   phase: phaseSchema, reason: reasonSchema, dueAt: timestamp.nullable(), attempts: z.number().int().nonnegative(),
   humanRequired: z.boolean(), pendingIds: z.array(z.string()), messageAt: z.string().nullable(),
   attemptMessageId: z.string().nullable(), expectingStart: z.boolean(), revision: z.number().int().nonnegative(),
-  goal: z.object({ key: z.string().nullable(), state: z.enum(["active", "paused", "blocked", "limited", "complete", "cleared", "unknown"]), attempts: z.number().int().nonnegative(), selectedKey: z.string().nullable().default(null) }).optional(),
+  goal: z.object({ key: z.string().nullable(), state: z.enum(["active", "paused", "blocked", "limited", "complete", "cleared", "unknown"]), attempts: z.number().int().nonnegative(), selectedKey: z.string().nullable().default(null), modeId: z.string().optional() }).optional(),
 });
 export type RecordEntry = z.infer<typeof recordSchema>;
 export const stateSchema = z.object({
@@ -22,7 +22,7 @@ export interface Agent {
   id: string; title: string; provider: string; workspaceId: string | null; parentId: string | null;
   status: string; activeTurn: string | null | undefined; pendingPermissions: number; archivedAt: string | null;
   lastUserMessageAt: string | null; attentionReason: string | null; attentionTimestamp: string | null;
-  persistence: boolean; internal: boolean;
+  persistence: boolean; internal: boolean; modeId?: string | null;
 }
 export interface Workspace { id: string; archived: boolean; archiving: boolean }
 export function time(value: string | null): number { const result = value ? Date.parse(value) : NaN; return Number.isFinite(result) ? result : 0; }
@@ -49,6 +49,7 @@ export function automaticBlock(r: RecordEntry, settings: Preferences, now: numbe
 export function snapshotBlock(a: Agent | null, r: RecordEntry, workspace: Workspace | null): Reason | null {
   if (!a) return "missing";
   if (a.internal || a.workspaceId !== r.workspaceId || a.provider !== r.provider || a.parentId !== r.parentId) return "unknown_state";
+  if (isGoalContinuation(r) && r.goal?.modeId && a.modeId !== r.goal.modeId) return "unknown_state";
   if (a.archivedAt) return "archived";
   if (!workspace || workspace.archived || workspace.archiving) return "workspace_unavailable";
   if (a.pendingPermissions > 0 || r.humanRequired) return "input";
