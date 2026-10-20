@@ -1,13 +1,18 @@
 {
   "name": "session-recovery",
   "private": true,
-  "version": "0.1.0",
-  "description": "Resume interrupted Paseo sessions after a daemon restart.",
+  "version": "0.2.0",
+  "description": "Recover interrupted Paseo sessions and continue active goals.",
   "license": "MIT",
   "author": "sm1ee",
-  "repository": { "type": "git", "url": "git+https://github.com/sm1ee/paseo-session-recovery.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sm1ee/paseo-session-recovery.git"
+  },
   "homepage": "https://github.com/sm1ee/paseo-session-recovery#readme",
-  "bugs": { "url": "https://github.com/sm1ee/paseo-session-recovery/issues" },
+  "bugs": {
+    "url": "https://github.com/sm1ee/paseo-session-recovery/issues"
+  },
   "files": [
     "paseo-plugin.json",
     "OVERVIEW.md",
@@ -28,7 +33,7 @@
     "test": "vitest run"
   },
   "devDependencies": {
-    "@getpaseo/plugin": "0.11.4",
+    "@getpaseo/plugin": "0.12.0",
     "@tanstack/react-query": "^5.90.11",
     "@types/react": "~19.2.0",
     "react": "19.1.0",
@@ -40,7 +45,7 @@
     "vitest": "^4.1.6"
   },
   "dependencies": {
-    "@getpaseo/client": "0.11.4",
+    "@getpaseo/client": "0.12.0",
     "ws": "^8.18.3"
   }
 }

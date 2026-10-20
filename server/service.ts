@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { preferences, statusInput, type Preferences, type Reason, type RecoveryRow, type RecoveryStatus, type ResumePreview } from "../shared/contracts";
-import { automaticBlock, backoff, busy, emptyState, fingerprint, isTransient, OPEN_PHASES, snapshotBlock, time, type Agent, type RecordEntry, type SavedState } from "../shared/model";
+import { GOAL_PROMPT, preferences, statusInput, type Preferences, type Reason, type RecoveryRow, type RecoveryStatus, type ResumePreview } from "../shared/contracts";
+import { automaticBlock, backoff, busy, emptyState, fingerprint, isGoalContinuation, isTransient, OPEN_PHASES, snapshotBlock, time, type Agent, type RecordEntry, type SavedState } from "../shared/model";
 import { openLocalHost, type RecoveryHost } from "./host";
 import { RecoveryError } from "./store";
 
@@ -44,7 +44,7 @@ export class RecoveryService {
     try { await this.host.store.save(this.saved); } catch (e) { this.fatal = true; throw e; }
   }
   private audit(r: RecordEntry, action: SavedState["history"][number]["action"], reason = r.reason): void {
-    this.saved.history.push({ at: this.now(), id: r.id, action, reason, attempt: r.attempts });
+    this.saved.history.push({ at: this.now(), id: r.id, action, reason, attempt: r.attempts + (r.goal?.attempts ?? 0) });
     this.saved.history = this.saved.history.slice(-100);
   }
   private set(r: RecordEntry, phase: RecordEntry["phase"], reason: Reason): void { r.phase = phase; r.reason = reason; r.dueAt = null; r.revision++; }
@@ -63,7 +63,7 @@ export class RecoveryService {
           else if (r.humanRequired || r.phase === "waiting") this.review(r, "input");
           else if ((r.phase === "watching" || r.phase === "interrupted") && r.turnId) this.scheduled(r, "daemon_restart");
           else if (r.phase === "watching" || r.phase === "interrupted") this.review(r, "unknown_state");
-          if (r.phase === "scheduled") r.dueAt = this.now() + backoff(this.settings, r.attempts);
+          if (r.phase === "scheduled") r.dueAt = this.now() + (r.reason === "goal_active" ? this.settings.goalDelaySeconds * 1000 : backoff(this.settings, r.attempts));
         }
       } else if (saved.lastBoot === host.bootKey) {
         // Reloads leave an observation gap, not proof of a daemon restart.
@@ -83,9 +83,13 @@ export class RecoveryService {
       if (this.stopped || generation !== this.generation) return;
       if (settings.daemonHome !== this.settings.daemonHome && this.host) { await this.host.close(); this.host = null; }
       const enabling = !this.settings.enabled && settings.enabled;
+      const enablingGoals = !this.settings.continueGoals && settings.continueGoals;
       this.settings = settings;
       this.validSettings = true;
       if (enabling) for (const r of Object.values(this.saved.records)) if (r.phase === "scheduled") r.dueAt = this.now() + backoff(settings, r.attempts);
+      for (const r of Object.values(this.saved.records)) {
+        if (r.goal?.state === "active" && (enablingGoals && r.reason === "goal_disabled" || settings.continueGoals && r.reason === "goal_limit" && r.goal.attempts < settings.goalMaxAttempts)) this.set(r, "review", "goal_check");
+      }
       try { await this.scan(generation); } finally { this.scheduleTimer(); }
     });
   }
@@ -112,7 +116,7 @@ export class RecoveryService {
           workspaceId: event.agent.workspaceId, parentId: event.agent.parentAgentId, turnId: event.turnId, bootKey: host.bootKey,
           startedAt: at, lastSeenAt: at, phase: "watching", reason: "active", dueAt: null, attempts: continuing ? r!.attempts : 0,
           humanRequired: false, pendingIds: [], messageAt: null, attemptMessageId: continuing ? r!.attemptMessageId : null,
-          expectingStart: false, revision: (r?.revision ?? 0) + 1 };
+          expectingStart: false, revision: (r?.revision ?? 0) + 1, ...(r?.goal ? { goal: r.goal } : {}) };
         this.saved.records[id] = r;
         const finished = Object.values(this.saved.records).filter((x) => !OPEN_PHASES.has(x.phase)).sort((a, b) => b.lastSeenAt - a.lastSeenAt);
         for (const old of finished.slice(200)) delete this.saved.records[old.id];
@@ -136,7 +140,12 @@ export class RecoveryService {
           }
         } else if (event.kind === "end") {
           r.expectingStart = false;
-          if (event.outcome.kind === "completed") { this.set(r, "completed", "finished"); this.audit(r, "completed"); }
+          if (event.outcome.kind === "completed") {
+            r.lastSeenAt = at;
+            if (this.settings.continueGoals && r.humanRequired) this.review(r, "input");
+            else if (this.settings.continueGoals) this.set(r, "review", "goal_check");
+            else { this.set(r, "completed", "finished"); this.audit(r, "completed"); }
+          }
           else if (event.outcome.kind === "canceled") {
             if (!r.humanRequired && await host.shuttingDown()) this.set(r, "interrupted", "shutdown");
             else { this.set(r, "stopped", "user_stop"); this.audit(r, "stopped"); }
@@ -165,13 +174,28 @@ export class RecoveryService {
     if (!reason && agent && await this.parentBlock(agent, host)) reason = "parent_unavailable";
     return { agent, reason };
   }
+  private async inspectGoal(r: RecordEntry, host: RecoveryHost): Promise<void> {
+    const reading = await host.goal?.(r.id) ?? { state: "unknown" as const, key: null, evidence: false };
+    if (!reading.evidence && !r.goal) { this.set(r, "completed", "finished"); this.audit(r, "completed"); return; }
+    const previous = r.goal;
+    const state = reading.state === "active" && !reading.key ? "unknown" : reading.state;
+    r.goal = { key: reading.key, state, attempts: previous?.key === reading.key ? previous?.attempts ?? 0 : 0 };
+    if (state === "active") {
+      if (!this.settings.continueGoals) { this.review(r, "goal_disabled"); return; }
+      if (r.phase !== "scheduled" || r.reason !== "goal_active" || previous?.key !== reading.key) {
+        this.scheduled(r, "goal_active"); r.dueAt = this.now() + this.settings.goalDelaySeconds * 1000;
+      }
+    } else if (state === "complete") { this.set(r, "completed", "goal_complete"); this.audit(r, "completed"); }
+    else if (state === "paused" || state === "cleared") { this.set(r, "stopped", state === "paused" ? "goal_paused" : "goal_cleared"); this.audit(r, "stopped"); }
+    else this.review(r, state === "blocked" ? "goal_blocked" : state === "limited" ? "goal_limited" : "goal_unknown");
+  }
   private async scan(generation: number): Promise<void> {
     this.scanning = true;
     try {
       this.check(generation); const host = await this.ready();
       const all = Object.values(this.saved.records).filter((r) => OPEN_PHASES.has(r.phase) && !this.saved.excluded.includes(r.id));
       const due = all.filter((r) => r.phase === "scheduled").sort((a, b) => (a.dueAt ?? 0) - (b.dueAt ?? 0));
-      const watch = all.filter((r) => ["watching", "waiting", "resumed"].includes(r.phase) || r.phase === "review" && ["monitor_gap", "unknown_end", "runtime_closed"].includes(r.reason));
+      const watch = all.filter((r) => ["watching", "waiting", "resumed"].includes(r.phase) || r.phase === "review" && ["monitor_gap", "unknown_end", "runtime_closed", "goal_check"].includes(r.reason));
       const rotating = watch.slice(this.cursor).concat(watch.slice(0, this.cursor));
       const batch = [...due.slice(0, 3), ...rotating.slice(0, 7)]; this.cursor = watch.length ? (this.cursor + 7) % watch.length : 0;
       // Read tracked sessions only. Old idle sessions are never discovered or resumed.
@@ -184,6 +208,17 @@ export class RecoveryService {
         if (a.activeTurn && a.pendingPermissions === 0) {
           if (r.phase !== "watching") this.set(r, "watching", "active");
           r.turnId = a.activeTurn; r.bootKey = host.bootKey; r.lastSeenAt = this.now(); r.messageAt = a.lastUserMessageAt; r.expectingStart = false; continue;
+        }
+        if (r.reason === "goal_check" || r.reason === "goal_active") {
+          if (r.reason === "goal_check") r.messageAt = a.lastUserMessageAt;
+          await this.inspectGoal(r, host); this.check(generation);
+          if ((this.changes.get(r.id) ?? 0) !== changed) continue;
+          if (r.reason !== "goal_active") continue;
+          if (!this.settings.enabled) continue;
+          const block = automaticBlock(r, this.settings, this.now());
+          if (block) { this.review(r, block); continue; }
+          if ((r.dueAt ?? Infinity) <= this.now()) await this.attempt(r, false, generation);
+          continue;
         }
         if (a.attentionReason === "finished" && time(a.attentionTimestamp) >= r.startedAt) { this.set(r, "completed", "finished"); this.audit(r, "completed"); continue; }
         if (["watching", "waiting", "resumed"].includes(r.phase)) {
@@ -213,6 +248,16 @@ export class RecoveryService {
     const guard = () => { this.check(generation); if ((this.changes.get(r.id) ?? 0) !== changed || this.saved.excluded.includes(r.id)) throw new RecoveryError("The session changed during recovery. Open it before trying again."); };
     guard();
     if (!manual) { const block = automaticBlock(r, this.settings, this.now()); if (block) { this.review(r, block); return; } }
+    const goalAttempt = isGoalContinuation(r);
+    if (goalAttempt) {
+      const key = r.goal!.key;
+      const reading = await host.goal?.(r.id); guard();
+      if (!reading || reading.state !== "active" || reading.key !== key || !key) {
+        await this.inspectGoal(r, host); await this.persist();
+        if (manual) throw new RecoveryError("The goal changed after the preview. Check its latest state.");
+        return;
+      }
+    }
     const result = await this.verified(r, host); guard();
     if (result.reason || !result.agent) {
       this.review(r, result.reason ?? "unknown_state"); await this.persist();
@@ -221,10 +266,12 @@ export class RecoveryService {
     if (ticket && (ticket.revision !== r.revision || ticket.fingerprint !== fingerprint(result.agent))) throw new RecoveryError("The session changed after the preview. Prepare recovery again.");
     const messageId = `session-recovery-${randomUUID()}`;
     // Persist intent before submission. Uncertain delivery is never automatically replayed.
-    this.set(r, "sending", r.reason); r.attemptMessageId = messageId; r.expectingStart = true; r.attempts++; r.lastSeenAt = this.now();
+    this.set(r, "sending", r.reason); r.attemptMessageId = messageId; r.expectingStart = true;
+    if (goalAttempt) r.goal!.attempts++; else r.attempts++;
+    r.lastSeenAt = this.now();
     await this.persist();
     try {
-      guard(); await host.send(r.id, ticket?.prompt ?? this.settings.prompt, messageId, result.agent, guard);
+      guard(); await host.send(r.id, ticket?.prompt ?? (goalAttempt ? GOAL_PROMPT : this.settings.prompt), messageId, result.agent, guard);
       this.set(r, "resumed", "sent"); r.lastSeenAt = this.now(); this.audit(r, "resume");
     } catch { this.review(r, "uncertain_send"); }
     await this.persist();
@@ -247,6 +294,29 @@ export class RecoveryService {
       return { ok: true };
     });
   }
+  watchGoal(id: string): Promise<{ ok: true }> {
+    this.changes.set(id, (this.changes.get(id) ?? 0) + 1);
+    return this.action(async () => {
+      const host = await this.ready(); const a = await host.fetch(id);
+      if (!a || a.internal || a.archivedAt || this.saved.excluded.includes(id)) throw new RecoveryError("This session is unavailable or excluded from recovery.");
+      const existing = this.saved.records[id];
+      if (!existing && Object.keys(this.saved.records).length >= 2000) throw new RecoveryError("Too many sessions are being tracked. Review existing candidates before watching another goal.");
+      if (existing?.expectingStart || existing?.phase === "sending" || existing?.reason === "uncertain_send") throw new RecoveryError("A previous continuation has uncertain delivery. Check the conversation and dismiss that candidate before watching its goal again.");
+      const reading = await host.goal?.(id);
+      if (!reading?.evidence) throw new RecoveryError("No supported goal state was found in the recent conversation. Goal tools must expose their result in Paseo.");
+      const previous = this.saved.records[id]; const at = this.now();
+      const r: RecordEntry = { id, title: a.title, provider: a.provider, workspaceId: a.workspaceId, parentId: a.parentId,
+        turnId: a.activeTurn ?? null, bootKey: host.bootKey, startedAt: at, lastSeenAt: at, phase: "review", reason: "goal_check", dueAt: null,
+        attempts: previous?.attempts ?? 0, humanRequired: previous?.humanRequired || a.pendingPermissions !== 0, pendingIds: previous?.pendingIds ?? [],
+        messageAt: a.lastUserMessageAt, attemptMessageId: null, expectingStart: false, revision: (previous?.revision ?? 0) + 1,
+        goal: { key: reading.key, state: reading.state, attempts: 0 } };
+      this.saved.records[id] = r;
+      if (busy(a)) this.set(r, a.pendingPermissions > 0 ? "waiting" : "watching", a.pendingPermissions > 0 ? "input" : "active");
+      else if (r.humanRequired) this.review(r, "input");
+      else await this.inspectGoal(r, host);
+      await this.persist(); return { ok: true };
+    });
+  }
   prepare(id: string): Promise<ResumePreview> {
     return this.action(async () => {
       const host = await this.ready(); const r = this.saved.records[id];
@@ -255,8 +325,9 @@ export class RecoveryService {
       if (result.reason || !result.agent || (this.changes.get(id) ?? 0) !== changed) throw new RecoveryError("The session is active, changed, or waiting for input. Open it before resuming.");
       const token = randomUUID(); const expiresAt = this.now() + 60_000;
       for (const [key, ticket] of this.tickets) if (ticket.expiresAt <= this.now()) this.tickets.delete(key);
-      this.tickets.set(token, { id, revision: r.revision, generation: this.generation, expiresAt, fingerprint: fingerprint(result.agent), prompt: this.settings.prompt });
-      return { token, expiresAt, title: result.agent.title, prompt: this.settings.prompt };
+      const prompt = isGoalContinuation(r) ? GOAL_PROMPT : this.settings.prompt;
+      this.tickets.set(token, { id, revision: r.revision, generation: this.generation, expiresAt, fingerprint: fingerprint(result.agent), prompt });
+      return { token, expiresAt, title: result.agent.title, prompt };
     });
   }
   resume(token: string): Promise<{ ok: true }> {
@@ -268,17 +339,18 @@ export class RecoveryService {
       await this.attempt(r, true, ticket.generation, ticket); return { ok: true };
     });
   }
-  private canResume(r: RecordEntry): boolean { return ["review", "scheduled", "interrupted"].includes(r.phase) && !r.humanRequired && !this.saved.excluded.includes(r.id) && !["uncertain_send", "new_activity", "finished", "archived", "missing", "input"].includes(r.reason); }
+  private canResume(r: RecordEntry): boolean { return ["review", "scheduled", "interrupted"].includes(r.phase) && !r.humanRequired && !this.saved.excluded.includes(r.id) && !["uncertain_send", "new_activity", "finished", "archived", "missing", "input", "goal_check", "goal_unknown", "goal_paused", "goal_blocked", "goal_complete", "goal_cleared", "goal_limited"].includes(r.reason); }
   status(input = statusInput.parse({})): RecoveryStatus {
     const rows: RecoveryRow[] = Object.values(this.saved.records).map((r) => ({ id: r.id, title: r.title, provider: r.provider, workspaceId: r.workspaceId, parentId: r.parentId,
       phase: r.phase, reason: this.saved.excluded.includes(r.id) ? "excluded" : !this.settings.enabled && r.phase === "scheduled" ? "disabled" : r.reason,
-      dueAt: r.phase === "scheduled" && this.settings.enabled ? r.dueAt : null, lastSeenAt: r.lastSeenAt, attempts: r.attempts, excluded: this.saved.excluded.includes(r.id), canResume: this.canResume(r) }));
-    for (const id of this.saved.excluded) if (!this.saved.records[id]) rows.push({ id, title: `Excluded session (${id.slice(0, 8)})`, provider: "", parentId: null, workspaceId: null, phase: "dismissed", reason: "excluded", dueAt: null, lastSeenAt: 0, attempts: 0, excluded: true, canResume: false });
+      dueAt: r.phase === "scheduled" && this.settings.enabled ? r.dueAt : null, lastSeenAt: r.lastSeenAt, attempts: r.attempts, excluded: this.saved.excluded.includes(r.id), canResume: this.canResume(r), goalState: r.goal?.state ?? null, goalAttempts: r.goal?.attempts ?? 0 }));
+    for (const id of this.saved.excluded) if (!this.saved.records[id]) rows.push({ id, title: `Excluded session (${id.slice(0, 8)})`, provider: "", parentId: null, workspaceId: null, phase: "dismissed", reason: "excluded", dueAt: null, lastSeenAt: 0, attempts: 0, excluded: true, canResume: false, goalState: null, goalAttempts: 0 });
     const query = input.query.trim().toLowerCase();
     const filtered = rows.filter((r) => {
       if (input.view === "excluded" ? !r.excluded : r.excluded) return false;
       if (input.view === "queue" && !["review", "scheduled", "interrupted", "sending"].includes(r.phase)) return false;
       if (input.view === "watching" && !["watching", "waiting", "resumed"].includes(r.phase)) return false;
+      if (input.view === "goals" && !r.goalState) return false;
       if (input.view === "history" && OPEN_PHASES.has(r.phase)) return false;
       return !query || `${r.id} ${r.title} ${r.provider}`.toLowerCase().includes(query);
     }).sort((a, b) => (a.dueAt ?? Infinity) - (b.dueAt ?? Infinity) || b.lastSeenAt - a.lastSeenAt);

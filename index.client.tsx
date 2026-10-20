@@ -2,7 +2,7 @@ import type { PluginClientContext, PluginScreenProps, PluginSidebarItemProps } f
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { RecoveryScreen } from "./client/screen";
 import { RecoverySettings } from "./client/settings";
-import { excludeRpc } from "./shared/contracts";
+import { excludeRpc, watchGoalRpc } from "./shared/contracts";
 
 function RecoveryItem({ currentScreen, openScreen }: PluginSidebarItemProps) {
   return (
@@ -23,5 +23,6 @@ export default function contribute(client: PluginClientContext) {
   client.addCommandCenterItem({ id: "settings", title: "session-recovery settings", icon: "Settings2", context: "global", onSelect({ openSettings }) { openSettings("preferences"); } });
   client.addCommandCenterItem({ id: "exclude", title: "Exclude this session from recovery", icon: "CirclePause", context: "agent", async onSelect({ agent, rpc }) { await rpc(excludeRpc, { id: agent.id, excluded: true }); } });
   client.addCommandCenterItem({ id: "include", title: "Allow future recovery for this session", icon: "RotateCcw", context: "agent", async onSelect({ agent, rpc }) { await rpc(excludeRpc, { id: agent.id, excluded: false }); } });
+  client.addCommandCenterItem({ id: "watch-goal", title: "Watch this session's goal", icon: "Target", context: "agent", async onSelect({ agent, rpc, openScreen }) { await rpc(watchGoalRpc, { id: agent.id }); openScreen({ screenId: "main", params: { agentId: agent.id } }); } });
   return () => {};
 }

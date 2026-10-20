@@ -1,0 +1,121 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { readGoal, type GoalReading } from "./goals";
+
+export interface CodexLaunch { command: string; args: string[]; env: Record<string, string> }
+function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
+export function codexLaunch(config: unknown, provider: string): CodexLaunch | null {
+  const providers = record(record(record(config).agents).providers);
+  const chain: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  let id = provider;
+  while (true) {
+    if (seen.has(id) || seen.size > 10) throw new Error("Invalid provider inheritance");
+    seen.add(id); const entry = record(providers[id]); chain.unshift(entry);
+    if (id === "codex") break;
+    if (typeof entry.extends !== "string") return null;
+    id = entry.extends;
+  }
+  let command = ["codex"];
+  let env: Record<string, string> = {};
+  for (const entry of chain) {
+    if (Array.isArray(entry.command) && entry.command.length && entry.command.every((v) => typeof v === "string" && v)) command = entry.command as string[];
+    env = { ...env, ...Object.fromEntries(Object.entries(record(entry.env)).filter((pair): pair is [string, string] => typeof pair[1] === "string")) };
+  }
+  return { command: command[0], args: [...command.slice(1), "app-server", "--enable", "goals"], env };
+}
+
+export class CodexGoalConnection {
+  private child: ChildProcessWithoutNullStreams | undefined;
+  private ready: Promise<void> | undefined;
+  private nextId = 0;
+  private buffer = "";
+  private closed = false;
+  private pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
+  constructor(private readonly launch: CodexLaunch, private readonly cwd: string, private readonly timeoutMs = 10_000) {}
+  private fail(): void {
+    for (const request of this.pending.values()) { clearTimeout(request.timer); request.reject(new Error("Codex goal lookup is unavailable")); }
+    this.pending.clear(); this.ready = undefined;
+  }
+  private request(method: string, params: unknown): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      const id = ++this.nextId;
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error("Codex goal lookup timed out")); void this.close(); }, this.timeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      this.child!.stdin.write(JSON.stringify({ id, method, params }) + "\n", (error) => { if (error) this.fail(); });
+    });
+  }
+  private start(): Promise<void> {
+    if (this.closed) return Promise.reject(new Error("Goal reader is closed"));
+    if (this.ready) return this.ready;
+    this.buffer = "";
+    // This subprocess only receives initialize and thread/goal/get. It never
+    // loads, resumes, changes, or starts a Codex thread.
+    const child = spawn(this.launch.command, this.launch.args, { cwd: this.cwd, env: { ...process.env, ...this.launch.env }, stdio: ["pipe", "pipe", "pipe"] });
+    this.child = child;
+    child.stderr.resume();
+    child.on("error", () => this.fail());
+    child.on("exit", () => { if (this.child === child) { this.child = undefined; this.fail(); } });
+    child.stdin.on("error", () => this.fail());
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      this.buffer += chunk;
+      if (this.buffer.length > 1_000_000) { this.fail(); void this.close(); return; }
+      let end: number;
+      while ((end = this.buffer.indexOf("\n")) >= 0) {
+        const line = this.buffer.slice(0, end); this.buffer = this.buffer.slice(end + 1);
+        let message: Record<string, unknown>;
+        try { message = record(JSON.parse(line)); } catch { continue; }
+        if (typeof message.id !== "number") continue;
+        const pending = this.pending.get(message.id); if (!pending) continue;
+        clearTimeout(pending.timer); this.pending.delete(message.id);
+        if (message.error) pending.reject(new Error("Codex goal lookup was rejected")); else pending.resolve(message.result);
+      }
+    });
+    this.ready = (async () => {
+      await this.request("initialize", { clientInfo: { name: "paseo-session-recovery", version: "0.2.0" }, capabilities: { experimentalApi: true } });
+      child.stdin.write(JSON.stringify({ method: "initialized" }) + "\n");
+    })();
+    return this.ready;
+  }
+  async read(threadId: string): Promise<GoalReading> {
+    await this.start();
+    const data = record(await this.request("thread/goal/get", { threadId }));
+    if (!("goal" in data)) throw new Error("Unrecognized Codex goal response");
+    if (data.goal === null) return { state: "cleared", key: null, evidence: false };
+    return readGoal([{ type: "tool_call", name: "get_goal", status: "completed", detail: { type: "unknown", input: {}, output: data.goal } }]);
+  }
+  async close(): Promise<void> {
+    this.closed = true; this.fail();
+    const child = this.child; this.child = undefined;
+    if (!child) return;
+    child.stdin.end();
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => { child.kill("SIGTERM"); resolve(); }, 1000);
+      child.once("exit", () => { clearTimeout(timer); resolve(); });
+    });
+  }
+}
+export class CodexGoals {
+  private readers = new Map<string, { signature: string; reader: CodexGoalConnection }>();
+  constructor(private readonly home: string) {}
+  async read(provider: string, threadId: string): Promise<GoalReading | null> {
+    const config = JSON.parse(await readFile(join(this.home, "config.json"), "utf8"));
+    const launch = codexLaunch(config, provider); if (!launch) return null;
+    const signature = createHash("sha256").update(JSON.stringify(launch)).digest("hex");
+    let current = this.readers.get(provider);
+    if (current?.signature !== signature) {
+      await current?.reader.close();
+      current = { signature, reader: new CodexGoalConnection(launch, this.home) };
+      this.readers.set(provider, current);
+    }
+    try { return await current!.reader.read(threadId); }
+    catch {
+      await current!.reader.close(); this.readers.delete(provider);
+      return { state: "unknown", key: null, evidence: true };
+    }
+  }
+  async close(): Promise<void> { for (const { reader } of this.readers.values()) await reader.close(); this.readers.clear(); }
+}

@@ -4,6 +4,7 @@ import { emptyState, HOUR, holdIds, type Agent, type SavedState, type Workspace 
 import type { RecoveryHost } from "./host";
 import { RecoveryService, type RecoveryEvent } from "./service";
 import { RecoveryError } from "./store";
+import type { GoalReading } from "./goals";
 
 const epoch = Date.parse("2026-10-20T00:00:00Z");
 const hook = { id: "session", title: "Test session", provider: "codex", workspaceId: "workspace", parentAgentId: null as string | null };
@@ -11,6 +12,7 @@ function fixture(options: Record<string, unknown> = {}) {
   let clock = epoch;
   let saved = emptyState("host");
   let shuttingDown = false;
+  let goalReading: GoalReading = { state: "unknown", key: null, evidence: false };
   let service!: RecoveryService;
   const a: Agent = { id: hook.id, title: hook.title, provider: hook.provider, workspaceId: hook.workspaceId, parentId: null,
     status: "running", activeTurn: "turn-1", pendingPermissions: 0, archivedAt: null, lastUserMessageAt: new Date(epoch).toISOString(),
@@ -20,18 +22,20 @@ function fixture(options: Record<string, unknown> = {}) {
   const store = { load: vi.fn(async () => structuredClone(saved)), save: vi.fn(async (s: SavedState) => { saved = structuredClone(s); }) };
   const fetch = vi.fn(async (id: string) => structuredClone(id === a.id ? a : others.get(id) ?? null));
   const getWorkspace = vi.fn(async () => structuredClone(workspace));
+  const goal = vi.fn(async () => structuredClone(goalReading));
   const send = vi.fn(async (_id: string, _prompt: string, _messageId: string, _expected: Agent, check: () => void) => { check(); });
   const settings = preferences.schema.parse(options);
   const hosts: RecoveryHost[] = [];
   const create = (bootKey: string) => {
     const host: RecoveryHost = { bootKey, serverId: "host", store, fetch, workspace: getWorkspace,
-      shuttingDown: vi.fn(async () => shuttingDown), send, close: vi.fn(async () => {}) };
+      shuttingDown: vi.fn(async () => shuttingDown), goal, send, close: vi.fn(async () => {}) };
     hosts.push(host); service = new RecoveryService(async () => host, () => clock, false); return service;
   };
   create("boot-a");
   const event = (value: Omit<RecoveryEvent, "agent">) => service.observe({ ...value, agent: { ...hook, parentAgentId: a.parentId } } as RecoveryEvent);
   return {
-    a, others, workspace, settings, store, fetch, getWorkspace, send, hosts,
+    a, others, workspace, settings, store, fetch, getWorkspace, goal, send, hosts,
+    setGoal: (reading: GoalReading) => { goalReading = reading; },
     get service() { return service; },
     get saved() { return structuredClone(saved); }, setSaved: (s: SavedState) => { saved = structuredClone(s); },
     advance: (n: number) => { clock += n; }, shutdown: (value: boolean) => { shuttingDown = value; },
@@ -42,6 +46,111 @@ function fixture(options: Record<string, unknown> = {}) {
     row() { return service.status(statusInput.parse({})).rows[0]; },
   };
 }
+describe("goal continuation", () => {
+  const active: GoalReading = { state: "active", key: "goal-fingerprint", evidence: true };
+  async function ended(f: ReturnType<typeof fixture>, turnId = "turn-1") {
+    f.idle(); f.a.attentionReason = "finished"; f.a.attentionTimestamp = new Date(epoch + 1000).toISOString();
+    await f.event({ kind: "end", turnId, outcome: { kind: "completed" } } as Omit<RecoveryEvent, "agent">);
+    await f.service.scanNow();
+  }
+  it("continues a completed turn with an active goal after the configured delay", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await ended(f);
+    expect(f.saved.records.session.reason).toBe("goal_active"); expect(holdIds(f.saved)).toContain("session");
+    f.advance(59_999); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+    f.advance(1); await f.service.scanNow(); await f.service.scanNow();
+    expect(f.send).toHaveBeenCalledTimes(1); expect(f.send.mock.calls[0][1]).toContain("goal was still active");
+    expect(f.saved.records.session.goal?.attempts).toBe(1);
+  });
+  it("does not read conversations or change completed turns unless enabled", async () => {
+    const f = fixture(); f.setGoal(active); await f.track(); await ended(f); f.advance(HOUR); await f.service.scanNow();
+    expect(f.goal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it.each(["complete", "paused", "blocked", "limited", "cleared", "unknown"] as const)("does not restart a goal with state %s", async (state) => {
+    const f = fixture({ continueGoals: true }); f.setGoal({ ...active, state }); await f.track(); await ended(f);
+    f.advance(HOUR); await f.service.scanNow();
+    expect(f.send).not.toHaveBeenCalled(); expect(f.saved.records.session.goal?.state).toBe(state);
+    expect(f.service.status(statusInput.parse({ view: "goals" })).rows[0].canResume).toBe(false);
+  });
+  it("does not treat the absence of a goal as unfinished work", async () => {
+    const f = fixture({ continueGoals: true }); await f.track(); await ended(f); f.advance(HOUR); await f.service.scanNow();
+    expect(f.saved.records.session.phase).toBe("completed"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("rechecks completion during the grace period", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await ended(f);
+    f.setGoal({ ...active, state: "complete" }); f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("goal_complete"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("lets the provider's own continuation start first", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await ended(f);
+    f.a.activeTurn = "native-turn"; f.a.status = "running";
+    f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.phase).toBe("watching"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("honors a stop while a goal continuation is scheduled", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await ended(f);
+    await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
+    f.advance(HOUR); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("user_stop"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("holds questions and approvals for the user", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track();
+    await f.event({ kind: "permission", requestId: "question" } as Omit<RecoveryEvent, "agent">); await ended(f);
+    f.advance(HOUR); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("input"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("preserves the per-goal limit across turns and restarts", async () => {
+    const f = fixture({ continueGoals: true, goalMaxAttempts: 1 }); f.setGoal(active); await f.track(); await ended(f);
+    f.advance(60_000); await f.service.scanNow();
+    f.a.status = "running"; f.a.activeTurn = "turn-2";
+    await f.event({ kind: "start", turnId: "turn-2" } as Omit<RecoveryEvent, "agent">);
+    await ended(f, "turn-2");
+    expect(f.saved.records.session.reason).toBe("goal_limit");
+    await f.restart(); f.advance(HOUR); await f.service.scanNow();
+    expect(f.send).toHaveBeenCalledTimes(1); expect(f.saved.records.session.goal?.attempts).toBe(1);
+  });
+  it("does not reuse a queued continuation after the user changes the conversation", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await ended(f);
+    f.a.lastUserMessageAt = new Date(epoch + 60_000).toISOString(); f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("new_activity"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("can explicitly watch an existing idle goal without discovering other sessions", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); f.idle(); await f.service.configure(f.settings);
+    await f.service.watchGoal("session"); f.advance(60_000); await f.service.scanNow();
+    expect(f.send).toHaveBeenCalledTimes(1); expect(f.saved.records.session.goal?.attempts).toBe(1);
+    expect(f.fetch.mock.calls.every(([id]) => id === "session")).toBe(true);
+  });
+  it("allows manual preview with automation off but does not send automatically", async () => {
+    const f = fixture(); f.setGoal(active); f.idle(); await f.service.configure(f.settings); await f.service.watchGoal("session");
+    expect(f.saved.records.session.reason).toBe("goal_disabled");
+    const preview = await f.service.prepare("session"); expect(preview.prompt).toContain("goal was still active");
+    f.advance(HOUR); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("schedules a watched goal when its setting is enabled", async () => {
+    const f = fixture(); f.setGoal(active); f.idle(); await f.service.configure(f.settings); await f.service.watchGoal("session");
+    await f.service.configure({ ...f.settings, continueGoals: true });
+    expect(f.saved.records.session.reason).toBe("goal_active");
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(1);
+  });
+  it("keeps goal continuations dormant while overall recovery is off", async () => {
+    const f = fixture({ enabled: false, continueGoals: true }); f.setGoal(active); f.idle(); await f.service.configure(f.settings); await f.service.watchGoal("session");
+    f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.phase).toBe("scheduled"); expect(f.send).not.toHaveBeenCalled();
+    await f.service.configure({ ...f.settings, enabled: true });
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(1);
+  });
+  it("keeps uncertain delivery protected and blocks Watch goal from bypassing it", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await ended(f);
+    f.send.mockRejectedValueOnce(new Error("lost response")); f.advance(60_000); await f.service.scanNow();
+    await expect(f.service.watchGoal("session")).rejects.toThrow(/uncertain delivery/);
+    await f.restart(); f.advance(HOUR); await f.service.scanNow();
+    expect(f.send).toHaveBeenCalledTimes(1); expect(holdIds(f.saved)).toContain("session");
+  });
+  it("does not read an excluded session's goal", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await f.service.exclude("session", true);
+    await expect(f.service.watchGoal("session")).rejects.toThrow(/excluded/);
+    expect(f.goal).not.toHaveBeenCalled();
+  });
+});
 describe("restart recovery", () => {
   it("does not scan or resume pre-existing sessions on first install", async () => {
     const f = fixture(); f.idle(); await f.service.configure(f.settings); f.advance(HOUR); await f.service.scanNow();

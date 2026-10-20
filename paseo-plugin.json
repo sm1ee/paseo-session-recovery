@@ -1,10 +1,10 @@
 {
   "id": "session-recovery",
   "name": "session-recovery",
-  "description": "Track interrupted sessions and resume unfinished work after a daemon restart.",
+  "description": "Recover interrupted sessions and continue goals that remain active after a turn ends.",
   "build": [["npm", "ci", "--ignore-scripts", "--omit=dev"]],
-  "media": ["assets/dashboard.png"],
+  "media": ["assets/goal-settings.png"],
   "requirements": {
-    "paseo": ">=0.11.4 <0.12.0"
+    "paseo": ">=0.11.4 <0.13.0"
   }
 }

@@ -3,9 +3,9 @@ import { useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
-import { dismissRpc, excludeRpc, prepareRpc, reasonText, resumeRpc, scanRpc, statusRpc, type Phase, type RecoveryRow, type ResumePreview } from "../shared/contracts";
+import { dismissRpc, excludeRpc, prepareRpc, reasonText, resumeRpc, scanRpc, statusRpc, watchGoalRpc, type Phase, type RecoveryRow, type ResumePreview } from "../shared/contracts";
 
-const views = [["queue", "Recovery queue"], ["watching", "Watching"], ["history", "History"], ["excluded", "Excluded"]] as const;
+const views = [["queue", "Recovery queue"], ["watching", "Watching"], ["goals", "Goals"], ["history", "History"], ["excluded", "Excluded"]] as const;
 const labels: Record<Phase, string> = { watching: "Watching", waiting: "Needs input", interrupted: "Interrupted", scheduled: "Scheduled", review: "Review needed", sending: "Sending…", resumed: "Continuation sent", completed: "Completed", stopped: "Stopped", dismissed: "Dismissed" };
 const states = { starting: "Connecting…", running: "Automatic recovery is on", paused: "Automatic recovery is off", error: "Recovery is paused" };
 function date(value: number | null): string { return value ? new Date(value).toLocaleString() : ""; }
@@ -15,15 +15,16 @@ export function RecoveryScreen({ theme, layout, params, navigation, host, onOpen
   const [page, setPage] = useState(0);
   const [preview, setPreview] = useState<ResumePreview | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const status = useRpc(statusRpc), scan = useRpc(scanRpc), exclude = useRpc(excludeRpc), dismiss = useRpc(dismissRpc), prepare = useRpc(prepareRpc), resume = useRpc(resumeRpc);
+  const status = useRpc(statusRpc), scan = useRpc(scanRpc), exclude = useRpc(excludeRpc), dismiss = useRpc(dismissRpc), prepare = useRpc(prepareRpc), resume = useRpc(resumeRpc), watch = useRpc(watchGoalRpc);
   const cache = useQueryClient();
   const result = useQuery({ queryKey: ["recovery", query, view, page], queryFn: () => status({ query, view, page }), refetchInterval: 5000 });
   const mutation = useMutation({
-    mutationFn: async (action: { kind: "scan" | "resume" } | { kind: "exclude" | "dismiss" | "prepare"; row: RecoveryRow }) => {
+    mutationFn: async (action: { kind: "scan" | "resume" } | { kind: "exclude" | "dismiss" | "prepare" | "watch"; row: RecoveryRow }) => {
       setNotice(null);
       if (action.kind === "scan") await scan({});
       if (action.kind === "exclude") await exclude({ id: action.row.id, excluded: !action.row.excluded });
       if (action.kind === "dismiss") await dismiss({ id: action.row.id });
+      if (action.kind === "watch") { await watch({ id: action.row.id }); setView("goals"); setPage(0); }
       if (action.kind === "prepare") setPreview(await prepare({ id: action.row.id }));
       if (action.kind === "resume" && preview) { await resume({ token: preview.token }); setPreview(null); setNotice("Recovery checked. The latest result is shown below."); }
     },
@@ -40,12 +41,12 @@ export function RecoveryScreen({ theme, layout, params, navigation, host, onOpen
         <Text style={{ ...text, fontSize: 24, fontWeight: "600" }}>session-recovery</Text>
         {button("Settings", onOpenSettings)}
       </View>
-      <Text style={muted}>Continue unfinished work after a daemon restart. Review interruptions that need your attention.</Text>
+      <Text style={muted}>Recover interrupted work and continue goals that remain active after a turn ends.</Text>
       <Text style={{ ...text, fontWeight: "600" }}>{data ? states[data.state] : "Connecting…"}</Text>
       {(data?.error || result.isError) && <Text accessibilityRole="alert" style={{ color: c.statusDanger }}>{data?.error ?? "Could not read recovery status. Check this host's connection and refresh."}</Text>}
       {data && <Text style={muted}>{data.counts.watching} watching · {data.counts.scheduled} scheduled · {data.counts.review} need review · {data.counts.resumed} recent continuations</Text>}
       <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 10, alignItems: "center" }}>{button(data?.scanning ? "Checking…" : "Check sessions", () => mutation.mutate({ kind: "scan" }), data?.scanning)}<Text style={muted}>{data?.lastScanAt ? `Checked ${date(data.lastScanAt)}` : ""}</Text></View>
-      <Text style={muted}>Only observed turns are tracked. An empty queue means no interrupted work has been recorded. Direct stops and completed turns are left alone.</Text>
+      <Text style={muted}>Observed turns and explicitly watched goals are tracked. Goal continuation must be enabled in settings. Direct stops and completed goals are left alone.</Text>
     </View>
     {notice && <Text accessibilityRole="alert" style={text}>{notice}</Text>}
     {preview && <View style={{ gap: 12, padding: 16, borderWidth: 1, borderColor: c.accent, borderRadius: 8, backgroundColor: c.surface1 }}>
@@ -66,9 +67,11 @@ export function RecoveryScreen({ theme, layout, params, navigation, host, onOpen
         <Text style={text}>{reasonText[row.reason]}</Text>
         {row.dueAt && <Text style={muted}>Resume after {date(row.dueAt)}</Text>}
         <Text style={muted}>{row.attempts} recovery attempts{row.lastSeenAt ? ` · Last seen ${date(row.lastSeenAt)}` : ""}</Text>
+        {row.goalState && <Text style={text}>Goal: {row.goalState} · {row.goalAttempts} continuations</Text>}
         <View style={{ flexDirection: "row", gap: 6, flexWrap: "wrap" }}>
           {navigation && button("Open session", () => navigation.openAgent({ agentId: row.id, serverId: host.id }))}
           {row.canResume && button("Resume…", () => mutation.mutate({ kind: "prepare", row }))}
+          {!row.excluded && !["watching", "waiting", "sending", "resumed"].includes(row.phase) && button(row.goalState ? "Watch goal again" : "Watch goal", () => mutation.mutate({ kind: "watch", row }))}
           {button(row.excluded ? "Allow future recovery" : "Exclude recovery", () => mutation.mutate({ kind: "exclude", row }))}
           {["scheduled", "review", "interrupted"].includes(row.phase) && button("Dismiss", () => mutation.mutate({ kind: "dismiss", row }))}
         </View>

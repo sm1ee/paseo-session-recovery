@@ -10,6 +10,7 @@ export const recordSchema = z.object({
   phase: phaseSchema, reason: reasonSchema, dueAt: timestamp.nullable(), attempts: z.number().int().nonnegative(),
   humanRequired: z.boolean(), pendingIds: z.array(z.string()), messageAt: z.string().nullable(),
   attemptMessageId: z.string().nullable(), expectingStart: z.boolean(), revision: z.number().int().nonnegative(),
+  goal: z.object({ key: z.string().nullable(), state: z.enum(["active", "paused", "blocked", "limited", "complete", "cleared", "unknown"]), attempts: z.number().int().nonnegative() }).optional(),
 });
 export type RecordEntry = z.infer<typeof recordSchema>;
 export const stateSchema = z.object({
@@ -31,10 +32,14 @@ export function backoff(settings: Preferences, attempts: number): number { retur
 export function isTransient(code: string | undefined): boolean {
   return /^(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|connection_lost|connection_reset|network_error|service_unavailable|server_overloaded|502|503|504)$/i.test(code ?? "");
 }
+export function isGoalContinuation(r: RecordEntry): boolean { return r.goal?.state === "active" && ["goal_active", "goal_limit", "goal_disabled"].includes(r.reason); }
 export function automaticBlock(r: RecordEntry, settings: Preferences, now: number): Reason | null {
   if (!settings.enabled) return "disabled";
   if (r.humanRequired) return "input";
-  if (r.attempts >= settings.maxAttempts) return "attempt_limit";
+  if (r.reason === "goal_active") {
+    if (!settings.continueGoals) return "goal_disabled";
+    if ((r.goal?.attempts ?? 0) >= settings.goalMaxAttempts) return "goal_limit";
+  } else if (r.attempts >= settings.maxAttempts) return "attempt_limit";
   if (now < r.lastSeenAt || now - r.lastSeenAt > settings.maxOfflineHours * HOUR) return "too_old";
   if (r.parentId && !settings.recoverSubagents) return "subagent";
   return null;
@@ -48,7 +53,7 @@ export function snapshotBlock(a: Agent | null, r: RecordEntry, workspace: Worksp
   if (a.pendingPermissions < 0 || a.activeTurn === undefined) return "unknown_state";
   if (busy(a)) return "new_activity";
   if (!a.persistence) return "no_history";
-  if (a.attentionReason === "finished" && time(a.attentionTimestamp) >= r.startedAt) return "finished";
+  if (!isGoalContinuation(r) && a.attentionReason === "finished" && time(a.attentionTimestamp) >= r.startedAt) return "finished";
   if (r.messageAt !== null && a.lastUserMessageAt !== r.messageAt) return "new_activity";
   if (r.messageAt === null && time(a.lastUserMessageAt) > r.lastSeenAt) return "new_activity";
   return null;

@@ -1,15 +1,18 @@
 import { createPaseoApi, type PaseoAgent } from "@getpaseo/client";
-import { DaemonClient, type WebSocketLike } from "@getpaseo/client/internal/daemon-client";
+import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import WebSocket from "ws";
 import { z } from "zod";
 import { busy, fingerprint, type Agent, type Workspace } from "../shared/model";
 import { FileStore, RecoveryError, type StateStore } from "./store";
+import { daemonCompatibilityError } from "./compatibility";
+import { localWebSocketFactory } from "./transport";
+import { readGoal, type GoalItem, type GoalReading } from "./goals";
+import { CodexGoals } from "./codex-goals";
 
 export interface RecoveryHost {
   bootKey: string;
@@ -17,6 +20,7 @@ export interface RecoveryHost {
   store: StateStore;
   fetch(id: string): Promise<Agent | null>;
   workspace(id: string): Promise<Workspace | null>;
+  goal?(id: string): Promise<GoalReading>;
   shuttingDown(): Promise<boolean>;
   send(id: string, prompt: string, messageId: string, expected: Agent, check: () => void): Promise<void>;
   close(): Promise<void>;
@@ -89,7 +93,7 @@ async function lease(directory: string): Promise<() => Promise<void>> {
   };
 }
 
-// 0.11.4 does not expose an SDK context at server entry startup. This small
+// 0.11 and 0.12 do not expose an SDK context at server entry startup. This small
 // version-pinned adapter authenticates only to the daemon that owns the plugin.
 export async function openLocalHost(configuredHome: string, parentPid = process.ppid): Promise<RecoveryHost> {
   if (process.platform === "win32") throw new RecoveryError("session-recovery currently requires a macOS or Linux daemon.");
@@ -107,7 +111,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
     if (JSON.stringify(current) !== JSON.stringify(lock) || await workerIdentity(parentPid, lock.pid) !== worker) throw new RecoveryError("The daemon changed. Recovery is paused.");
   };
   const driver = new DaemonClient({
-    url: endpoint.url, clientId: `session-recovery-${randomUUID()}`, clientType: "cli", appVersion: "0.11.4",
+    url: endpoint.url, clientId: `session-recovery-${randomUUID()}`, clientType: "cli", appVersion: "0.12.0",
     connectTimeoutMs: 10_000, reconnect: { enabled: false }, logger: { debug() {}, info() {}, warn() {}, error() {} },
     localCredential: async () => {
       await identity();
@@ -115,21 +119,48 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
       if (!/^[A-Za-z0-9_-]{43}$/.test(credential)) throw new RecoveryError("The daemon's local credential is unavailable.");
       return credential;
     },
-    webSocketFactory: (url, options) => new WebSocket(url, options?.protocols, { headers: options?.headers, ...(endpoint.socketPath ? { socketPath: endpoint.socketPath } : {}) }) as unknown as WebSocketLike,
+    webSocketFactory: localWebSocketFactory(endpoint.socketPath),
   });
   let closed = false;
-  const close = async () => { if (closed) return; closed = true; await driver.close().finally(release); };
+  const codexGoals = new CodexGoals(home);
+  const close = async () => { if (closed) return; closed = true; await codexGoals.close(); await driver.close().finally(release); };
   const check = async () => {
     await identity();
     if (closed || driver.getConnectionState().status !== "connected" || driver.getLastServerInfoMessage()?.serverId !== lock.serverId) throw new RecoveryError("The local daemon is disconnected. Recovery is paused.");
   };
   try {
     await driver.connect(); await check();
-    if (!/^0\.11\./.test(driver.getLastServerInfoMessage()?.version ?? "")) throw new RecoveryError("This Paseo daemon version has not been verified for automatic recovery.");
+    const compatibilityError = daemonCompatibilityError(driver.getLastServerInfoMessage()?.version, driver.supportsBackgroundWorkspaces());
+    if (compatibilityError) throw new RecoveryError(compatibilityError);
     const paseo = createPaseoApi(driver);
     const fetch = async (id: string) => { await check(); const result = await paseo.agents.ref(id).refresh(); await check(); return result?.agent ? metadata(result.agent) : null; };
     return {
       bootKey, serverId: lock.serverId, store: new FileStore(directory, lock.serverId), fetch,
+      async goal(id) {
+        await check();
+        const agent = (await paseo.agents.ref(id).refresh())?.agent;
+        if (!agent) return { state: "unknown", key: null, evidence: true };
+        if (agent.persistence?.sessionId) {
+          const native = await codexGoals.read(agent.provider, agent.persistence.sessionId);
+          await check();
+          if (native) return native;
+        }
+        let page = await driver.fetchAgentTimeline(id, { projection: "canonical", direction: "tail", limit: 200 });
+        const epoch = page.epoch;
+        let entries = [...page.entries];
+        const cursors = new Set<number>();
+        for (let n = 0; n < 10; n++) {
+          await check();
+          if (page.error || page.gap || page.staleCursor || page.epoch !== epoch || n === 0 && page.hasNewer) return { state: "unknown", key: null, evidence: true };
+          const reading = readGoal(entries.sort((a, b) => a.seqEnd - b.seqEnd).map((e) => e.item as GoalItem));
+          if (reading.evidence && (reading.key || reading.state !== "active") || !page.hasOlder) return reading;
+          if (!page.startCursor || cursors.has(page.startCursor.seq)) break;
+          cursors.add(page.startCursor.seq);
+          page = await driver.fetchAgentTimeline(id, { projection: "canonical", direction: "before", cursor: page.startCursor, limit: 200 });
+          entries = [...page.entries, ...entries];
+        }
+        return { state: "unknown", key: null, evidence: true };
+      },
       async workspace(id) {
         await check(); const w = await paseo.workspaces.ref(id).refresh(); await check();
         // Workspace descriptors include active workspaces only; archived ones
@@ -138,7 +169,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
       },
       async shuttingDown() {
         await identity();
-        // Paseo 0.11.4 removes this credential at the start of graceful shutdown,
+        // Paseo 0.11.4 and 0.12.0 remove this credential at graceful shutdown,
         // before canceling turns or closing sessions. Rotation is not assumed.
         try { await access(join(home, "local-credential")); return false; }
         catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return true; throw e; }
