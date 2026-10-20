@@ -11,9 +11,10 @@ import { busy, fingerprint, goalCommandReady, type Agent, type Workspace } from 
 import { FileStore, RecoveryError, type StateStore } from "./store";
 import { daemonCompatibilityError } from "./compatibility";
 import { localWebSocketFactory } from "./transport";
-import { readGoal, type GoalItem, type GoalReading } from "./goals";
-import { CodexGoals, type CodexGoalDetails } from "./codex-goals";
+import { readGoal, type GoalDetails, type GoalItem, type GoalReading, type GoalSource } from "./goals";
+import { CodexGoals } from "./codex-goals";
 import { OpenCodeGoals } from "./opencode-goals";
+import { ClaudeGoals } from "./claude-goals";
 
 export interface RecoveryHost {
   bootKey: string;
@@ -22,8 +23,8 @@ export interface RecoveryHost {
   fetch(id: string): Promise<Agent | null>;
   workspace(id: string): Promise<Workspace | null>;
   goal?(id: string, options?: { allowTimeline?: boolean }): Promise<GoalReading>;
-  supportsGoalCommand?(id: string): Promise<boolean>;
-  goalDetails?(id: string): Promise<CodexGoalDetails | null>;
+  supportsGoalCommand?(id: string, source?: GoalSource): Promise<boolean>;
+  goalDetails?(id: string): Promise<GoalDetails | null>;
   editGoal?(id: string, revision: string, objective: string, expected: Agent, check: () => void, messageId: string, submitted: () => void): Promise<GoalReading>;
   resumeBlockedGoal?(id: string, key: string, expected: Agent, check: () => void, messageId: string, submitted?: () => void): Promise<GoalReading>;
   shuttingDown(): Promise<boolean>;
@@ -42,16 +43,24 @@ export function metadata(a: PaseoAgent): Agent {
     modeId: a.currentModeId === undefined ? a.runtimeInfo?.modeId ?? null : a.currentModeId,
   };
 }
-function checkGoalSession(current: Agent | null, expected: Agent, stage: "initial" | "final"): asserts current is Agent {
-  // A native command changes the goal on an existing thread without allocating
-  // a continuation turn. Titles, attention and hydrated turn metadata can change
-  // during lookup. Lifecycle guards still protect stops, approvals and new turns.
-  const stable = ["id", "provider", "workspaceId", "parentId", "sessionId", "lastUserMessageAt"] as const;
+export function nativeGoalCommand(commands: readonly { name: string; kind?: string; description: string }[], source: GoalSource): boolean {
+  const descriptions: Record<GoalSource, string[]> = {
+    codex: ["Set, pause, resume, or clear the agent's goal"],
+    opencode: ["Set a session-scoped goal and auto-continue until complete."],
+    claude: ["Set a goal — keep working until the condition is met"],
+  };
+  return commands.some((command) => command.name === "goal" && command.kind === (source === "claude" ? "skill" : "command") && descriptions[source].includes(command.description));
+}
+function checkGoalSession(current: Agent | null, expected: Agent, stage: "initial" | "final", idleOnly = false): asserts current is Agent {
+  // Codex updates can run during a turn; OpenCode/Claude commands require idle.
+  // Presentation metadata can change during lookup. Lifecycle guards still
+  // protect stops, approvals and new turns.
+  const stable = ["id", "provider", "workspaceId", "parentId", "sessionId", "lastUserMessageAt", "modeId"] as const;
   if (current && expected.sessionId && stable.every((field) => current[field] === expected[field]) &&
-    goalCommandReady(current) && !current.archivedAt && !current.internal) return;
-  console.warn("Native goal resume preflight rejected", { stage,
+    goalCommandReady(current) && (!idleOnly || !busy(current)) && !current.archivedAt && !current.internal) return;
+  console.warn("Native goal preflight rejected", { stage,
     changedFields: current ? Object.keys({ ...expected, ...current }).filter((field) => current[field as keyof Agent] !== expected[field as keyof Agent]) : ["missing"] });
-  throw new RecoveryError("The session changed before its goal could resume. Check it and try again.");
+  throw new RecoveryError("The session changed before its goal could be updated. Check it and try again.");
 }
 export function resolveHome(configured: string): string {
   const raw = configured.trim() || process.env.PASEO_HOME || join(homedir(), ".paseo");
@@ -141,6 +150,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
   let closed = false;
   const codexGoals = new CodexGoals(home);
   const openCodeGoals = new OpenCodeGoals(home);
+  const claudeGoals = new ClaudeGoals(home);
   const close = async () => { if (closed) return; closed = true; await codexGoals.close(); await driver.close().finally(release); };
   const check = async () => {
     await identity();
@@ -161,6 +171,10 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         const openCode = await openCodeGoals.read(agent);
         await check();
         if (openCode) return openCode;
+        if (options?.allowTimeline !== false) {
+          const claude = await claudeGoals.details(agent); await check();
+          if (claude) return claude.reading;
+        }
         if (agent.persistence?.sessionId) {
           const native = await codexGoals.read(agent.provider, agent.persistence.sessionId);
           await check();
@@ -191,17 +205,17 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         // return null. Session archivedAt is checked independently before send.
         return w ? { id: w.id, archived: false, archiving: Boolean(w.archivingAt) } : null;
       },
-      async supportsGoalCommand(id) {
+      async supportsGoalCommand(id, source = "codex") {
         await check();
         const result = await paseo.agents.ref(id).commands(); await check();
         if (result.error) throw new RecoveryError("Could not check this session's native goal commands. Try again.");
-        return result.commands.some((command) => command.name === "goal" && command.kind === "command" && command.description === "Set, pause, resume, or clear the agent's goal");
+        return nativeGoalCommand(result.commands, source);
       },
       async goalDetails(id) {
         await check();
         const agent = (await paseo.agents.ref(id).refresh())?.agent;
-        if (!agent?.persistence?.sessionId) return null;
-        const details = await codexGoals.details(agent.provider, agent.persistence.sessionId);
+        if (!agent) return null;
+        const details = await openCodeGoals.details(agent) ?? await claudeGoals.details(agent) ?? (agent.persistence?.sessionId ? await codexGoals.details(agent.provider, agent.persistence.sessionId) : null);
         await check(); return details;
       },
       async editGoal(id, revision, objective, expected, guard, messageId, submitted) {
@@ -209,22 +223,33 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         const agent = (await paseo.agents.ref(id).refresh())?.agent;
         checkGoalSession(agent ? metadata(agent) : null, expected, "initial");
         if (!agent?.persistence?.sessionId) throw new RecoveryError("The session's saved history is unavailable.");
+        const details = await openCodeGoals.details(agent) ?? await claudeGoals.details(agent) ?? await codexGoals.details(agent.provider, agent.persistence.sessionId);
+        const source = details?.reading.source;
+        if (!source || source === "timeline") throw new RecoveryError("This provider's native goal editor is unavailable.");
+        const idleOnly = source !== "codex";
+        checkGoalSession(metadata(agent), expected, "initial", idleOnly);
         const workspace = agent.workspaceId ? await paseo.workspaces.ref(agent.workspaceId).refresh() : null;
         if (!workspace || workspace.archivingAt) throw new RecoveryError("This workspace is unavailable.");
         const commands = await paseo.agents.ref(id).commands();
-        if (commands.error || !commands.commands.some((command) => command.name === "goal" && command.kind === "command" && command.description === "Set, pause, resume, or clear the agent's goal")) throw new RecoveryError("Native Codex goal commands are unavailable for this session.");
+        if (commands.error || !nativeGoalCommand(commands.commands, source)) throw new RecoveryError("Native goal commands are unavailable for this session.");
         await check(); guard();
         try {
-          return await codexGoals.edit(agent.provider, agent.persistence.sessionId, revision, objective, guard, async () => {
+          const send = async () => {
             if (driver.getLastServerInfoMessage()?.features?.agentRequestReceipts !== true) throw new RecoveryError("This daemon does not advertise durable message receipts.");
-            checkGoalSession(await fetch(id), expected, "final");
+            checkGoalSession(await fetch(id), expected, "final", idleOnly);
             const currentWorkspace = await paseo.workspaces.ref(workspace.id).refresh();
             if (!currentWorkspace || currentWorkspace.archivingAt) throw new RecoveryError("This workspace is unavailable.");
             await check(); guard(); submitted();
-            try { await driver.sendAgentMessage(id, `/goal ${objective.trim()}`, { messageId, activeTurnBehavior: "steer" }); }
+            // OpenCode strips one wrapping quote at each edge. Wrapping the raw
+            // objective preserves quotes/newlines without JSON escape sequences.
+            const command = source === "opencode" ? `/goal edit "${objective.trim()}"` : `/goal ${objective.trim()}`;
+            try { await driver.sendAgentMessage(id, command, { messageId, activeTurnBehavior: "steer" }); }
             catch { throw new RecoveryError("The goal edit delivery could not be confirmed. Check the conversation and reload before trying again."); }
-          });
-        } catch (error) { throw new RecoveryError(error instanceof Error ? error.message : "Codex could not confirm the goal edit. Reload the editor before trying again."); }
+          };
+          return source === "opencode" ? await openCodeGoals.edit(agent, revision, objective, guard, send)
+            : source === "claude" ? await claudeGoals.edit(agent, revision, objective, guard, send)
+            : await codexGoals.edit(agent.provider, agent.persistence.sessionId, revision, objective, guard, send);
+        } catch (error) { throw new RecoveryError(error instanceof Error ? error.message : "The provider could not confirm the goal edit. Reload before trying again."); }
       },
       async resumeBlockedGoal(id, key, expected, guard, messageId, submitted) {
         await check(); guard();

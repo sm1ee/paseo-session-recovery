@@ -125,10 +125,22 @@ describe("명시적인 Goal 편집", () => {
     expect(await f.service.readGoalEditor("session")).toMatchObject({ supported: false, ticket: null });
     expect(f.goal).not.toHaveBeenCalled(); expect(f.editGoal).not.toHaveBeenCalled();
   });
+  it.each(["opencode", "claude"] as const)("%s의 확인된 네이티브 목표만 편집하며 턴 실행 중에는 기다린다", async (source) => {
+    const f = await editor(); f.a.provider = source;
+    const reading: GoalReading = { state: "active", key: "provider-goal", evidence: true, source };
+    f.setDetails({ reading, objective: "Original fixture", revision: "provider-revision", tokenBudget: source === "claude" ? null : 100, tokensUsed: null });
+    let view = await f.service.readGoalEditor("session");
+    expect(view).toMatchObject({ supported: true, source, objective: "Original fixture", ticket: expect.any(String) });
+    expect(f.supportsGoalCommand).toHaveBeenCalledWith("session", source);
+    expect(view.note).toContain(source === "claude" ? "resets its goal timer" : "preserves turn/token/time budgets");
+    f.a.status = "running"; f.a.activeTurn = "current-turn";
+    view = await f.service.readGoalEditor("session"); expect(view.ticket).toBeNull(); expect(view.note).toContain("Wait");
+    expect(f.editGoal).not.toHaveBeenCalled();
+  });
   it("승인을 기다리거나 예산이 소진된 Goal은 읽기 전용이다", async () => {
     const f = await editor(); f.a.pendingPermissions = 1;
     expect(await f.service.readGoalEditor("session")).toMatchObject({ ticket: null, objective: "Original fixture" });
-    f.a.pendingPermissions = 0; f.setDetails({ reading: { state: "limited", key: "original-goal", evidence: true }, objective: "Original fixture", revision: "native-revision", tokenBudget: 100, tokensUsed: 100 });
+    f.a.pendingPermissions = 0; f.setDetails({ reading: { state: "limited", key: "original-goal", evidence: true, source: "codex" }, objective: "Original fixture", revision: "native-revision", tokenBudget: 100, tokensUsed: 100 });
     expect(await f.service.readGoalEditor("session")).toMatchObject({ ticket: null, state: "limited" });
     expect(f.editGoal).not.toHaveBeenCalled();
   });

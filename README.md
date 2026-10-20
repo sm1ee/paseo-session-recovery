@@ -48,15 +48,23 @@ Paused, limited, and non-Codex blocked goals can be selected without changing th
 
 Turning automatic recovery off leaves monitoring and manual review available. Settings are shared by clients connected to the same daemon.
 
-## View and edit a Codex goal
+## View and edit a goal
 
-In a native Codex session, enter `/goal`, `/goal edit`, or `/goal-edit`, or choose **View or edit this session's goal** in the Command Center. The desktop and mobile editor shows the current objective, native state, and token usage. The objective is prefilled so you can change it in place.
+In a native Codex, OpenCode Goal-mode, or Claude Code session, enter `/goal`, `/goal edit`, or `/goal-edit`, or choose **View or edit this session's goal** in the Command Center. The desktop and mobile editor prefills the current objective and shows its native state and reported token usage.
 
-**Save goal** uses the existing Paseo connection's native `/goal <objective>` command. For paused or blocked goals the button is **Save and activate**: that native command sets the edited goal active. It does not explicitly start a model turn, but Codex's own goal loop may continue an active goal. Completed goals, exhausted limits, unavailable state, pending approvals, and uncertain delivery are read-only. The editor does not change token budgets; it checks the native result and never retries an unconfirmed edit automatically.
+| Provider | Save behavior |
+| --- | --- |
+| Codex | **Save goal**, or **Save and activate** for paused/blocked goals. Sends native `/goal <objective>`, preserving the goal budget and usage. Codex's own loop may start work. |
+| OpenCode | Uses native `/goal edit <objective>`, preserving the focused goal ID, turn/token/time budgets, usage, and history. Paused/blocked goals become active and native work starts. Requires opencode-goal-plugin's version 1 session state and its registered `/goal` command. |
+| Claude Code | **Replace goal and start** sends native `/goal <condition>` and immediately starts a turn. Claude replaces the condition and resets its goal timer, evaluated turn count, and token-spend baseline. Claude exposes no separate goal token budget. |
+
+OpenCode and Claude edits require an idle session because their native commands start work. Completed goals, exhausted limits, unavailable state, pending approvals, and uncertain delivery are read-only. The editor checks the native result and never retries an unconfirmed edit automatically. OpenCode and Claude conditions are limited to 4,000 characters; Codex allows 16,000 in this editor.
+
+Claude reads native `goal_status` attachments in the selected session's JSONL transcript, following the current parent chain to exclude abandoned branches. It inspects at most the last 8 MiB; incomplete, changing, missing, or unrecognized state is read-only. `CLAUDE_CONFIG_DIR` from the inherited provider environment is supported. A launch wrapper or hook that privately changes that directory must expose the same path in the provider environment. Token usage, when present, is from the last native goal evaluation. The plugin does not change Claude's hook settings or trust policy. Its native `/goal` command must be available and allowed by those policies.
 
 Saving rechecks the native objective, state, identity, budget, and the session before sending. An edit ticket expires after five minutes and is consumed once. These checks reduce stale overwrites; Paseo does not expose an atomic conditional goal update. The new objective is not automatically selected for Paseo continuation. Select it again if desired. Opening the editor never selects a goal or starts work, and its objective reads are not part of background discovery. Objective text and edit tickets are not written to the recovery journal.
 
-`/goal pause`, `/goal resume`, `/goal clear`, and `/goal <objective>` retain their native behavior. Other providers retain their native `/goal` and `/goal edit` behavior; their goal editor integration is not included in this release.
+Nonempty `/goal` arguments other than `edit` retain their native behavior, including `/goal pause`, `/goal resume`, and `/goal clear` where supported. Other providers retain their native `/goal` and `/goal edit` behavior. OMP editing is unavailable because its current goal RPC does not expose an objective update; the editor does not replace it by clearing and recreating a goal.
 
 ## Goal continuation
 
@@ -70,9 +78,13 @@ OpenCode uses the **Goal** agent mode supplied by [opencode-goal-plugin](https:/
 
 OpenCode already has its own goal loop. This toggle controls Paseo's fallback messages; turning it off does not pause OpenCode's own loop. A native continuation claim or child-session guard prevents an extra Paseo message. Native pauses, blockers, restarts, and limits are respected. Use OpenCode's `/goal pause` to pause its loop. Review a stopped goal before using `/goal resume`, which starts a new native budget window. This plugin never sends those control commands or resets native budgets automatically.
 
+OpenCode's configured Goal command and agent must reference an available model. A stale command/agent model can fail before the native goal is created even when the session has a different model selected.
+
 OpenCode state is read from `<session cwd>/.opencode/goals/state.json.sessions/<hashed native session ID>/state.json`, or the corresponding location under `OPENCODE_GOAL_STATE_PATH` in the provider environment. Custom providers extending OpenCode are supported. Snapshots are bounded to 2 MiB and checked against the native lifecycle ledger's modification time. Missing, changed, malformed, unsupported, or outdated snapshots require review. Persistence must be enabled. Legacy global state and JavaScript-only `stateFilePath` overrides are not discovered; expose a custom location through `OPENCODE_GOAL_STATE_PATH`. The upstream source and state format were used as the integration reference; the reader does not import or execute the upstream plugin.
 
 For OMP, the plugin reads structured `goal` tool results and Paseo's `omp_goal_updated` timeline records. It also reads structured `create_goal`, `get_goal`, and `update_goal` results, including compatible Pi goal extensions. Detection depends on the provider exposing these records in Paseo. Ordinary chat text, plans, and to-do lists are not treated as goals. Conversation inspection is bounded to the most recent 2,000 canonical timeline entries; an unverifiable state requires review.
+
+Claude goal inspection is explicit through the editor or Command Center. Background composer discovery does not scan its transcripts. Claude's own goal loop owns continuation, so a selected active Claude goal never receives an additional Paseo fallback message.
 
 Automatic composer discovery reads native goal state only and never restores a conversation to find a goal. For OMP and other providers that expose goals through conversation records, use **Continue this session's goal** in the Command Center to inspect and select one explicitly. Selected goals keep their automatic checks before continuation. Their composer toggle can show the last checked state without loading the conversation. Concurrent background checks for the same session share a result; sessions without a visible goal are checked again after five minutes or a relevant session change.
 
@@ -112,7 +124,7 @@ paseo plugin install /absolute/path/to/paseo-session-recovery
 
 Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed. Goal controls retry a failed initial session lookup and restore previously visible goals first after reconnecting, including on mobile clients.
 
-For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.4.5`. The public registry listing requires a separate review.
+For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.5.0`. The public registry listing requires a separate review.
 
 ## Local data
 

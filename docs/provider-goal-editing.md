@@ -1,11 +1,12 @@
 # 제공자별 Goal 편집 조사
 
-확인 날짜: 2026-10-20. 이번 릴리스에는 Codex 편집기만 추가했다.
+확인 날짜: 2026-10-20. v0.5.0은 기존 Codex 편집기에 OpenCode와 Claude Code를 연결한다.
 
 | 제공자 | 본문 조회 | 현재 목표 본문 수정 | 이번 처리 |
 | --- | --- | --- | --- |
 | Codex | `thread/goal/get` | Paseo의 대화 소유 연결이 `/goal <objective>`를 처리하며 `thread/goal/set` 호출 | 조회·편집 UI와 검증을 추가 |
-| OpenCode Goal plugin | 기존 플러그인이 읽는 세션별 snapshot | 네이티브 `/goal edit <objective>`와 `update_goal` 도구가 존재 | 동작 조사 완료, 편집기 연결은 미포함 |
+| OpenCode Goal plugin | 기존 플러그인이 읽는 세션별 snapshot | 네이티브 `/goal edit <objective>`와 `update_goal` 도구가 존재 | slash 명령으로 편집하고 ID·예산·사용량 보존을 확인 |
+| Claude Code | 현재 대화 가지의 네이티브 `goal_status` 기록 | `/goal <condition>`이 조건을 교체하고 즉시 턴을 시작 | 교체와 카운터 초기화를 명시한 편집기를 추가 |
 | OMP 18.11.3 | RPC Goal `get`과 구조화된 Goal 기록 | 확인한 RPC와 Goal 도구에는 본문 수정 연산이 없음 | 기존 목표를 삭제·재생성하는 방식으로 대체하지 않음 |
 
 ## Codex
@@ -20,9 +21,23 @@ Paseo v0.12.0의 Codex 제공자는 목표 설정 시 `objective`와 `status: "a
 
 확인한 upstream pin은 `2ef30137d666d50b252b8f4af144a1997fa53dcf`다. `/goal edit <objective>`는 목표 식별자, 토큰·턴·시간 예산과 이력을 유지하면서 본문을 수정한다. 새 `runId`를 발급해 진행 중인 작업·검토 결과를 무효화하고, 멈춤 상태를 해제해 목표를 활성화한다. 한도에 도달한 목표는 다음 idle 검사에서 다시 멈추며 `/goal resume`는 별도로 예산 창을 초기화한다.
 
-`update_goal` 도구의 본문 수정은 정지 상태를 유지한다. 즉 slash 명령과 도구의 상태 전이가 다르다. Paseo 편집기로 연결할 때는 사용자가 요청한 활성화 여부와 실제 네이티브 결과를 구분해야 한다. 로컬 OpenCode 설정에 Goal plugin 선언은 확인했으나, 이 조사는 해당 설치본의 편집 동작을 실제로 실행한 검증은 아니다.
+`update_goal` 도구의 본문 수정은 정지 상태를 유지한다. slash 명령과 도구의 상태 전이가 다르므로 편집기는 네이티브 slash 명령을 쓰고, 중지된 목표에는 **Save and activate**를 표시한다. 한도가 소진된 목표는 편집으로 재개하지 않는다. OpenCode의 편집 명령은 작업을 시작하므로 대화가 idle인 동안만 저장할 수 있다.
+
+실제 로컬 OpenCode 2.0.32와 opencode-goal-plugin 0.8.2의 새 시험 대화에서 본문 편집 후 같은 Goal ID·예산 창·턴/토큰/시간 한도·사용량·이력 보존을 확인했다. 따옴표와 줄바꿈도 보존한다. 이 설치본과 위 upstream pin의 세부 구현은 구분한다. 처음 시험에서는 오래된 기본 모델 참조로 네이티브 명령 자체가 실패했다. 시험 작업공간에만 유효한 모델과 Goal 모드 등록 정보를 지정했고 사용자 전역 설정은 변경하지 않았다.
 
 출처: [본문 수정 도구](https://github.com/william-ricchiuti/OpenCode-goal-plugin/blob/2ef30137d666d50b252b8f4af144a1997fa53dcf/src/goal-plugin.js#L3396), [네이티브 edit 명령](https://github.com/william-ricchiuti/OpenCode-goal-plugin/blob/2ef30137d666d50b252b8f4af144a1997fa53dcf/src/goal-plugin.js#L5404).
+
+## Claude Code
+
+공식 `/goal`은 현재 조건 조회와 교체·해제를 제공한다. 조건 변경은 별도 편집 RPC가 아니라 `/goal <condition>`으로 처리하며 즉시 새 턴을 시작한다. 기존 조건을 대체하고 Goal의 시간·평가 턴 수·토큰 사용 기준점을 초기화하므로 **Replace goal and start** 버튼과 설명을 사용한다. Codex/OpenCode처럼 Goal 예산을 보존하는 편집으로 표시하지 않는다. 별도의 Goal 토큰 예산은 공개되지 않는다.
+
+로컬 Claude Code 2.1.302와 Paseo에 포함된 Claude Agent SDK 0.3.246을 확인했다. SDK는 `active_goal` 이벤트를 공개하지만 현재 Paseo 플러그인 API는 이를 직접 조회하는 경로가 없다. 편집기는 Claude가 복원에 쓰는 `goal_status` attachment를 네이티브 세션 JSONL에서 읽고 `parentUuid`를 따라 현재 가지의 상태만 채택한다. 완료·해제·실패 기록, 불완전한 행, 알 수 없는 연결은 편집 가능한 활성 상태로 추정하지 않는다. 최대 8 MiB만 읽고 목표를 찾거나 현재 가지를 확인할 수 없으면 읽기 전용으로 둔다. 저장 파일은 수정하지 않는다.
+
+상속된 제공자 환경의 `CLAUDE_CONFIG_DIR`를 따른다. 별도 launch wrapper나 hook이 비공개로 디렉터리를 바꾸는 경우에는 같은 경로를 제공자 환경에 명시해야 한다. 백그라운드 발견 조회에는 Claude transcript 읽기를 추가하지 않았다. 선택한 Claude 목표도 네이티브 루프가 진행하므로 Paseo가 추가 자동 진행 메시지를 보내지 않는다.
+
+새 시험 대화에서 실제 RPC 조회→교체→다시 읽기, 일회용 티켓 재전송 거부와 외부에서 교체된 목표 보존을 확인했다. 네이티브 조회·편집과 모바일/데스크톱 화면 직접 확인은 별도 검증이다.
+
+출처: [공식 Claude Goal 설명](https://code.claude.com/docs/en/goal), [Claude Agent SDK 0.3.246 타입](https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.246/sdk.d.ts), [Paseo Claude 명령 전달](https://github.com/getpaseo/paseo/blob/v0.12.0/packages/server/src/server/agent/providers/claude/agent.ts#L2954), [Paseo의 Claude transcript 경로](https://github.com/getpaseo/paseo/blob/v0.12.0/packages/server/src/server/agent/providers/claude/project-dir.ts).
 
 ## OMP
 

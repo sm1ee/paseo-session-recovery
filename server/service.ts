@@ -3,7 +3,7 @@ import { GOAL_PROMPT, preferences, reasonText, statusInput, type GoalControl, ty
 import { automaticBlock, backoff, busy, emptyState, fingerprint, goalCommandReady, isGoalContinuation, isSelectedGoal, isTransient, OPEN_PHASES, snapshotBlock, time, type Agent, type RecordEntry, type SavedState } from "../shared/model";
 import { openLocalHost, type RecoveryHost } from "./host";
 import { RecoveryError } from "./store";
-import { MAX_GOAL_LENGTH, editGoalInput, type GoalEditorSnapshot } from "../shared/goal-editor";
+import { goalLengthLimit, editGoalInput, type GoalEditorSnapshot } from "../shared/goal-editor";
 
 interface HookAgent { id: string; title: string | null; provider: string; workspaceId: string | null; parentAgentId: string | null }
 export type RecoveryEvent =
@@ -123,7 +123,7 @@ export class RecoveryService {
   observe(event: RecoveryEvent): Promise<void> {
     const at = this.now();
     this.changes.set(event.agent.id, (this.changes.get(event.agent.id) ?? 0) + 1);
-    // Codex can start its own goal turn as the native resume command is handled.
+    // Providers can start goal work as the native resume/edit command is handled.
     // Other events and user actions still invalidate the pending operation.
     const resuming = this.nativeGoalResumes.get(event.agent.id);
     if (event.kind === "start" && resuming?.submitted) resuming.starts++;
@@ -297,7 +297,7 @@ export class RecoveryService {
         return;
       }
       if (reading.nativeContinuation) {
-        if (manual) throw new RecoveryError("OpenCode is managing this goal's continuation. Review its native goal state before sending another message.");
+        if (manual) throw new RecoveryError("The provider is managing this goal's continuation. Review its native goal state before sending another message.");
         r.dueAt = this.now() + this.settings.goalDelaySeconds * 1000;
         return;
       }
@@ -447,23 +447,30 @@ export class RecoveryService {
     const { host, generation, changed } = await this.action(async () => ({ host: await this.ready(), generation: this.generation, changed: this.changes.get(id) ?? 0 }));
     const a = await host.fetch(id); this.check(generation);
     if (!a || a.internal || a.archivedAt || !a.workspaceId) throw new RecoveryError("This session is unavailable. Open a current session and try again.");
-    const view: GoalEditorSnapshot = { id, title: a.title, provider: a.provider, supported: false, objective: null, state: "unknown", tokenBudget: null, tokensUsed: null, ticket: null, note: null };
+    const view: GoalEditorSnapshot = { id, title: a.title, provider: a.provider, supported: false, source: null, objective: null, state: "unknown", tokenBudget: null, tokensUsed: null, ticket: null, note: null };
     const details = await host.goalDetails?.(id); this.check(generation);
-    if (!details) return { ...view, note: "Goal editing is currently supported for native Codex sessions. Use this provider's native goal controls." };
-    Object.assign(view, { supported: true, objective: details.objective, state: details.reading.state, tokenBudget: details.tokenBudget, tokensUsed: details.tokensUsed });
-    if (!details.objective) return { ...view, note: "There is no current goal. Set one in the conversation with /goal <objective>." };
-    if (!details.reading.key || !["active", "paused", "blocked"].includes(details.reading.state) || details.objective.length > MAX_GOAL_LENGTH) return { ...view, note: "This goal is read-only in its current state. Review completed goals and native limits in the conversation." };
+    if (!details) return { ...view, note: "This provider does not expose a supported goal editor. Use its native goal controls." };
+    const source = details.reading.source;
+    if (!source || source === "timeline") return { ...view, note: "The native goal provider could not be verified." };
+    Object.assign(view, { supported: true, source, objective: details.objective, state: details.reading.state, tokenBudget: details.tokenBudget, tokensUsed: details.tokensUsed });
+    if (details.reading.state === "unknown") return { ...view, note: "The current native goal could not be verified. Check its state in the conversation and reload." };
+    if (!details.objective) return { ...view, note: source === "opencode" && !details.reading.modeId ? "Select the registered OpenCode Goal mode and set an objective with /goal <objective>." : "There is no current goal. Set one in the conversation with /goal <objective>." };
+    if (!details.reading.key || !["active", "paused", "blocked"].includes(details.reading.state) || details.objective.length > goalLengthLimit(source)) return { ...view, note: "This goal is read-only in its current state. Review completed goals and native limits in the conversation." };
     const r = this.saved.records[id];
     if (!goalCommandReady(a) || !a.sessionId || r?.humanRequired || r?.phase === "sending" || r?.expectingStart || r?.reason === "uncertain_send") return { ...view, note: "Resolve pending input or uncertain delivery in this session before editing its goal." };
+    if (source !== "codex" && busy(a)) return { ...view, note: "Wait for this session's current turn to finish before editing its goal. Saving starts native goal work." };
     const workspace = await host.workspace(a.workspaceId); this.check(generation);
-    if (!workspace || workspace.archived || workspace.archiving || !await host.supportsGoalCommand?.(id) || !host.editGoal) return { ...view, note: "Native Codex goal commands are unavailable for this session. Reload it when idle." };
+    if (!workspace || workspace.archived || workspace.archiving || !await host.supportsGoalCommand?.(id, source) || !host.editGoal) return { ...view, note: "Native goal commands are unavailable for this session. Reload it when idle." };
     this.check(generation);
     if ((this.changes.get(id) ?? 0) !== changed) throw new RecoveryError("The session changed while reading its goal. Reload the editor.");
     const ticket = randomUUID(), now = this.now();
     for (const [key, value] of this.goalEditTickets) if (value.expiresAt <= now) this.goalEditTickets.delete(key);
     if (this.goalEditTickets.size >= 100) this.goalEditTickets.delete(this.goalEditTickets.keys().next().value!);
     this.goalEditTickets.set(ticket, { id, generation, changed, revision: details.revision, expected: a, expiresAt: now + 300_000 });
-    return { ...view, ticket, note: "Saving uses Codex's native /goal command and makes the edited goal active. Goal continuation must be selected again for the new objective." };
+    const note = source === "claude" ? "Replacing uses Claude's native /goal command and immediately starts a turn. Claude resets its goal timer, evaluated turn count, and token-spend baseline. Existing session limits are unchanged."
+      : source === "opencode" ? "Saving uses OpenCode's native /goal edit command, preserves turn/token/time budgets and history, and starts work on the edited goal. Paused or blocked goals become active."
+      : "Saving uses Codex's native /goal command and makes the edited goal active. Goal continuation must be selected again for the new objective.";
+    return { ...view, ticket, note };
   }
   editGoal(input: { ticket: string; objective: string }): Promise<{ ok: true }> {
     const { ticket: token, objective } = editGoalInput.parse(input);

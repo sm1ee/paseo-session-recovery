@@ -2,13 +2,10 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { readGoal, type GoalReading } from "./goals";
+import { readGoal, type GoalDetails, type GoalReading } from "./goals";
 import { goalObjectiveError } from "../shared/goal-editor";
 
-export interface CodexGoalDetails {
-  reading: GoalReading; objective: string | null; revision: string;
-  tokenBudget: number | null; tokensUsed: number | null;
-}
+export type CodexGoalDetails = GoalDetails;
 
 export interface CodexLaunch { command: string; args: string[]; env: Record<string, string> }
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}; }

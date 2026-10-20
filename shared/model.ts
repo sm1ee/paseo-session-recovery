@@ -27,8 +27,8 @@ export interface Agent {
 export interface Workspace { id: string; archived: boolean; archiving: boolean }
 export function time(value: string | null): number { const result = value ? Date.parse(value) : NaN; return Number.isFinite(result) ? result : 0; }
 export function busy(a: Agent): boolean { return !["idle", "error", "closed"].includes(a.status) || a.activeTurn != null || a.pendingPermissions !== 0; }
-// Native goal commands do not allocate a turn. Older snapshots may omit its ID;
-// snapshotBlock still requires a verified idle turn before a continuation.
+// Codex goal commands can run during a turn; OpenCode/Claude adapters require
+// idle separately. Ordinary continuations still need a verified idle snapshot.
 export function goalCommandReady(a: Agent): boolean { return a.persistence && a.pendingPermissions === 0 && ["idle", "running", "error", "closed"].includes(a.status); }
 export function fingerprint(a: Agent): string { return JSON.stringify(a); }
 export function backoff(settings: Preferences, attempts: number): number { return Math.min(900_000, settings.delaySeconds * 1000 * 2 ** Math.min(attempts, 10)); }

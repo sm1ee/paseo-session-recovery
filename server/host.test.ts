@@ -1,5 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
-import { localEndpoint, workerIdentity } from "./host";
+import { localEndpoint, workerIdentity, nativeGoalCommand } from "./host";
+
+describe("제공자의 네이티브 Goal 명령 식별", () => {
+  const registrations = {
+    codex: { name: "goal", kind: "command", description: "Set, pause, resume, or clear the agent's goal" },
+    opencode: { name: "goal", kind: "command", description: "Set a session-scoped goal and auto-continue until complete." },
+    claude: { name: "goal", kind: "skill", description: "Set a goal — keep working until the condition is met" },
+  };
+  it.each(["codex", "opencode", "claude"] as const)("%s의 실제 등록 정보와 일치해야 한다", (source) => {
+    expect(nativeGoalCommand([registrations[source]], source)).toBe(true);
+    expect(nativeGoalCommand([{ ...registrations[source], description: "Custom goal skill" }], source)).toBe(false);
+    expect(nativeGoalCommand([{ ...registrations[source], kind: undefined }], source)).toBe(false);
+    for (const other of ["codex", "opencode", "claude"] as const) if (other !== source) expect(nativeGoalCommand([registrations[other]], source)).toBe(false);
+  });
+});
 
 describe("daemon identity", () => {
   it("distinguishes workers under a persistent supervisor", async () => {

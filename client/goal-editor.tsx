@@ -3,7 +3,7 @@ import { useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
-import { MAX_GOAL_LENGTH, editGoalRpc, goalObjectiveError, readGoalRpc, type GoalEditorSnapshot } from "../shared/goal-editor";
+import { goalLengthLimit, editGoalRpc, goalObjectiveError, readGoalRpc, type GoalEditorSnapshot } from "../shared/goal-editor";
 
 export function GoalEditorScreen(props: PluginScreenProps) {
   // Host or target changes discard the old draft and its one-use edit ticket.
@@ -19,7 +19,7 @@ function GoalEditor({ theme, layout, params, navigation, host }: PluginScreenPro
   const goal = result.data;
   const text = draft?.ticket === goal?.ticket ? draft?.text ?? goal?.objective ?? "" : goal?.objective ?? "";
   const dirty = !!goal?.objective && text.trim() !== goal.objective.trim();
-  const validation = goalObjectiveError(text);
+  const maxLength = goalLengthLimit(goal?.source ?? null), validation = goalObjectiveError(text, goal?.source ?? null);
   const save = useMutation({
     retry: false,
     mutationFn: async (value: GoalEditorSnapshot) => {
@@ -27,7 +27,7 @@ function GoalEditor({ theme, layout, params, navigation, host }: PluginScreenPro
       setNotice(null);
       await edit({ ticket: value.ticket, objective: text });
     },
-    onSuccess: () => { setDraft(null); setNeedsReload(false); setNotice("Goal saved and active. Select goal continuation again if you want Paseo to continue the new objective."); void cache.invalidateQueries({ queryKey: ["recovery"] }); void result.refetch(); },
+    onSuccess: () => { setDraft(null); setNeedsReload(false); setNotice(goal?.source === "claude" ? "Goal replaced. Claude starts work with a fresh goal timer and counters." : "Goal saved and active. Select goal continuation again if you want Paseo to continue the new objective."); void cache.invalidateQueries({ queryKey: ["recovery"] }); void result.refetch(); },
     onError: (error) => { setNeedsReload(true); setNotice(error instanceof Error ? error.message : "The goal edit could not be confirmed. Check the conversation and reload before trying again."); },
   });
   const [confirmReload, setConfirmReload] = useState(false);
@@ -45,17 +45,17 @@ function GoalEditor({ theme, layout, params, navigation, host }: PluginScreenPro
     {!!id && result.isPending && <Text style={muted}>Reading the current goal…</Text>}
     {goal?.objective != null && <View style={{ gap: 8 }}>
       <Text style={normal}>Objective</Text>
-      <TextInput multiline value={text} onChangeText={(value) => setDraft({ ticket: goal.ticket, text: value })} maxLength={MAX_GOAL_LENGTH}
+      <TextInput multiline value={text} onChangeText={(value) => setDraft({ ticket: goal.ticket, text: value })} maxLength={maxLength}
         editable={!!goal.ticket && !needsReload && !result.isError && !save.isPending && !result.isFetching} accessibilityLabel="Goal objective" placeholderTextColor={c.foregroundMuted}
         style={{ ...normal, minHeight: layout.compact ? 180 : 240, padding: 12, backgroundColor: c.surface1, borderWidth: 1, borderColor: c.border, borderRadius: 8, textAlignVertical: "top" }} />
-      {goal.ticket && <Text style={muted}>{text.length.toLocaleString()} / {MAX_GOAL_LENGTH.toLocaleString()}</Text>}
+      {goal.ticket && <Text style={muted}>{text.length.toLocaleString()} / {maxLength.toLocaleString()}</Text>}
       {dirty && validation && <Text accessibilityRole="alert" style={{ color: c.statusDanger }}>{validation}</Text>}
     </View>}
-    {goal?.supported && <Text style={muted}>Tokens used: {goal.tokensUsed?.toLocaleString() ?? "unavailable"} · Budget: {goal.tokenBudget?.toLocaleString() ?? "none reported"}. This editor does not change token budgets.</Text>}
+    {goal?.supported && <Text style={muted}>{goal.source === "claude" ? "Goal tokens at last native evaluation" : "Tokens used"}: {goal.tokensUsed?.toLocaleString() ?? "unavailable"} · Budget: {goal.tokenBudget?.toLocaleString() ?? "none reported"}. {goal.source === "claude" ? "Claude does not expose a separate goal token budget." : "This editor does not change token budgets."}</Text>}
     {goal?.note && <Text style={muted}>{goal.note}</Text>}
     {notice && <Text accessibilityRole="alert" style={normal}>{notice}</Text>}
     <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-      {goal?.ticket && button(save.isPending ? "Saving…" : goal.state === "active" ? "Save goal" : "Save and activate", () => save.mutate(goal), !dirty || !!validation || needsReload || result.isError, true)}
+      {goal?.ticket && button(save.isPending ? "Saving…" : goal.source === "claude" ? "Replace goal and start" : goal.state === "active" ? "Save goal" : "Save and activate", () => save.mutate(goal), !dirty || !!validation || needsReload || result.isError, true)}
       {!!id && button("Reload current goal", () => dirty ? setConfirmReload(true) : reload())}
       {navigation && !!id && button("Open session", () => navigation.openAgent({ agentId: id, serverId: host.id }))}
     </View>
