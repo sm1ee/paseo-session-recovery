@@ -155,6 +155,25 @@ describe("goal composer inspection", () => {
     release(active); await expect(reading).rejects.toThrow(/changed/);
     expect(f.saved.excluded).toEqual(["session"]); expect(f.send).not.toHaveBeenCalled();
   });
+  it("does not queue another session's control behind a slow provider lookup", async () => {
+    const f = fixture(); await f.service.configure(f.settings); f.others.set("other", { ...f.a, id: "other" });
+    let release!: (value: GoalReading) => void;
+    f.goal.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const pending = f.service.goalControl("session", true);
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    let other: unknown; const second = f.service.goalControl("other", true).then((value) => { other = value; });
+    await vi.waitFor(() => expect(other).toMatchObject({ id: "other" }));
+    release(active); await pending; await second; expect(f.send).not.toHaveBeenCalled();
+  });
+  it("does not cache an older reading over a newer result for the same session", async () => {
+    const f = fixture(); await f.service.configure(f.settings); let release!: (value: GoalReading) => void;
+    f.goal.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const old = f.service.goalControl("session", true);
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    f.setGoal({ ...active, key: "latest-goal" }); await f.service.goalControl("session", true);
+    release(active); await old;
+    expect(await f.service.goalControl("session")).toMatchObject({ key: "latest-goal" });
+  });
 });
 describe("goal continuation", () => {
   const active: GoalReading = { state: "active", key: "goal-fingerprint", evidence: true };

@@ -64,4 +64,36 @@ describe("goal composer pill lifecycle", () => {
     f.advance(15_000); f.read.mockRejectedValueOnce(new Error("offline")); await f.controller.poll();
     expect(f.registrations[0].remove).toHaveBeenCalledOnce();
   });
+  it("refreshes a mode change immediately, bypassing the cached idle result", async () => {
+    const f = fixture(); f.controller.upsert({ ...agent, currentModeId: "build" }); await f.controller.poll();
+    f.set({ visible: true, key: "native-goal" }); f.controller.upsert({ ...agent, currentModeId: "goal" }); await f.controller.poll();
+    expect(f.read).toHaveBeenLastCalledWith(agent.id, true); expect(f.add).toHaveBeenCalledOnce();
+  });
+  it("does not let a slow session block other goal controls", async () => {
+    const f = fixture(); let release!: (value: GoalControl) => void;
+    f.read.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    f.controller.upsert({ ...agent, id: "other" }); f.set({ id: "other", visible: true });
+    const pending = f.controller.poll();
+    await vi.waitFor(() => expect(f.add).toHaveBeenCalledWith("other", agent.workspaceId));
+    release(control()); await pending;
+  });
+  it("keeps the result of a direct toggle when an older background read arrives later", async () => {
+    const f = fixture(); let release!: (value: GoalControl) => void;
+    f.read.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const old = f.controller.refresh(agent.id, false);
+    f.set({ visible: true, selected: true, key: "goal" }); await f.controller.refresh(agent.id, true);
+    release(control({ visible: true, selected: false })); await old;
+    expect(f.registrations[0].update).toHaveBeenCalledOnce();
+    expect(f.registrations[0].update).toHaveBeenLastCalledWith(expect.objectContaining({ selected: true }));
+  });
+  it("bounds background reads to four concurrent requests", async () => {
+    const f = fixture(); const releases: Array<() => void> = []; let active = 0, peak = 0;
+    f.read.mockImplementation(async () => { active++; peak = Math.max(peak, active); await new Promise<void>((resolve) => releases.push(resolve)); active--; return control(); });
+    f.controller.snapshot(Array.from({ length: 10 }, (_, i) => ({ ...agent, id: `session-${i}` })));
+    const pending = f.controller.poll(); expect(f.read).toHaveBeenCalledTimes(4);
+    while (f.read.mock.calls.length < 10 || active) {
+      releases.splice(0).forEach((release) => release()); await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    }
+    await pending; expect(peak).toBe(4);
+  });
 });

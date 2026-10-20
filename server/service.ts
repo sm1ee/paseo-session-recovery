@@ -30,7 +30,7 @@ export class RecoveryService {
   private lastScanAt: number | null = null;
   private cursor = 0;
   private controls = new Map<string, { at: number; generation: number; changed: number; value: GoalControl }>();
-  private controlQueue: Promise<unknown> = Promise.resolve();
+  private controlRequests = new Map<string, object>();
   constructor(private readonly connect = openLocalHost, private readonly now = Date.now, private readonly automaticTimer = true) {}
   private enqueue<T>(work: () => Promise<T>, report = true): Promise<T> {
     const task = this.queue.then(work);
@@ -359,7 +359,8 @@ export class RecoveryService {
   }
   goalControl(id: string, fresh = false): Promise<GoalControl> {
     // Passive discovery must not hold up recovery actions while a provider is slow.
-    const task = this.controlQueue.then(async () => {
+    const request = {}; this.controlRequests.set(id, request);
+    return (async () => {
       const { host, generation, changed } = await this.action(async () => ({ host: await this.ready(), generation: this.generation, changed: this.changes.get(id) ?? 0 }));
       const cached = this.controls.get(id);
       if (!fresh && cached && cached.generation === generation && cached.changed === changed && this.now() - cached.at < 10_000) return cached.value;
@@ -388,10 +389,12 @@ export class RecoveryService {
             : "OpenCode has paused or stopped this goal. This toggle does not resume it or reset its native limits. Review it in OpenCode; /goal resume starts a new native budget window."
           : value.state !== "active" ? reasonText[value.state === "paused" ? "goal_paused" : value.state === "blocked" ? "goal_blocked" : value.state === "limited" ? "goal_limited" : "goal_unknown"] : null;
       }
-      if (this.controls.size >= 2000) this.controls.delete(this.controls.keys().next().value!);
-      this.controls.set(id, { at: this.now(), generation, changed, value }); return value;
-    });
-    this.controlQueue = task.catch(() => {}); return task;
+      if (this.controlRequests.get(id) === request) {
+        if (this.controls.size >= 2000) this.controls.delete(this.controls.keys().next().value!);
+        this.controls.set(id, { at: this.now(), generation, changed, value });
+      }
+      return value;
+    })().finally(() => { if (this.controlRequests.get(id) === request) this.controlRequests.delete(id); });
   }
   prepare(id: string): Promise<ResumePreview> {
     return this.action(async () => {
