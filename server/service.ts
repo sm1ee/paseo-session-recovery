@@ -442,7 +442,9 @@ export class RecoveryService {
     const signature = `${this.generation}:${this.changes.get(id) ?? 0}`;
     const requestKey = `${id}:${preview}`;
     const pending = this.controlReads.get(requestKey);
-    if (!fresh && pending?.signature === signature) return pending.promise;
+    // 마운트된 composer의 동시 미리보기만 공유한다. 명시적인 fresh 읽기는
+    // 이전 조회와 분리하여 사용자가 요청한 최신 상태를 다시 확인한다.
+    if ((!fresh || preview) && pending?.signature === signature) return pending.promise;
     const promise = this.inspectGoalControl(id, fresh, false, preview);
     const entry = { signature, promise };
     this.controlReads.set(requestKey, entry);

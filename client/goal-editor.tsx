@@ -29,12 +29,11 @@ function GoalEditor({ theme, layout, agentId: id, host, onChanged, openSession }
   const result = useQuery({ queryKey: ["goal-editor", host.id, id], enabled: !!id,
     queryFn: () => read({ id }), staleTime: 0, gcTime: 0, retry: false, refetchOnWindowFocus: false, refetchOnReconnect: false });
   const goal = result.data;
-  // Only opening this screen requests history inspection for OMP/Pi or Claude.
-  // The generic composer entry does not opt a goal into continuation.
-  const inspection = useQuery({ queryKey: ["goal-control", host.id, id], enabled: !!id,
+  // 추가 이어가기를 펼칠 때만 기록을 검사한다. 기본 편집은 목표만 읽는다.
+  const inspection = useQuery({ queryKey: ["goal-control", host.id, id], enabled: !!id && more,
     queryFn: () => readControl({ id, fresh: true, inspect: true }), staleTime: 0, gcTime: 0, retry: false, refetchOnWindowFocus: false, refetchOnReconnect: false });
   const control = inspection.data;
-  const refresh = () => { void result.refetch(); void inspection.refetch(); onChanged?.(); void cache.invalidateQueries({ queryKey: ["recovery"] }); };
+  const refresh = () => { void result.refetch(); if (more) void inspection.refetch(); onChanged?.(); void cache.invalidateQueries({ queryKey: ["recovery"] }); };
   const playback = useMutation({ retry: false, mutationFn: async (value: GoalEditorSnapshot) => {
     if (!value.action || !value.actionTicket) throw new Error("Reload the current goal before changing it.");
     setNotice(null);
@@ -64,7 +63,7 @@ function GoalEditor({ theme, layout, agentId: id, host, onChanged, openSession }
     onError: (error) => { setNeedsReload(true); setNotice(goalErrorText(error)); },
   });
   const [confirmReload, setConfirmReload] = useState(false);
-  const reload = () => { setDraft(null); setNotice(null); setNeedsReload(false); setConfirmReload(false); void result.refetch(); void inspection.refetch(); };
+  const reload = () => { setDraft(null); setNotice(null); setNeedsReload(false); setConfirmReload(false); void result.refetch(); if (more) void inspection.refetch(); };
   const c = theme.colors, normal = { color: c.foreground }, muted = { color: c.foregroundMuted, fontSize: 13 };
   const pending = save.isPending || playback.isPending || continuation.isPending || result.isFetching;
   const button = (label: string, onPress: () => void, disabled = false, primary = false) => <Pressable accessibilityRole="button" accessibilityLabel={label}

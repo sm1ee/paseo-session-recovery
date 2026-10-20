@@ -29,6 +29,7 @@ export function createGoalPillController(read: (id: string, fresh: boolean) => P
   const targets = new Map<string, Target>();
   const priority = new Set<string>();
   let stopped = false, polling = false;
+  let pollPromise = Promise.resolve(), wakePoll: (() => void) | undefined;
   function upsert(agent: PillAgent): void {
     if (stopped) return;
     if (!agent.workspaceId || agent.archivedAt) { remove(agent.id); return; }
@@ -80,56 +81,52 @@ export function createGoalPillController(read: (id: string, fresh: boolean) => P
     let released = false;
     return () => { if (!released) { released = true; target.mounts = Math.max(0, target.mounts - 1); } };
   }
-  const eligible = (target: Target) => target.mounts > 0 || !hasGoalEntry(target.agent);
-  async function poll(): Promise<void> {
-    if (stopped || polling) return;
+  const eligible = (target: Target) => target.mounts > 0;
+  function poll(): Promise<void> {
+    if (stopped) return Promise.resolve();
+    if (polling) { wakePoll?.(); return pollPromise; }
     polling = true;
-    try {
-      const due = [...targets.entries()].filter(([, t]) => eligible(t) && t.nextCheck <= now())
-        .sort(([, a], [, b]) => Number(b.agent.status === "running") - Number(a.agent.status === "running"));
-      let cursor = 0;
-      const worker = async () => {
-        while (!stopped) {
-          // Mode changes and newly observed sessions take priority over a large
-          // initial directory. Slow lookups occupy at most one of four workers.
-          let urgent: [string, Target] | undefined;
-          for (const id of priority) {
-            const target = targets.get(id);
-            if (!target || !target.fresh) { priority.delete(id); continue; }
-            if (eligible(target) && target.nextCheck <= now()) { urgent = [id, target]; priority.delete(id); break; }
-          }
-          const next = urgent ?? due[cursor++];
-          if (!next) break;
-          const [id, target] = next;
-          if (targets.get(id) !== target || !eligible(target) || target.nextCheck > now()) continue;
-          const fresh = target.fresh; target.fresh = false; priority.delete(id);
-          target.nextCheck = now() + (target.agent.status === "running" || target.pill ? 15_000 : 60_000);
-          const revision = target.revision + 1;
-          try {
-            const value = await refresh(id, fresh);
-            // Goal이 없는 대화는 목록 변경 전까지 자주 재조회하지 않는다.
-            // 느린 요청의 완료 직후 같은 대화를 다시 읽는 루프도 방지한다.
-            if (targets.get(id) === target && target.revision === revision && !target.fresh) {
-              target.nextCheck = now() + (value.visible ? 15_000 : 300_000);
-            }
-          }
-          catch {
-            // A failed lookup must not leave an actionable stale control behind.
-            if (targets.get(id) === target && target.revision === revision) {
-              if (hasGoalEntry(target.agent)) target.pill?.update(null);
-              else { target.pill?.remove(); target.pill = undefined; }
-            }
-          }
-        }
-      };
-      await Promise.all([worker(), worker(), worker(), worker()]);
-    } finally {
-      polling = false;
-      // A composer may mount after all workers exhausted the current batch.
-      // Its first preview should not have to wait for the five-second timer.
-      if (!stopped && [...priority].some((id) => { const t = targets.get(id); return t && eligible(t) && t.fresh && t.nextCheck <= now(); })) void poll();
+    let done!: () => void;
+    pollPromise = new Promise<void>((resolve) => { done = resolve; });
+    const active = new Set<Target>();
+    function next(): [string, Target] | undefined {
+      const due = (target: Target) => eligible(target) && !active.has(target) && target.nextCheck <= now();
+      for (const id of priority) {
+        const target = targets.get(id);
+        if (!target || !target.fresh) { priority.delete(id); continue; }
+        if (due(target)) return [id, target];
+      }
+      return [...targets.entries()].filter(([, target]) => due(target))
+        .sort(([, a], [, b]) => Number(b.agent.status === "running") - Number(a.agent.status === "running"))[0];
     }
+    function pump(): void {
+      while (!stopped && active.size < 4) {
+        const entry = next();
+        if (!entry) break;
+        const [id, target] = entry;
+        active.add(target);
+        const fresh = target.fresh; target.fresh = false; priority.delete(id);
+        target.nextCheck = now() + (target.agent.status === "running" || target.pill ? 15_000 : 60_000);
+        const revision = target.revision + 1;
+        void refresh(id, fresh).then((value) => {
+          // 느린 요청이 끝난 시점부터 간격을 계산하고, 중간 변경을 보존한다.
+          if (targets.get(id) === target && target.revision === revision && !target.fresh) {
+            target.nextCheck = now() + (value.visible ? 15_000 : 300_000);
+          }
+        }, () => {
+          if (targets.get(id) === target && target.revision === revision) {
+            if (hasGoalEntry(target.agent)) target.pill?.update(null);
+            else { target.pill?.remove(); target.pill = undefined; }
+          }
+        }).finally(() => { active.delete(target); pump(); });
+      }
+      if (active.size === 0) { polling = false; wakePoll = undefined; done(); }
+    }
+    // 느린 조회 하나가 진행 중이어도 나중에 열린 composer는 빈 슬롯을 쓴다.
+    wakePoll = pump; pump();
+    return pollPromise;
   }
+
   function stop(): void { stopped = true; for (const id of targets.keys()) remove(id); }
   return { upsert, snapshot, remove, refresh, mount, poll, stop };
 }

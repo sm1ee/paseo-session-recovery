@@ -43,7 +43,15 @@ describe("goal composer pill lifecycle", () => {
     expect(registration.update).toHaveBeenLastCalledWith(null); expect(registration.remove).not.toHaveBeenCalled();
   });
   it("has no registration or layout space for a session without a goal", async () => {
-    const f = fixture(); await f.controller.poll(); expect(f.read).toHaveBeenCalledOnce(); expect(f.add).not.toHaveBeenCalled();
+    const f = fixture(); await f.controller.poll(); expect(f.read).not.toHaveBeenCalled(); expect(f.add).not.toHaveBeenCalled();
+  });
+  it("제공자 정보가 없거나 미지원인 숨겨진 대화는 재접속과 상태 변경 후에도 조회하지 않는다", async () => {
+    const f = fixture();
+    const agents = Array.from({ length: 2200 }, (_, i) => ({ ...agent, id: `hidden-${i}`, provider: i % 2 ? "other" : undefined }));
+    f.controller.snapshot(agents); await f.controller.poll();
+    f.controller.snapshot(agents.map((value) => ({ ...value, status: "running", lastUserMessageAt: "2026-10-21T00:00:00Z" })));
+    f.advance(600_000); await f.controller.poll();
+    expect(f.read).not.toHaveBeenCalled(); expect(f.add).not.toHaveBeenCalled();
   });
   it("appears on a verified goal, updates in place, and disappears when it completes", async () => {
     const f = fixture(); f.set({ visible: true, state: "active", key: "goal", canSelect: true }); await f.controller.refresh(agent.id);
@@ -52,7 +60,7 @@ describe("goal composer pill lifecycle", () => {
     f.set({ visible: false, state: "complete", key: "goal" }); await f.controller.refresh(agent.id); expect(f.registrations[0].remove).toHaveBeenCalledOnce();
   });
   it("does not attach a goal to a different workspace", async () => {
-    const f = fixture(); f.set({ visible: true, workspaceId: "other" }); await f.controller.poll(); expect(f.add).not.toHaveBeenCalled();
+    const f = fixture(); f.set({ visible: true, workspaceId: "other" }); await f.controller.refresh(agent.id); expect(f.add).not.toHaveBeenCalled();
   });
   it("discards a pending lookup after the session is removed", async () => {
     const f = fixture(); let release!: (value: GoalControl) => void;
@@ -79,45 +87,55 @@ describe("goal composer pill lifecycle", () => {
     f.controller.snapshot([agent]); await f.controller.refresh(agent.id); expect(f.add).toHaveBeenCalledTimes(2);
     expect(f.registrations[0].remove).toHaveBeenCalledOnce(); f.controller.snapshot([]); expect(f.registrations[1].remove).toHaveBeenCalledOnce();
   });
-  it("restores known goal controls before a large directory after reconnect", async () => {
+  it("재접속 후 다시 마운트된 composer만 복원하고 나머지 목록은 읽지 않는다", async () => {
     const f = fixture(); f.set({ visible: true, state: "active", key: "goal" }); await f.controller.refresh(agent.id);
     f.read.mockClear();
     f.read.mockImplementation(async (id) => control({ id, visible: id === agent.id }));
     f.controller.snapshot([...Array.from({ length: 2200 }, (_, i) => ({ ...agent, id: `other-${i}` })), agent]);
-    await f.controller.poll();
-    expect(f.read.mock.calls[0][0]).toBe(agent.id); expect(f.add).toHaveBeenCalledTimes(2);
+    await f.controller.poll(); expect(f.read).not.toHaveBeenCalled();
+    const unmount = f.controller.mount(agent.id);
+    await vi.waitFor(() => expect(f.read).toHaveBeenCalledExactlyOnceWith(agent.id, true));
+    expect(f.add).toHaveBeenCalledTimes(2); unmount();
   });
   it("serializes background lookups and waits before polling an idle session again", async () => {
     const f = fixture(); let release!: (value: GoalControl) => void;
     f.read.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
-    const first = f.controller.poll(); await f.controller.poll(); expect(f.read).toHaveBeenCalledOnce();
-    release(control()); await first; f.advance(299_999); await f.controller.poll(); expect(f.read).toHaveBeenCalledOnce();
+    const unmount = f.controller.mount(agent.id); const first = f.controller.poll(); expect(f.read).toHaveBeenCalledOnce();
+    release(control()); await first;
+    f.advance(299_999); await f.controller.poll(); expect(f.read).toHaveBeenCalledOnce();
     f.advance(1); await f.controller.poll(); expect(f.read).toHaveBeenCalledTimes(2);
+    unmount();
   });
   it("refreshes active goals sooner and hides stale controls on a lookup failure", async () => {
-    const f = fixture(); f.controller.upsert({ ...agent, status: "running" }); f.set({ visible: true }); await f.controller.poll();
+    const f = fixture(); f.controller.upsert({ ...agent, status: "running" }); f.set({ visible: true }); const unmount = f.controller.mount(agent.id);
+    await vi.waitFor(() => expect(f.add).toHaveBeenCalledOnce());
     f.advance(15_000); f.read.mockRejectedValueOnce(new Error("offline")); await f.controller.poll();
     expect(f.registrations[0].remove).toHaveBeenCalledOnce();
+    unmount();
   });
   it("느린 조회가 끝난 시점부터 다음 조회 간격을 계산한다", async () => {
     const f = fixture(); let release!: (value: GoalControl) => void;
     f.read.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
-    const pending = f.controller.poll(); f.advance(400_000); release(control()); await pending;
+    const unmount = f.controller.mount(agent.id); f.advance(400_000); release(control());
+    await new Promise((resolve) => setTimeout(resolve, 0));
     await f.controller.poll(); expect(f.read).toHaveBeenCalledOnce();
     f.advance(300_000); await f.controller.poll(); expect(f.read).toHaveBeenCalledTimes(2);
+    unmount();
   });
   it("refreshes a mode change immediately, bypassing the cached idle result", async () => {
-    const f = fixture(); f.controller.upsert({ ...agent, currentModeId: "build" }); await f.controller.poll();
+    const f = fixture(); f.controller.upsert({ ...agent, currentModeId: "build" }); const unmount = f.controller.mount(agent.id);
+    await new Promise((resolve) => setTimeout(resolve, 0));
     f.set({ visible: true, key: "native-goal" }); f.controller.upsert({ ...agent, currentModeId: "goal" }); await f.controller.poll();
     expect(f.read).toHaveBeenLastCalledWith(agent.id, true); expect(f.add).toHaveBeenCalledOnce();
+    unmount();
   });
   it("does not let a slow session block other goal controls", async () => {
     const f = fixture(); let release!: (value: GoalControl) => void;
     f.read.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
     f.controller.upsert({ ...agent, id: "other" }); f.set({ id: "other", visible: true });
-    const pending = f.controller.poll();
+    const unmount = [f.controller.mount(agent.id), f.controller.mount("other")];
     await vi.waitFor(() => expect(f.add).toHaveBeenCalledWith("other", agent.workspaceId));
-    release(control()); await pending;
+    release(control()); unmount.forEach((stop) => stop());
   });
   it("keeps the result of a direct toggle when an older background read arrives later", async () => {
     const f = fixture(); let release!: (value: GoalControl) => void;
@@ -132,10 +150,11 @@ describe("goal composer pill lifecycle", () => {
     const f = fixture(); const releases: Array<() => void> = []; let active = 0, peak = 0;
     f.read.mockImplementation(async () => { active++; peak = Math.max(peak, active); await new Promise<void>((resolve) => releases.push(resolve)); active--; return control(); });
     f.controller.snapshot(Array.from({ length: 10 }, (_, i) => ({ ...agent, id: `session-${i}` })));
-    const pending = f.controller.poll(); expect(f.read).toHaveBeenCalledTimes(4);
+    const unmount = Array.from({ length: 10 }, (_, i) => f.controller.mount(`session-${i}`));
+    await vi.waitFor(() => expect(f.read).toHaveBeenCalledTimes(4));
     while (f.read.mock.calls.length < 10 || active) {
       releases.splice(0).forEach((release) => release()); await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
     }
-    await pending; expect(peak).toBe(4);
+    expect(peak).toBe(4); unmount.forEach((stop) => stop());
   });
 });
