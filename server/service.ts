@@ -430,7 +430,10 @@ export class RecoveryService {
       return { ok: true };
     });
   }
-  goalControl(id: string, fresh = false): Promise<GoalControl> {
+  goalControl(id: string, fresh = false, inspect = false): Promise<GoalControl> {
+    // History inspection is an explicit action for one opened goal screen.
+    // Background mounted-composer checks must never restore a conversation.
+    if (inspect) return this.inspectGoalControl(id, true, true);
     const signature = `${this.generation}:${this.changes.get(id) ?? 0}`;
     const pending = this.controlReads.get(id);
     if (!fresh && pending?.signature === signature) return pending.promise;
@@ -510,7 +513,7 @@ export class RecoveryService {
       }
     });
   }
-  private inspectGoalControl(id: string, fresh: boolean): Promise<GoalControl> {
+  private inspectGoalControl(id: string, fresh: boolean, inspect = false): Promise<GoalControl> {
     // Passive discovery must not hold up recovery actions while a provider is slow.
     const request = {}; this.controlRequests.set(id, request);
     return (async () => {
@@ -522,7 +525,7 @@ export class RecoveryService {
       const value: GoalControl = { id, workspaceId: a?.workspaceId ?? null, visible: false, state: null, key: null, selected: false, canSelect: false,
         automatic: this.settings.enabled && this.settings.continueGoals, attempts: 0, maxAttempts: this.settings.goalMaxAttempts, delaySeconds: this.settings.goalDelaySeconds, note: null };
       if (a && !a.internal && !a.archivedAt && a.workspaceId) {
-        let reading = await host.goal?.(id, { allowTimeline: false }) ?? { state: "unknown" as const, key: null, evidence: false }; this.check(generation);
+        let reading = await host.goal?.(id, { allowTimeline: inspect }) ?? { state: "unknown" as const, key: null, evidence: false }; this.check(generation);
         const snapshotOnly = reading.source === "timeline" && !reading.evidence && reading.state === "unknown" && !!r?.goal?.selectedKey;
         // 선택된 비네이티브 Goal은 마지막 검사 결과로 해제 버튼을 유지한다.
         // 이 표시 결과는 자동 전송이나 새 Goal 선택의 증거로 쓰지 않는다.

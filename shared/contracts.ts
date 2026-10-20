@@ -77,7 +77,7 @@ export const goalControlSchema = z.object({
   note: z.string().nullable(), holdReason: reasonSchema.nullable().optional(),
 });
 export type GoalControl = z.infer<typeof goalControlSchema>;
-export const goalControlRpc = defineRpc({ name: "recovery.goal.control", input: z.object({ id: z.string().min(1), fresh: z.boolean().default(false) }), output: goalControlSchema });
+export const goalControlRpc = defineRpc({ name: "recovery.goal.control", input: z.object({ id: z.string().min(1), fresh: z.boolean().default(false), inspect: z.boolean().default(false) }), output: goalControlSchema });
 export const excludeRpc = defineRpc({ name: "recovery.exclude", input: z.object({ id: z.string().min(1), excluded: z.boolean() }), output: ok });
 export const dismissRpc = defineRpc({ name: "recovery.dismiss", input: z.object({ id: z.string().min(1) }), output: ok });
 export const prepareRpc = defineRpc({ name: "recovery.prepare", input: z.object({ id: z.string().min(1) }), output: z.object({ token: z.string(), title: z.string(), prompt: z.string(), expiresAt: z.number() }) });

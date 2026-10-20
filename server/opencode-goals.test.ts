@@ -89,6 +89,12 @@ describe("read-only OpenCode goal snapshots", () => {
     expect(await readFile(path, "utf8")).toBe(before); expect((await lstat(path)).mtimeMs).toBe(info.mtimeMs);
     await expect(lstat(`${path}.lock`)).rejects.toMatchObject({ code: "ENOENT" });
   });
+  it("복원하지 않은 대화의 빈 모드 목록에서도 세션별 Goal 스냅샷을 확인한다", async () => {
+    expect(await reader.read({ ...agent, availableModes: [] })).toMatchObject({ state: "paused", modeId: "goal", key: expect.any(String) });
+    expect(await reader.read({ ...agent, availableModes: [{ ...mode, description: "Unrelated custom mode" }] })).toMatchObject({ state: "cleared", key: null });
+    await rm(path);
+    expect(await reader.read({ ...agent, availableModes: [] })).toMatchObject({ state: "unknown", key: null });
+  });
   it("hides the goal when leaving Goal mode, regardless of stale goal tools", async () => {
     expect(await reader.read({ ...agent, currentModeId: "build" })).toMatchObject({ state: "cleared", key: null });
     expect(await reader.read({ ...agent, provider: "omp" })).toBeNull();

@@ -46,3 +46,12 @@ Paseo v0.12.0의 Codex 제공자는 목표 설정 시 `objective`와 `status: "a
 기존 목표를 유지하면서 수정하는 UI를 제공하려면 OMP의 목표 변경 연산과 Paseo를 통한 호출 경로가 추가되어야 한다. 목표를 지운 뒤 새로 만드는 작업은 예산과 이력이 달라질 수 있어 이번 편집 기능에 포함하지 않았다. 실제 사용자 Goal을 변경하거나 목표 저장 파일을 직접 수정하지 않았다.
 
 출처: [OMP RPC 연산과 생성 제한](https://github.com/can1357/oh-my-pi/blob/96894a6147d8cc64b7e00ad3a7d7178fd93b9531/packages/coding-agent/src/modes/rpc/rpc-goal.ts#L21), [Goal 도구 계약](https://github.com/can1357/oh-my-pi/blob/96894a6147d8cc64b7e00ad3a7d7178fd93b9531/packages/coding-agent/src/goals/tools/goal-tool.ts#L21).
+
+
+## v0.5.1 버튼 표시 수정 (2026-10-21)
+
+Goal 조회 진입과 자동 이어가기 검증을 분리했다. Codex·OMP·Pi·Claude·OpenCode에서는 대화 메타데이터만으로 Goal 진입을 먼저 등록한다. iPhone을 포함해 실제 composer의 아이콘이 마운트된 대화만 주기적으로 점검하고, 전체 저장 대화에 대한 제공자 조회를 반복하지 않는다. 검증된 Goal은 기존 On/Off 토글을 유지하고, 검증 전·완료 후·조회 실패 때에는 Goal 화면으로 들어가는 버튼을 유지한다.
+
+Goal 화면을 열면 현재 대화 한 개를 명시적으로 검사한다. OMP/Pi는 기존 구조화된 타임라인 판독으로 이어가기를 선택할 수 있고 본문 편집은 계속 제공하지 않는다. Claude는 네이티브 상태를 읽어 이어가기 선택과 편집 가능 여부를 각각 표시한다. 조회만으로 목표를 선택하거나 실행하지 않는다.
+
+OpenCode의 휴면 대화는 Paseo 저장 payload에 availableModes가 비어 있다. 이 경우 기록된 현재 모드가 정규 goal ID이고 버전·세션·목표가 검증되는 네이티브 스냅샷이 있을 때 상태를 읽는다. 현재 모드가 바뀌었거나 실제 모드 등록 설명이 충돌하면 계속 거부한다. 이름만 goal인 모드는 목표 존재의 근거가 아니며, 본문 저장 전에는 네이티브 명령 등록과 현재 상태를 다시 검증한다.

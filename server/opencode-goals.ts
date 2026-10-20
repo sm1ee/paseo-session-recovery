@@ -109,7 +109,11 @@ export class OpenCodeGoals {
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const env = openCodeEnvironment(config, agent.provider);
     if (!env) return null;
-    const modeId = openCodeGoalMode(agent);
+    // Stored Paseo payloads have no availableModes. A canonical recorded Goal
+    // mode can still be verified from its versioned, session-matched snapshot.
+    // A live conflicting registration or explicit non-Goal mode still wins.
+    const recordedMode = agent.currentModeId === undefined ? agent.runtimeInfo?.modeId : agent.currentModeId;
+    const modeId = openCodeGoalMode(agent) ?? (!agent.availableModes?.length && recordedMode === "goal" ? "goal" : null);
     const empty = (reading: GoalReading) => ({ details: { reading, objective: null, revision: "", tokenBudget: null, tokensUsed: null } });
     if (!modeId) return empty(cleared);
     const sessionId = agent.persistence?.sessionId;

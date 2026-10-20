@@ -2,6 +2,7 @@ import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { goalControlRpc, unwatchGoalRpc, watchGoalRpc, type GoalControl } from "../shared/contracts";
 import { contributeGoalPills } from "./goal-pill";
+vi.mock("./goal-pill-icon", () => ({ GoalPillIcon: () => null }));
 
 const agent = { id: "session", workspaceId: "workspace", status: "idle" };
 let cleanup: (() => void) | undefined;
@@ -30,6 +31,20 @@ async function fixture() {
   return { list, rpc, update, press: behavior.onPress, set: (patch: Partial<GoalControl>) => { goal = { ...goal, ...patch }; } };
 }
 describe("direct goal toggle", () => {
+  it.each(["omp", "claude", "opencode", "codex"])("%s 조회가 끝나기 전에도 Goal 진입을 만들고 눌러도 이어가기를 선택하지 않는다", async (provider) => {
+    const openScreen = vi.fn(), rpc = vi.fn(() => new Promise(() => {}));
+    const addComposerPill = vi.fn(() => ({ update: vi.fn(), remove: vi.fn() }));
+    const subscription = { subscribe: vi.fn((handlers) => handlers.snapshot({ entries: [{ agent: { ...agent, provider } }] })) };
+    const client = { openScreen, rpc, addComposerPill, paseo: { agents: { list: vi.fn(async () => ({ subscription })) } } } as unknown as PluginClientContext;
+    cleanup = contributeGoalPills(client);
+    await vi.waitFor(() => expect(addComposerPill).toHaveBeenCalledOnce());
+    const entry = addComposerPill.mock.calls[0] as unknown as [Parameters<PluginClientContext["addComposerPill"]>[0]];
+    const behavior = entry[0].button.behavior;
+    if (behavior.kind !== "action") throw new Error("조회 진입은 단일 동작이어야 함");
+    await behavior.onPress();
+    expect(openScreen).toHaveBeenCalledExactlyOnceWith({ screenId: "goal", params: { agentId: agent.id } });
+    expect(rpc).not.toHaveBeenCalled();
+  });
   it("retries a failed initial directory lookup and stops retrying after cleanup", async () => {
     vi.useFakeTimers(); const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     const goal: GoalControl = { id: agent.id, workspaceId: agent.workspaceId, visible: true, state: "active", key: "goal", selected: false, canSelect: true,

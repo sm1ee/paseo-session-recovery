@@ -32,7 +32,7 @@ The sidebar shortcut is hidden in the iOS and Android apps. Use **Open session-r
 - **History:** completed, stopped, and dismissed records.
 - **Excluded:** sessions excluded from recovery.
 
-**Goal · On / Off** appears beside Tasks and Subagents above the message composer when a supported current goal is found. Press it to switch continuation on or off directly. A selected goal shows **Blocked**, **Paused**, **Waiting**, **Limit**, or **Review** when it cannot continue. Goal details and continuation counts are on the recovery screen. Sessions without a verified goal and completed or cleared goals have no pill. A previously selected goal with an unavailable state keeps the control so you can turn it off.
+**Goal** appears beside Tasks and Subagents for Codex, OMP, Pi, Claude Code, and OpenCode sessions, including on iPhone and Android. It opens the current goal screen without selecting a goal or starting work. When the mounted composer verifies a current goal, the same button becomes **Goal · On / Off** and toggles continuation directly. A selected goal shows **Blocked**, **Paused**, **Waiting**, **Limit**, or **Review** when it cannot continue. Missing, completed, cleared, or unavailable goal state leaves the **Goal** inspection entry available. The goal screen also has a **Continue goal · On / Off** control when the current goal can be verified. OMP/Pi goals can be inspected for continuation there; native objective editing is not available for them.
 
 Goal sessions also have a toggle on their recovery card. Turning either toggle off cancels that goal's pending continuation while keeping interruption recovery available.
 
@@ -50,7 +50,7 @@ Turning automatic recovery off leaves monitoring and manual review available. Se
 
 ## View and edit a goal
 
-In a native Codex, OpenCode Goal-mode, or Claude Code session, enter `/goal`, `/goal edit`, or `/goal-edit`, or choose **View or edit this session's goal** in the Command Center. The desktop and mobile editor prefills the current objective and shows its native state and reported token usage.
+Press **Goal** to open the current goal screen. In a native Codex, OpenCode Goal-mode, or Claude Code session, you can also enter `/goal`, `/goal edit`, or `/goal-edit`, or choose **View or edit this session's goal** in the Command Center. The desktop and mobile editor prefills the current objective and shows its native state and reported token usage.
 
 | Provider | Save behavior |
 | --- | --- |
@@ -122,7 +122,7 @@ npm run typecheck
 paseo plugin install /absolute/path/to/paseo-session-recovery
 ```
 
-Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed. Goal controls retry a failed initial session lookup and restore previously visible goals first after reconnecting, including on mobile clients.
+Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed. Goal entries retry a failed initial session lookup and rebuild after reconnecting, including on mobile clients. A supported provider entry is registered before any goal-state request. Goal checks run for mounted composers, rather than scanning every saved session on each connected client.
 
 For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.5.0`. The public registry listing requires a separate review.
 
@@ -130,7 +130,7 @@ For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-rec
 
 Session IDs, titles, providers, turn IDs, timestamps, attempt counts, exclusions, goal fingerprints, selections, states and mode IDs, and recent outcomes stay under `plugin-data/session-recovery/` in the daemon's Paseo home. `state.json` is the journal, `holds.json` is the cleanup protection list, and `worker.lock` prevents duplicate monitors. Files use owner-only permissions. Journal writes use sync and atomic rename.
 
-Composer visibility checks, goal continuation, and explicit goal selection inspect supported goal state and conversation records in memory. Connected clients read the complete directory of unarchived sessions in active workspaces. Each client checks up to four sessions at a time, prioritizing mode and activity changes. Running sessions and visible goal controls are checked about every 15 seconds; other idle sessions about every minute, subject to directory size and provider response times. The daemon briefly caches these read-only results. Discovery does not select, schedule, or resume sessions, and still works when the automatic continuation setting is off. Conversation bodies, goal objectives, raw provider errors, API tokens, and credentials are not stored in the journal. The local credential is read in memory to authenticate to the owning daemon's loopback listener or Unix socket. Continuations go through the session's existing provider. No separate model or external review service is used.
+Composer visibility checks, goal continuation, and explicit goal selection inspect supported goal state and conversation records in memory. Connected clients observe the metadata directory of unarchived sessions in active workspaces to register Goal entries. Only mounted supported-provider composers query current goal state, with up to four concurrent requests. Verified goals are checked about every 15 seconds; an unavailable goal state is checked again after five minutes or a relevant session change. Opening the goal screen explicitly inspects that one session, including supported OMP/Pi conversation records and Claude native state. Other providers may discover compatible goals through their existing metadata checks. The daemon briefly caches these read-only results. Discovery does not select, schedule, or resume sessions, and still works when the automatic continuation setting is off. Conversation bodies, goal objectives, raw provider errors, API tokens, and credentials are not stored in the journal. The local credential is read in memory to authenticate to the owning daemon's loopback listener or Unix socket. Continuations go through the session's existing provider. No separate model or external review service is used.
 
 The startup connection uses a version-pinned adapter because Paseo does not provide an SDK context at plugin entry startup. Stable 0.11.4 through 0.12.x are supported. On 0.12, workspace lookups include background workspaces. Unknown versions and prereleases pause recovery until compatibility has been checked.
 

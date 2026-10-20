@@ -147,6 +147,15 @@ describe("명시적인 Goal 편집", () => {
 });
 describe("goal composer inspection", () => {
   const active: GoalReading = { state: "active", key: "current-goal", evidence: true };
+  it.each(["omp", "claude"])("%s Goal 화면에서만 기록을 검사하고 선택이나 실행을 하지 않는다", async (provider) => {
+    const f = fixture(); f.a.provider = provider; f.idle(); await f.service.configure(f.settings);
+    f.goal.mockImplementation(async (_id, options) => options?.allowTimeline ? active : { state: "unknown", key: null, evidence: false, source: "timeline" });
+    expect(await f.service.goalControl("session")).toMatchObject({ visible: false });
+    const before = f.saved;
+    expect(await f.service.goalControl("session", true, true)).toMatchObject({ visible: true, key: active.key, selected: false, canSelect: true });
+    expect(f.goal).toHaveBeenLastCalledWith("session", { allowTimeline: true });
+    expect(f.saved).toEqual(before); expect(f.send).not.toHaveBeenCalled(); expect(f.resumeBlockedGoal).not.toHaveBeenCalled(); expect(f.editGoal).not.toHaveBeenCalled();
+  });
   it("수동 새로고침을 포함한 표시 조회는 대화 복원을 요청하지 않는다", async () => {
     const f = fixture(); await f.service.configure(f.settings);
     await f.service.goalControl("session"); await f.service.goalControl("session", true);

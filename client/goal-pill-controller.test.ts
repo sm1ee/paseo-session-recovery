@@ -15,6 +15,33 @@ function fixture() {
   return { read, add, registrations, controller, advance: (ms: number) => { now += ms; }, set: (patch: Partial<GoalControl>) => { value = control(patch); } };
 }
 describe("goal composer pill lifecycle", () => {
+  it("수천 개의 제공자 대화에는 조회 버튼만 등록하고 현재 보이는 composer만 읽는다", async () => {
+    const f = fixture();
+    f.controller.snapshot(Array.from({ length: 2200 }, (_, i) => ({ ...agent, id: `native-${i}`, provider: ["omp", "claude", "opencode", "codex"][i % 4] })));
+    expect(f.add).toHaveBeenCalledTimes(2200);
+    await f.controller.poll(); expect(f.read).not.toHaveBeenCalled();
+    const unmount = f.controller.mount("native-2199");
+    await vi.waitFor(() => expect(f.read).toHaveBeenCalledExactlyOnceWith("native-2199", true));
+    unmount(); f.advance(600_000); await f.controller.poll(); expect(f.read).toHaveBeenCalledOnce();
+  });
+  it("여러 composer가 같은 순간 마운트돼도 진행 중인 점검에 즉시 포함한다", async () => {
+    const f = fixture(); f.controller.snapshot([0, 1, 2].map((n) => ({ ...agent, id: `native-${n}`, provider: "omp" })));
+    const release = [0, 1, 2].map((n) => f.controller.mount(`native-${n}`));
+    await vi.waitFor(() => expect(f.read).toHaveBeenCalledTimes(3));
+    expect(new Set(f.read.mock.calls.map(([id]) => id))).toEqual(new Set(["native-0", "native-1", "native-2"]));
+    release.forEach((stop) => stop());
+  });
+  it("네이티브 목표가 없거나 조회가 실패해도 조회 진입은 유지하고 이전 토글 상태는 없앤다", async () => {
+    const f = fixture(); f.controller.upsert({ ...agent, provider: "omp" });
+    const registration = f.registrations[0]; expect(registration.update).toHaveBeenCalledWith(null);
+    f.set({ visible: true, selected: true, key: "goal" }); await f.controller.refresh(agent.id);
+    expect(registration.update).toHaveBeenLastCalledWith(expect.objectContaining({ selected: true }));
+    f.read.mockRejectedValueOnce(new Error("offline")); const unmount = f.controller.mount(agent.id);
+    await vi.waitFor(() => expect(registration.update).toHaveBeenLastCalledWith(null));
+    expect(registration.remove).not.toHaveBeenCalled(); unmount();
+    f.set({ visible: false, state: "complete" }); await f.controller.refresh(agent.id);
+    expect(registration.update).toHaveBeenLastCalledWith(null); expect(registration.remove).not.toHaveBeenCalled();
+  });
   it("has no registration or layout space for a session without a goal", async () => {
     const f = fixture(); await f.controller.poll(); expect(f.read).toHaveBeenCalledOnce(); expect(f.add).not.toHaveBeenCalled();
   });

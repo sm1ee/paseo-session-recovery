@@ -20,7 +20,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(scanRpc, () => service.requestScan());
   server.handle(watchGoalRpc, ({ id, key, resetAttempts, resumeBlocked }) => service.watchGoal(id, key, resetAttempts, resumeBlocked));
   server.handle(unwatchGoalRpc, ({ id }) => service.unwatchGoal(id));
-  server.handle(goalControlRpc, ({ id, fresh }) => service.goalControl(id, fresh));
+  server.handle(goalControlRpc, ({ id, fresh, inspect }) => service.goalControl(id, fresh, inspect));
   server.handle(readGoalRpc, ({ id }) => service.readGoalEditor(id));
   server.handle(editGoalRpc, (input) => service.editGoal(input));
   server.handle(excludeRpc, ({ id, excluded }) => service.exclude(id, excluded));
