@@ -381,12 +381,16 @@ export class RecoveryService {
           a = latest;
         } catch (error) {
           if (nativeResume.submitted) this.review(intent, "uncertain_send");
-          else if (existing) this.saved.records[id] = existing;
-          else if (this.changes.get(id) === changed) delete this.saved.records[id];
+          else if (this.changes.get(id) === changed) {
+            if (existing) this.saved.records[id] = existing;
+            else delete this.saved.records[id];
+          }
           else {
             // Keep a record for queued lifecycle events to update. It carries
             // neither a submitted message nor a new automatic goal selection.
-            intent.attemptMessageId = null; intent.goal!.selectedKey = null;
+            // A closed or stale previous turn must not swallow a new stop.
+            intent.attemptMessageId = null;
+            intent.goal = existing?.goal ? { ...existing.goal } : { ...intent.goal!, selectedKey: null };
             this.set(intent, "review", "goal_blocked");
           }
           await this.persist(); throw error;

@@ -266,6 +266,24 @@ describe("goal composer inspection", () => {
     expect(f.saved.records.session.goal?.selectedKey).toBeNull();
     f.advance(60_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
   });
+  it.each(["stop", "permission", "unwatch"] as const)("preserves a queued %s after an unsent goal toggle with a closed previous record", async (block) => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.service.configure(f.settings);
+    await f.service.watchGoal("session", active.key!); await f.service.unwatchGoal("session");
+    const saved = f.saved; saved.records.session.turnId = "previous-turn"; saved.records.session.attempts = 2; saved.records.session.goal!.attempts = 1;
+    f.setSaved(saved); await f.restart("boot-a");
+    let pending!: Promise<unknown>;
+    f.resumeBlockedGoal.mockImplementationOnce(async (_id, _key, _expected, check) => {
+      if (block === "stop") pending = f.event({ kind: "end", turnId: "current-turn", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
+      else if (block === "permission") { f.a.pendingPermissions = 1; pending = f.event({ kind: "permission", requestId: "approval" } as Omit<RecoveryEvent, "agent">); }
+      else pending = f.service.unwatchGoal("session");
+      check(); throw new Error("Expected guard failure");
+    });
+    await expect(f.service.watchGoal("session", active.key!, true, true)).rejects.toThrow(/changed/); await pending;
+    expect(f.saved.records.session).toMatchObject({ attemptMessageId: null, attempts: 2, goal: { attempts: 1, selectedKey: null } });
+    if (block === "stop") expect(f.saved.records.session.reason).toBe("user_stop");
+    if (block === "permission") expect(f.saved.records.session).toMatchObject({ humanRequired: true, pendingIds: ["approval"] });
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+  });
   it.each(["paused", "limited", "unknown"] as const)("does not reactivate a native %s goal from the toggle", async (state) => {
     const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, source: "codex", state }); await f.service.configure(f.settings);
     await f.service.watchGoal("session", active.key!, false, true); f.advance(60_000); await f.service.scanNow();
