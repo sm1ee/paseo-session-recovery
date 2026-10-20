@@ -29,7 +29,7 @@ function GoalPopover({ theme, layout, targetId, load, settings }: PluginButtonCo
     {data?.visible && <>
       <Text style={{ color: c.foregroundMuted, fontSize: 12 }}>Goal: {data.state} · {data.attempts} / {data.maxAttempts} continuations</Text>
       <SettingsCard><SettingsSwitch label="Continue this goal" hint="Selects this objective. It continues only while the goal is active."
-        value={data.selected} disabled={toggle.isPending || result.isFetching || !data.selected && !data.canSelect}
+        value={data.selected} disabled={toggle.isPending || !data.selected && !data.canSelect}
         onValueChange={(value) => toggle.mutate(value)} /></SettingsCard>
       <Text style={{ color: c.foregroundMuted, fontSize: 12 }}>{data.delaySeconds}s delay after a completed turn.</Text>
       {data.note && <Text style={{ color: c.foregroundMuted, fontSize: 12 }}>{data.note}</Text>}
