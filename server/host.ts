@@ -22,7 +22,8 @@ export interface RecoveryHost {
   fetch(id: string): Promise<Agent | null>;
   workspace(id: string): Promise<Workspace | null>;
   goal?(id: string): Promise<GoalReading>;
-  resumeBlockedGoal?(id: string, key: string, expected: Agent, check: () => void, messageId: string): Promise<GoalReading>;
+  supportsGoalCommand?(id: string): Promise<boolean>;
+  resumeBlockedGoal?(id: string, key: string, expected: Agent, check: () => void, messageId: string, submitted?: () => void): Promise<GoalReading>;
   shuttingDown(): Promise<boolean>;
   send(id: string, prompt: string, messageId: string, expected: Agent, check: () => void): Promise<void>;
   close(): Promise<void>;
@@ -174,13 +175,21 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         // return null. Session archivedAt is checked independently before send.
         return w ? { id: w.id, archived: false, archiving: Boolean(w.archivingAt) } : null;
       },
-      async resumeBlockedGoal(id, key, expected, guard, messageId) {
+      async supportsGoalCommand(id) {
+        await check();
+        const result = await paseo.agents.ref(id).commands(); await check();
+        if (result.error) throw new RecoveryError("Could not check this session's native goal commands. Try again.");
+        return result.commands.some((command) => command.name === "goal" && command.kind === "command" && command.description === "Set, pause, resume, or clear the agent's goal");
+      },
+      async resumeBlockedGoal(id, key, expected, guard, messageId, submitted) {
         await check(); guard();
         const agent = (await paseo.agents.ref(id).refresh())?.agent;
         const latest = agent ? metadata(agent) : null;
         if (!agent?.persistence?.sessionId || !latest || !goalCommandReady(latest) || latest.archivedAt || fingerprint(latest) !== fingerprint(expected)) throw new RecoveryError("The session changed before its goal could resume. Check it and try again.");
         const workspace = latest.workspaceId ? await paseo.workspaces.ref(latest.workspaceId).refresh() : null;
         if (!workspace || workspace.archivingAt) throw new RecoveryError("This workspace is unavailable.");
+        const commands = await paseo.agents.ref(id).commands();
+        if (commands.error || !commands.commands.some((command) => command.name === "goal" && command.kind === "command" && command.description === "Set, pause, resume, or clear the agent's goal")) throw new RecoveryError("Codex goal commands are not enabled for this session. Reload it when idle.");
         await check(); guard();
         try {
           return await codexGoals.resumeBlocked(agent.provider, agent.persistence.sessionId, key, guard, async () => {
@@ -188,6 +197,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
             const current = await fetch(id);
             if (!current || !goalCommandReady(current) || current.archivedAt || fingerprint(current) !== fingerprint(expected)) throw new RecoveryError("The session changed before its goal could resume. Check it and try again.");
             await check(); guard();
+            submitted?.();
             await driver.sendAgentMessage(id, "/goal resume", { messageId, activeTurnBehavior: "steer" });
           });
         }

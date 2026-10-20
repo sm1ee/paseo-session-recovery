@@ -31,8 +31,11 @@ export class GoalPillController {
   }
   snapshot(agents: PillAgent[]): void {
     // A reconnect can invalidate host-owned registrations. Rebuild the snapshot.
+    const visible = new Set([...this.targets].filter(([, target]) => target.pill).map(([id]) => id));
     for (const id of this.targets.keys()) this.remove(id);
     for (const a of agents) this.upsert(a);
+    // Restore known controls before scanning a large directory after reconnect.
+    for (const [id, target] of this.targets) target.fresh = visible.has(id);
   }
   remove(id: string): void { this.targets.get(id)?.pill?.remove(); this.targets.delete(id); }
   async refresh(id: string, fresh = true): Promise<GoalControl> {

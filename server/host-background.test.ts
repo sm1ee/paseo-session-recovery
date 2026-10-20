@@ -61,12 +61,19 @@ describe("native Codex goal commands", () => {
     vi.spyOn(DaemonClient.prototype, "fetchAgent").mockResolvedValue({ agent: { id: "fixture", title: "Fixture", provider: "codex", labels: {},
       workspaceId: "background-space", persistence: { sessionId: "native-fixture" }, status: "running", activeTurn: hasTurn ? { turnId: "current-turn" } : undefined, pendingPermissions: [], lastUserMessageAt: null }, project: null } as unknown as NonNullable<Awaited<ReturnType<DaemonClient["fetchAgent"]>>>);
     const send = vi.spyOn(DaemonClient.prototype, "sendAgentMessage").mockResolvedValue(undefined);
+    vi.spyOn(DaemonClient.prototype, "listCommands").mockResolvedValue({ agentId: "fixture", commands: [{ name: "goal", kind: "command", description: "Set, pause, resume, or clear the agent's goal", argumentHint: "[<objective>|pause|resume|clear]" }], error: null, requestId: "fixture" });
     vi.spyOn(CodexGoals.prototype, "resumeBlocked").mockImplementation(async (_provider, _thread, key, guard, submit) => { guard(); await submit(); return { state: "active", key, evidence: true, source: "codex" }; });
     host = await openLocalHost(home, process.pid); const agent = await host.fetch("fixture");
     expect(agent).toMatchObject({ status: "running", activeTurn: hasTurn ? "current-turn" : undefined });
     expect(await host.resumeBlockedGoal!("fixture", "current-goal", agent!, () => {}, "fixture-resume-message")).toMatchObject({ state: "active", key: "current-goal" });
     expect(send).toHaveBeenCalledExactlyOnceWith("fixture", "/goal resume", { messageId: "fixture-resume-message", activeTurnBehavior: "steer" });
     expect(await host.fetch("fixture")).toMatchObject({ status: "running", activeTurn: hasTurn ? "current-turn" : undefined });
+  });
+  it("requires the native goal registration, rather than an unrelated goal skill", async () => {
+    const commands = vi.spyOn(DaemonClient.prototype, "listCommands").mockResolvedValue({ agentId: "fixture", commands: [], error: null, requestId: "fixture" });
+    host = await openLocalHost(home, process.pid); expect(await host.supportsGoalCommand!("fixture")).toBe(false);
+    commands.mockResolvedValue({ agentId: "fixture", commands: [{ name: "goal", kind: "skill", description: "A custom goal skill", argumentHint: "" }], error: null, requestId: "fixture" });
+    expect(await host.supportsGoalCommand!("fixture")).toBe(false);
   });
 });
 

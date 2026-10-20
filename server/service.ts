@@ -12,6 +12,7 @@ export type RecoveryEvent =
   | { kind: "resolution"; agent: HookAgent; requestId: string; allowed: boolean }
   | { kind: "closed" | "archived"; agent: HookAgent };
 interface Ticket { id: string; revision: number; generation: number; expiresAt: number; fingerprint: string; prompt: string }
+interface NativeGoalResume { submitted: boolean; starts: number }
 function suspendedGoal(r: RecordEntry): boolean {
   return isSelectedGoal(r) && ["review", "stopped"].includes(r.phase) && ["goal_paused", "goal_blocked", "goal_limited", "goal_unknown"].includes(r.reason);
 }
@@ -34,6 +35,7 @@ export class RecoveryService {
   private cursor = 0;
   private controls = new Map<string, { at: number; generation: number; changed: number; value: GoalControl }>();
   private controlRequests = new Map<string, object>();
+  private nativeGoalResumes = new Map<string, NativeGoalResume>();
   constructor(private readonly connect = openLocalHost, private readonly now = Date.now, private readonly automaticTimer = true) {}
   private enqueue<T>(work: () => Promise<T>, report = true): Promise<T> {
     const task = this.queue.then(work);
@@ -117,6 +119,10 @@ export class RecoveryService {
   observe(event: RecoveryEvent): Promise<void> {
     const at = this.now();
     this.changes.set(event.agent.id, (this.changes.get(event.agent.id) ?? 0) + 1);
+    // Codex can start its own goal turn as the native resume command is handled.
+    // Other events and user actions still invalidate the pending operation.
+    const resuming = this.nativeGoalResumes.get(event.agent.id);
+    if (event.kind === "start" && resuming?.submitted) resuming.starts++;
     return this.enqueue(async () => {
       if (this.stopped || this.fatal) return;
       const host = await this.ready(); const id = event.agent.id;
@@ -330,9 +336,10 @@ export class RecoveryService {
   }
   watchGoal(id: string, expectedKey?: string, resetAttempts = false, resumeBlocked = false): Promise<{ ok: true }> {
     this.changes.set(id, (this.changes.get(id) ?? 0) + 1);
-    const changed = this.changes.get(id), generation = this.generation;
+    const changed = this.changes.get(id) ?? 0, generation = this.generation;
     return this.action(async () => {
-      const guard = () => { this.check(generation); if (this.changes.get(id) !== changed) throw new RecoveryError("The session changed. Check it before selecting its goal again."); };
+      let nativeResume: NativeGoalResume | undefined;
+      const guard = () => { this.check(generation); if (this.changes.get(id) !== changed + (nativeResume?.starts ?? 0)) throw new RecoveryError("The session changed. Check it before selecting its goal again."); };
       const host = await this.ready(); let a = await host.fetch(id);
       guard();
       if (!a || a.internal || a.archivedAt || this.saved.excluded.includes(id)) throw new RecoveryError("This session is unavailable or excluded from recovery.");
@@ -353,6 +360,8 @@ export class RecoveryService {
         const workspace = a.workspaceId ? await host.workspace(a.workspaceId) : null; guard();
         if (!workspace || workspace.archived || workspace.archiving || a.parentId && (!this.settings.recoverSubagents || await this.parentBlock(a, host))) throw new RecoveryError("The workspace or parent session is unavailable for goal continuation.");
         if (!host.resumeBlockedGoal) throw new RecoveryError("This provider cannot resume blocked goals from the toggle.");
+        if (!await host.supportsGoalCommand?.(id)) throw new RecoveryError("Codex goal commands are not enabled for this session. Reload it when idle.");
+        guard();
         const key = reading.key;
         const at = this.now(), messageId = `session-recovery-goal-${randomUUID()}`;
         const intent: RecordEntry = { id, title: a.title, provider: a.provider, workspaceId: a.workspaceId, parentId: a.parentId,
@@ -361,15 +370,17 @@ export class RecoveryService {
           attemptMessageId: messageId, expectingStart: false, revision: (existing?.revision ?? 0) + 1,
           goal: { key, state: "blocked", selectedKey: key, attempts: existing?.goal?.key === key ? existing.goal.attempts : 0 } };
         this.saved.records[id] = intent; await this.persist();
+        nativeResume = { submitted: false, starts: 0 };
+        this.nativeGoalResumes.set(id, nativeResume);
         try {
-          reading = await host.resumeBlockedGoal(id, key, a, guard, messageId); guard();
+          reading = await host.resumeBlockedGoal(id, key, a, guard, messageId, () => { nativeResume!.submitted = true; }); guard();
           if (reading.state !== "active" || reading.key !== key) throw new RecoveryError("The same goal could not be resumed. Check its latest state.");
           const latest = await host.fetch(id); guard();
           if (!latest || latest.provider !== a.provider || latest.workspaceId !== a.workspaceId || latest.parentId !== a.parentId || latest.archivedAt) throw new RecoveryError("The session changed while its goal resumed. Check it before continuing.");
           a = latest;
         } catch (error) {
           this.review(intent, "uncertain_send"); await this.persist(); throw error;
-        }
+        } finally { this.nativeGoalResumes.delete(id); }
       }
       const previous = this.saved.records[id]; const at = this.now();
       const goal = { key: reading.key, state: reading.state, selectedKey: reading.key, attempts: !resetAttempts && previous?.goal?.key === reading.key ? previous.goal.attempts : 0,

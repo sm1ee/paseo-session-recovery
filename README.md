@@ -36,7 +36,9 @@ Goal sessions also have a toggle on their recovery card. Turning either toggle o
 
 Turning the toggle on explicitly resumes a **blocked Codex goal**, then schedules its next continuation after the configured delay. For a goal already selected before this update, turn it off and on once to resume it. The goal's objective, token budget, usage, and continuation count are preserved. Pending input, an explicit session stop, and exhausted limits still prevent resumption. A later automatic check never clears another blocker.
 
-You can turn it on during a running turn. The native goal command leaves that turn running; a continuation waits until it finishes and the configured delay passes.
+You can turn it on during a running turn. The native goal command leaves that turn running. When idle, Codex may start its own goal turn immediately after resumption. The plugin waits for that turn to finish and the configured delay to pass before sending a fallback continuation.
+
+Paseo must list its native `/goal` command for the session before the toggle can resume a blocked Codex goal. Custom launch wrappers must return the Codex version when the wrapper itself is run with `--version`. After fixing a wrapper, reload affected sessions in Paseo when idle. The plugin checks command support before sending and leaves running sessions in place.
 
 Paused, limited, and non-Codex blocked goals can be selected without changing their native status. The plugin rechecks selected goals and waits for the same objective to become active.
 
@@ -94,9 +96,9 @@ npm run typecheck
 paseo plugin install /absolute/path/to/paseo-session-recovery
 ```
 
-Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed.
+Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed. Goal controls retry a failed initial session lookup and restore previously visible goals first after reconnecting, including on mobile clients.
 
-For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.4.3`. The public registry listing requires a separate review.
+For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.4.4`. The public registry listing requires a separate review.
 
 ## Local data
 

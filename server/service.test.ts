@@ -23,8 +23,10 @@ function fixture(options: Record<string, unknown> = {}) {
   const fetch = vi.fn(async (id: string) => structuredClone(id === a.id ? a : others.get(id) ?? null));
   const getWorkspace = vi.fn(async () => structuredClone(workspace));
   const goal = vi.fn(async () => structuredClone(goalReading));
-  const resumeBlockedGoal = vi.fn(async (_id: string, key: string, _expected: Agent, check: () => void) => {
+  const supportsGoalCommand = vi.fn(async () => true);
+  const resumeBlockedGoal = vi.fn(async (_id: string, key: string, _expected: Agent, check: () => void, _messageId: string, submitted?: () => void) => {
     check(); if (goalReading.state !== "blocked" || goalReading.key !== key) throw new Error("Goal changed");
+    submitted?.();
     goalReading = { ...goalReading, state: "active" }; return structuredClone(goalReading);
   });
   const send = vi.fn(async (_id: string, _prompt: string, _messageId: string, _expected: Agent, check: () => void) => { check(); });
@@ -32,13 +34,13 @@ function fixture(options: Record<string, unknown> = {}) {
   const hosts: RecoveryHost[] = [];
   const create = (bootKey: string) => {
     const host: RecoveryHost = { bootKey, serverId: "host", store, fetch, workspace: getWorkspace,
-      shuttingDown: vi.fn(async () => shuttingDown), goal, resumeBlockedGoal, send, close: vi.fn(async () => {}) };
+      shuttingDown: vi.fn(async () => shuttingDown), goal, supportsGoalCommand, resumeBlockedGoal, send, close: vi.fn(async () => {}) };
     hosts.push(host); service = new RecoveryService(async () => host, () => clock, false); return service;
   };
   create("boot-a");
   const event = (value: Omit<RecoveryEvent, "agent">) => service.observe({ ...value, agent: { ...hook, parentAgentId: a.parentId } } as RecoveryEvent);
   return {
-    a, others, workspace, settings, store, fetch, getWorkspace, goal, resumeBlockedGoal, send, hosts,
+    a, others, workspace, settings, store, fetch, getWorkspace, goal, supportsGoalCommand, resumeBlockedGoal, send, hosts,
     setGoal: (reading: GoalReading) => { goalReading = reading; },
     get service() { return service; },
     get saved() { return structuredClone(saved); }, setSaved: (s: SavedState) => { saved = structuredClone(s); },
@@ -104,6 +106,43 @@ describe("goal composer inspection", () => {
     f.advance(60_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
     f.idle(); await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "completed" } } as Omit<RecoveryEvent, "agent">);
     await f.service.scanNow(); f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledOnce();
+  });
+  it("does not send or persist a resume command when the session did not advertise native goal support", async () => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.service.configure(f.settings);
+    f.supportsGoalCommand.mockResolvedValue(false);
+    await expect(f.service.watchGoal("session", active.key!, false, true)).rejects.toThrow(/not enabled/);
+    expect(f.resumeBlockedGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled(); expect(f.saved.records).toEqual({});
+  });
+  it("accepts Codex's own turn starting after the native resume command is submitted", async () => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.service.configure(f.settings);
+    let started!: Promise<void>;
+    f.resumeBlockedGoal.mockImplementationOnce(async (_id, _key, _expected, check, _messageId, submitted) => {
+      check(); submitted?.(); f.setGoal({ ...active, source: "codex" }); f.a.status = "running"; f.a.activeTurn = "native-goal-turn";
+      started = f.event({ kind: "start", turnId: "native-goal-turn" } as Omit<RecoveryEvent, "agent">);
+      check(); return { ...active, source: "codex" };
+    });
+    await f.service.watchGoal("session", active.key!, false, true); await started;
+    expect(f.saved.records.session).toMatchObject({ phase: "watching", reason: "active", goal: { state: "active", selectedKey: active.key, attempts: 0 } });
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+    f.idle(); await f.event({ kind: "end", turnId: "native-goal-turn", outcome: { kind: "completed" } } as Omit<RecoveryEvent, "agent">);
+    await f.service.scanNow(); f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledOnce();
+  });
+  it.each(["stop", "permission", "unwatch"] as const)("still honors a %s after a native goal turn starts", async (block) => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.service.configure(f.settings);
+    const pending: Array<Promise<unknown>> = [];
+    f.resumeBlockedGoal.mockImplementationOnce(async (_id, _key, _expected, check, _messageId, submitted) => {
+      check(); submitted?.(); f.setGoal({ ...active, source: "codex" }); f.a.status = "running"; f.a.activeTurn = "native-goal-turn";
+      pending.push(f.event({ kind: "start", turnId: "native-goal-turn" } as Omit<RecoveryEvent, "agent">));
+      if (block === "stop") { f.idle(); pending.push(f.event({ kind: "end", turnId: "native-goal-turn", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">)); }
+      else if (block === "permission") { f.a.pendingPermissions = 1; pending.push(f.event({ kind: "permission", requestId: "approval" } as Omit<RecoveryEvent, "agent">)); }
+      else pending.push(f.service.unwatchGoal("session"));
+      check(); return { ...active, source: "codex" };
+    });
+    await expect(f.service.watchGoal("session", active.key!, false, true)).rejects.toThrow(/changed/); await Promise.all(pending);
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled(); expect(f.resumeBlockedGoal).toHaveBeenCalledOnce();
+    if (block === "stop") expect(f.saved.records.session.reason).toBe("user_stop");
+    if (block === "permission") expect(f.saved.records.session.humanRequired).toBe(true);
+    if (block === "unwatch") expect(f.saved.records.session.goal?.selectedKey).toBeNull();
   });
   it.each(["starting", "no-history"])("waits for %s session metadata before changing a goal", async (state) => {
     const f = fixture({ continueGoals: true }); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.track();

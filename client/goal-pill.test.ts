@@ -5,7 +5,7 @@ import { contributeGoalPills } from "./goal-pill";
 
 const agent = { id: "session", workspaceId: "workspace", status: "idle" };
 let cleanup: (() => void) | undefined;
-afterEach(() => { cleanup?.(); cleanup = undefined; });
+afterEach(() => { cleanup?.(); cleanup = undefined; vi.useRealTimers(); vi.restoreAllMocks(); });
 async function fixture() {
   let goal: GoalControl = { id: agent.id, workspaceId: agent.workspaceId, visible: true, state: "active", key: "old-goal", selected: false, canSelect: true,
     automatic: true, attempts: 0, maxAttempts: 10, delaySeconds: 60, note: null };
@@ -30,6 +30,21 @@ async function fixture() {
   return { list, rpc, update, press: behavior.onPress, set: (patch: Partial<GoalControl>) => { goal = { ...goal, ...patch }; } };
 }
 describe("direct goal toggle", () => {
+  it("retries a failed initial directory lookup and stops retrying after cleanup", async () => {
+    vi.useFakeTimers(); const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const goal: GoalControl = { id: agent.id, workspaceId: agent.workspaceId, visible: true, state: "active", key: "goal", selected: false, canSelect: true,
+      automatic: true, attempts: 0, maxAttempts: 10, delaySeconds: 60, note: null };
+    const addComposerPill = vi.fn(() => ({ update: vi.fn(), remove: vi.fn() }));
+    const subscription = { subscribe: vi.fn((handlers) => handlers.snapshot({ entries: [{ agent }] })) };
+    const list = vi.fn().mockRejectedValueOnce(new Error("Mobile connection interrupted")).mockResolvedValue({ subscription });
+    const client = { rpc: vi.fn(async () => goal), addComposerPill, paseo: { agents: { list } } } as unknown as PluginClientContext;
+    cleanup = contributeGoalPills(client); await vi.advanceTimersByTimeAsync(0);
+    expect(list).toHaveBeenCalledOnce(); expect(list.mock.calls[0][0].signal.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(5000); expect(list).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(5000); expect(list).toHaveBeenCalledTimes(2); expect(addComposerPill).toHaveBeenCalledOnce();
+    cleanup(); cleanup = undefined; await vi.advanceTimersByTimeAsync(10_000);
+    expect(list.mock.calls[1][0].signal.aborted).toBe(true); expect(list).toHaveBeenCalledTimes(2); errors.mockRestore();
+  });
   it("uses the complete active directory instead of the default first 200 sessions", async () => {
     const f = await fixture(); expect(f.list).toHaveBeenCalledWith(expect.objectContaining({ scope: "active", sync: {}, subscribe: {} }));
   });

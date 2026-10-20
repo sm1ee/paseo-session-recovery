@@ -29,19 +29,39 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
       return { remove: () => pill.remove(), update: (value) => pill.update({ label: label(value), title: value.selected ? `Turn goal continuation off${value.note ? `: ${value.note}` : ""}` : "Turn goal continuation on; resume a blocked Codex goal" }) };
     },
   );
-  const timer = setInterval(() => { void controller.poll(); }, 5000);
-  // A synced active directory includes every page, including older sessions.
-  void client.paseo.agents.list({ scope: "active", sync: {}, subscribe: {}, signal: lifetime.signal }).then(({ subscription }) => {
-    if (lifetime.signal.aborted) return;
-    subscription.subscribe({
-      snapshot: ({ entries }) => { controller.snapshot(entries.map(({ agent }) => agent)); void controller.poll(); },
-      update: (message) => {
-        if (message.type !== "agent_update") return;
-        if (message.payload.kind === "remove") controller.remove(message.payload.agentId);
-        else controller.upsert(message.payload.agent);
-        void controller.poll();
-      },
-    });
-  }).catch(() => { if (!lifetime.signal.aborted) console.error("Goal pill session observation failed."); });
+  let observing = false, starting = false;
+  const observe = () => {
+    if (lifetime.signal.aborted || observing || starting) return;
+    starting = true;
+    const attempt = new AbortController();
+    const abort = () => attempt.abort();
+    lifetime.signal.addEventListener("abort", abort, { once: true });
+    // A failed mobile bootstrap must release its partial observation and retry.
+    // A successful owned subscription handles later reconnects itself.
+    void (async () => {
+      try {
+        const { subscription } = await client.paseo.agents.list({ scope: "active", sync: {}, subscribe: {}, signal: attempt.signal });
+        if (lifetime.signal.aborted) return;
+        subscription.subscribe({
+          snapshot: ({ entries }) => { controller.snapshot(entries.map(({ agent }) => agent)); void controller.poll(); },
+          update: (message) => {
+            if (message.type !== "agent_update") return;
+            if (message.payload.kind === "remove") controller.remove(message.payload.agentId);
+            else controller.upsert(message.payload.agent);
+            void controller.poll();
+          },
+        });
+        observing = true;
+      } catch {
+        attempt.abort();
+        if (!lifetime.signal.aborted) console.error("Goal pill session observation failed; retrying.");
+      } finally {
+        starting = false;
+        if (!observing) lifetime.signal.removeEventListener("abort", abort);
+      }
+    })();
+  };
+  const timer = setInterval(() => { observe(); void controller.poll(); }, 5000);
+  observe();
   return () => { lifetime.abort(); clearInterval(timer); controller.stop(); };
 }

@@ -7,7 +7,7 @@ const control = (patch: Partial<GoalControl> = {}): GoalControl => ({ id: agent.
   state: null, key: null, selected: false, canSelect: false, automatic: true, attempts: 0, maxAttempts: 10, delaySeconds: 60, note: null, ...patch });
 function fixture() {
   let now = 0, value = control();
-  const read = vi.fn(async () => value);
+  const read = vi.fn(async (_id: string, _fresh: boolean) => value);
   const registrations: Array<PillRegistration & { update: ReturnType<typeof vi.fn>; remove: ReturnType<typeof vi.fn> }> = [];
   const add = vi.fn(() => { const r = { update: vi.fn(), remove: vi.fn() }; registrations.push(r); return r; });
   const controller = new GoalPillController(read, add, () => now);
@@ -51,6 +51,14 @@ describe("goal composer pill lifecycle", () => {
     const f = fixture(); f.set({ visible: true }); await f.controller.refresh(agent.id);
     f.controller.snapshot([agent]); await f.controller.refresh(agent.id); expect(f.add).toHaveBeenCalledTimes(2);
     expect(f.registrations[0].remove).toHaveBeenCalledOnce(); f.controller.snapshot([]); expect(f.registrations[1].remove).toHaveBeenCalledOnce();
+  });
+  it("restores known goal controls before a large directory after reconnect", async () => {
+    const f = fixture(); f.set({ visible: true, state: "active", key: "goal" }); await f.controller.refresh(agent.id);
+    f.read.mockClear();
+    f.read.mockImplementation(async (id) => control({ id, visible: id === agent.id }));
+    f.controller.snapshot([...Array.from({ length: 2200 }, (_, i) => ({ ...agent, id: `other-${i}` })), agent]);
+    await f.controller.poll();
+    expect(f.read.mock.calls[0][0]).toBe(agent.id); expect(f.add).toHaveBeenCalledTimes(2);
   });
   it("serializes background lookups and waits before polling an idle session again", async () => {
     const f = fixture(); let release!: (value: GoalControl) => void;
