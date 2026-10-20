@@ -51,8 +51,8 @@ export class CodexGoalConnection {
     if (this.closed) return Promise.reject(new Error("Goal reader is closed"));
     if (this.ready) return this.ready;
     this.buffer = "";
-    // This subprocess only receives initialize and thread/goal/get. It never
-    // loads, resumes, changes, or starts a Codex thread.
+    // This subprocess only initializes and reads goals. Goal changes and turns
+    // go through the owning Paseo connection, which holds Codex's writer lease.
     const child = spawn(this.launch.command, this.launch.args, { cwd: this.cwd, env: { ...process.env, ...this.launch.env }, stdio: ["pipe", "pipe", "pipe"] });
     this.child = child;
     child.stderr.resume();
@@ -81,11 +81,37 @@ export class CodexGoalConnection {
     return this.ready;
   }
   async read(threadId: string): Promise<GoalReading> {
+    return this.decode(await this.get(threadId));
+  }
+  private async get(threadId: string): Promise<Record<string, unknown>> {
     await this.start();
     const data = record(await this.request("thread/goal/get", { threadId }));
     if (!("goal" in data)) throw new Error("Unrecognized Codex goal response");
-    if (data.goal === null) return { state: "cleared", key: null, evidence: false };
-    return readGoal([{ type: "tool_call", name: "get_goal", status: "completed", detail: { type: "unknown", input: {}, output: data.goal } }]);
+    return data;
+  }
+  private decode(data: Record<string, unknown>): GoalReading {
+    if (data.goal === null) return { state: "cleared", key: null, evidence: false, source: "codex" };
+    return { ...readGoal([{ type: "tool_call", name: "get_goal", status: "completed", detail: { type: "unknown", input: {}, output: data.goal } }]), source: "codex" };
+  }
+  async resumeBlocked(threadId: string, key: string, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
+    const data = await this.get(threadId); check();
+    const before = this.decode(data), goal = record(data.goal);
+    if (before.state !== "blocked" || before.key !== key) throw new Error("The Codex goal changed. Check it before trying again.");
+    if (typeof goal.tokensUsed !== "number" || !Number.isFinite(goal.tokensUsed) || goal.tokensUsed < 0 ||
+      goal.tokenBudget !== null && (typeof goal.tokenBudget !== "number" || !Number.isFinite(goal.tokenBudget) || goal.tokenBudget <= 0 || goal.tokensUsed >= goal.tokenBudget)) {
+      throw new Error("The Codex goal's usage limit could not be cleared safely. Review its native budget.");
+    }
+    check();
+    // Paseo's native /goal resume uses the connection that owns the thread.
+    // Never write its database or retry a command whose receipt was lost.
+    await send(); check();
+    for (let n = 0; n < 20; n++) {
+      const after = await this.read(threadId); check();
+      if (after.key !== key || after.state !== "blocked" && after.state !== "active") break;
+      if (after.state === "active") return after;
+      await new Promise((resolve) => setTimeout(resolve, 250)); check();
+    }
+    throw new Error("Codex has not confirmed that the same goal resumed. Check the conversation before trying again.");
   }
   async close(): Promise<void> {
     this.closed = true; this.fail();
@@ -102,26 +128,36 @@ export class CodexGoals {
   private readers = new Map<string, { signature: string; reader: CodexGoalConnection }>();
   private closed = false;
   constructor(private readonly home: string) {}
-  async read(provider: string, threadId: string): Promise<GoalReading | null> {
+  private async reader(provider: string): Promise<CodexGoalConnection | null> {
     const config = JSON.parse(await readFile(join(this.home, "config.json"), "utf8"));
-    if (this.closed) return { state: "unknown", key: null, evidence: true };
+    if (this.closed) throw new Error("Goal reader is closed");
     const launch = codexLaunch(config, provider); if (!launch) return null;
     const signature = createHash("sha256").update(JSON.stringify(launch)).digest("hex");
     let current = this.readers.get(provider);
     while (current && current.signature !== signature) {
       this.readers.delete(provider); await current.reader.close();
-      if (this.closed) return { state: "unknown", key: null, evidence: true };
+      if (this.closed) throw new Error("Goal reader is closed");
       current = this.readers.get(provider);
     }
     if (current?.signature !== signature) {
       current = { signature, reader: new CodexGoalConnection(launch, this.home) };
       this.readers.set(provider, current);
     }
-    try { return await current!.reader.read(threadId); }
+    return current.reader;
+  }
+  async read(provider: string, threadId: string): Promise<GoalReading | null> {
+    if (this.closed) return { state: "unknown", key: null, evidence: true };
+    const reader = await this.reader(provider); if (!reader) return null;
+    try { return await reader.read(threadId); }
     catch {
-      await current!.reader.close(); if (this.readers.get(provider) === current) this.readers.delete(provider);
+      await reader.close(); if (this.readers.get(provider)?.reader === reader) this.readers.delete(provider);
       return { state: "unknown", key: null, evidence: true };
     }
+  }
+  async resumeBlocked(provider: string, threadId: string, key: string, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
+    const reader = await this.reader(provider);
+    if (!reader) throw new Error("Only native Codex blocked goals can be resumed from this toggle.");
+    return reader.resumeBlocked(threadId, key, check, send);
   }
   async close(): Promise<void> { this.closed = true; for (const { reader } of this.readers.values()) await reader.close(); this.readers.clear(); }
 }

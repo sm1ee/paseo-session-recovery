@@ -12,6 +12,9 @@ export type RecoveryEvent =
   | { kind: "resolution"; agent: HookAgent; requestId: string; allowed: boolean }
   | { kind: "closed" | "archived"; agent: HookAgent };
 interface Ticket { id: string; revision: number; generation: number; expiresAt: number; fingerprint: string; prompt: string }
+function suspendedGoal(r: RecordEntry): boolean {
+  return isSelectedGoal(r) && ["review", "stopped"].includes(r.phase) && ["goal_paused", "goal_blocked", "goal_limited", "goal_unknown"].includes(r.reason);
+}
 export class RecoveryService {
   private host: RecoveryHost | null = null;
   private saved: SavedState = emptyState("");
@@ -197,10 +200,13 @@ export class RecoveryService {
         this.scheduled(r, "goal_active"); r.dueAt = this.now() + this.settings.goalDelaySeconds * 1000;
       }
     } else if (state === "complete") { this.set(r, "completed", "goal_complete"); this.audit(r, "completed"); }
-    else if (state === "paused" || state === "cleared") { this.set(r, "stopped", state === "paused" ? "goal_paused" : "goal_cleared"); this.audit(r, "stopped"); }
+    else if (state === "paused" || state === "cleared") {
+      const reason = state === "paused" ? "goal_paused" : "goal_cleared";
+      if (r.phase !== "stopped" || r.reason !== reason) { this.set(r, "stopped", reason); this.audit(r, "stopped"); }
+    }
     else {
       const reason = state === "blocked" ? "goal_blocked" : state === "limited" ? "goal_limited" : "goal_unknown";
-      if (selectedKey) this.review(r, reason);
+      if (selectedKey) { if (r.phase !== "review" || r.reason !== reason) this.review(r, reason); }
       else { this.set(r, "completed", reason); this.audit(r, "completed"); }
     }
   }
@@ -208,9 +214,9 @@ export class RecoveryService {
     this.scanning = true;
     try {
       this.check(generation); const host = await this.ready();
-      const all = Object.values(this.saved.records).filter((r) => OPEN_PHASES.has(r.phase) && !this.saved.excluded.includes(r.id));
+      const all = Object.values(this.saved.records).filter((r) => (OPEN_PHASES.has(r.phase) || suspendedGoal(r)) && !this.saved.excluded.includes(r.id));
       const due = all.filter((r) => r.phase === "scheduled").sort((a, b) => (a.dueAt ?? 0) - (b.dueAt ?? 0));
-      const watch = all.filter((r) => ["watching", "waiting", "resumed"].includes(r.phase) || r.phase === "review" && ["monitor_gap", "unknown_end", "runtime_closed", "goal_check"].includes(r.reason));
+      const watch = all.filter((r) => suspendedGoal(r) || ["watching", "waiting", "resumed"].includes(r.phase) || r.phase === "review" && ["monitor_gap", "unknown_end", "runtime_closed", "goal_check"].includes(r.reason));
       const rotating = watch.slice(this.cursor).concat(watch.slice(0, this.cursor));
       const batch = [...due.slice(0, 3), ...rotating.slice(0, 7)]; this.cursor = watch.length ? (this.cursor + 7) % watch.length : 0;
       // Read tracked sessions only. Old idle sessions are never discovered or resumed.
@@ -224,8 +230,12 @@ export class RecoveryService {
           if (r.phase !== "watching") this.set(r, "watching", "active");
           r.turnId = a.activeTurn; r.bootKey = host.bootKey; r.lastSeenAt = this.now(); r.messageAt = a.lastUserMessageAt; r.expectingStart = false; continue;
         }
-        if (r.reason === "goal_check" || r.reason === "goal_active") {
-          if (r.reason === "goal_check") r.messageAt = a.lastUserMessageAt;
+        if (r.expectingStart) {
+          if (this.now() - r.lastSeenAt >= 30_000) this.review(r, "uncertain_send");
+          continue;
+        }
+        if (r.reason === "goal_check" || r.reason === "goal_active" || suspendedGoal(r)) {
+          if (r.reason !== "goal_active") r.messageAt = a.lastUserMessageAt;
           await this.inspectGoal(r, host); this.check(generation);
           if ((this.changes.get(r.id) ?? 0) !== changed) continue;
           if (r.reason !== "goal_active") continue;
@@ -235,7 +245,11 @@ export class RecoveryService {
           if ((r.dueAt ?? Infinity) <= this.now()) await this.attempt(r, false, generation);
           continue;
         }
-        if (a.attentionReason === "finished" && time(a.attentionTimestamp) >= r.startedAt) { this.set(r, "completed", "finished"); this.audit(r, "completed"); continue; }
+        if (a.attentionReason === "finished" && time(a.attentionTimestamp) >= r.startedAt) {
+          if (isSelectedGoal(r) && !r.humanRequired) { r.messageAt = a.lastUserMessageAt; await this.inspectGoal(r, host); }
+          else { this.set(r, "completed", "finished"); this.audit(r, "completed"); }
+          continue;
+        }
         if (["watching", "waiting", "resumed"].includes(r.phase)) {
           if (r.expectingStart && this.now() - r.lastSeenAt < 30_000) continue;
           this.review(r, r.expectingStart ? "uncertain_send" : r.humanRequired ? "input" : "unknown_end"); continue;
@@ -314,23 +328,54 @@ export class RecoveryService {
       return { ok: true };
     });
   }
-  watchGoal(id: string, expectedKey?: string, resetAttempts = false): Promise<{ ok: true }> {
+  watchGoal(id: string, expectedKey?: string, resetAttempts = false, resumeBlocked = false): Promise<{ ok: true }> {
     this.changes.set(id, (this.changes.get(id) ?? 0) + 1);
+    const changed = this.changes.get(id), generation = this.generation;
     return this.action(async () => {
-      const host = await this.ready(); const a = await host.fetch(id);
+      const guard = () => { this.check(generation); if (this.changes.get(id) !== changed) throw new RecoveryError("The session changed. Check it before selecting its goal again."); };
+      const host = await this.ready(); let a = await host.fetch(id);
+      guard();
       if (!a || a.internal || a.archivedAt || this.saved.excluded.includes(id)) throw new RecoveryError("This session is unavailable or excluded from recovery.");
       const existing = this.saved.records[id];
       if (!existing && Object.keys(this.saved.records).length >= 2000) throw new RecoveryError("Too many sessions are being tracked. Review existing candidates before watching another goal.");
       if (existing?.expectingStart || existing?.phase === "sending" || existing?.reason === "uncertain_send") throw new RecoveryError("A previous continuation has uncertain delivery. Check the conversation and dismiss that candidate before watching its goal again.");
-      const reading = await host.goal?.(id);
+      if (resumeBlocked && existing?.reason === "user_stop") throw new RecoveryError("This session was stopped by the user. Continue it in the conversation first.");
+      let reading = await host.goal?.(id); guard();
       if (!reading?.evidence) throw new RecoveryError("No supported current goal was found. Set a goal in the provider before selecting it here.");
       if (!reading.key || reading.state === "complete" || reading.state === "cleared") throw new RecoveryError("The current goal could not be verified or has already ended. Open the session and check its goal.");
       if (expectedKey && expectedKey !== reading.key) throw new RecoveryError("The goal changed. Refresh and select the new goal if you want to continue it.");
+      const reactivating = resumeBlocked && reading.state === "blocked" && reading.source === "codex";
+      if (reactivating) {
+        if (!this.settings.enabled || !this.settings.continueGoals) throw new RecoveryError("Enable Continue selected goals in Settings before resuming this goal.");
+        if (existing?.humanRequired || existing?.pendingIds.length || a.pendingPermissions !== 0) throw new RecoveryError("Answer the pending question or approval before resuming this goal.");
+        if (busy(a) || a.activeTurn === undefined || !a.persistence) throw new RecoveryError("The session must be idle with saved history before its blocked goal can resume.");
+        if (!resetAttempts && existing?.goal?.key === reading.key && existing.goal.attempts >= this.settings.goalMaxAttempts) throw new RecoveryError("The goal continuation limit was reached. Review it before resetting the count.");
+        const workspace = a.workspaceId ? await host.workspace(a.workspaceId) : null; guard();
+        if (!workspace || workspace.archived || workspace.archiving || a.parentId && (!this.settings.recoverSubagents || await this.parentBlock(a, host))) throw new RecoveryError("The workspace or parent session is unavailable for goal continuation.");
+        if (!host.resumeBlockedGoal) throw new RecoveryError("This provider cannot resume blocked goals from the toggle.");
+        const key = reading.key;
+        const at = this.now(), messageId = `session-recovery-goal-${randomUUID()}`;
+        const intent: RecordEntry = { id, title: a.title, provider: a.provider, workspaceId: a.workspaceId, parentId: a.parentId,
+          turnId: a.activeTurn ?? null, bootKey: host.bootKey, startedAt: at, lastSeenAt: at, phase: "sending", reason: "goal_blocked", dueAt: null,
+          attempts: existing?.attempts ?? 0, humanRequired: false, pendingIds: [], messageAt: a.lastUserMessageAt,
+          attemptMessageId: messageId, expectingStart: false, revision: (existing?.revision ?? 0) + 1,
+          goal: { key, state: "blocked", selectedKey: key, attempts: existing?.goal?.key === key ? existing.goal.attempts : 0 } };
+        this.saved.records[id] = intent; await this.persist();
+        try {
+          reading = await host.resumeBlockedGoal(id, key, a, guard, messageId); guard();
+          if (reading.state !== "active" || reading.key !== key) throw new RecoveryError("The same goal could not be resumed. Check its latest state.");
+          const latest = await host.fetch(id); guard();
+          if (!latest || latest.provider !== a.provider || latest.workspaceId !== a.workspaceId || latest.parentId !== a.parentId || latest.archivedAt) throw new RecoveryError("The session changed while its goal resumed. Check it before continuing.");
+          a = latest;
+        } catch (error) {
+          this.review(intent, "uncertain_send"); await this.persist(); throw error;
+        }
+      }
       const previous = this.saved.records[id]; const at = this.now();
       const goal = { key: reading.key, state: reading.state, selectedKey: reading.key, attempts: !resetAttempts && previous?.goal?.key === reading.key ? previous.goal.attempts : 0,
         ...(reading.modeId ? { modeId: reading.modeId } : {}) };
       // Selecting a goal must not replace an unresolved interruption or approval.
-      if (previous && OPEN_PHASES.has(previous.phase) && !previous.reason.startsWith("goal_") && !["watching", "waiting"].includes(previous.phase)) {
+      if (!reactivating && previous && OPEN_PHASES.has(previous.phase) && !previous.reason.startsWith("goal_") && !["watching", "waiting"].includes(previous.phase)) {
         previous.goal = goal; previous.revision++; await this.persist(); return { ok: true };
       }
       const r: RecordEntry = { id, title: a.title, provider: a.provider, workspaceId: a.workspaceId, parentId: a.parentId,
@@ -381,6 +426,10 @@ export class RecoveryService {
         const excluded = this.saved.excluded.includes(id);
         const uncertain = r?.reason === "uncertain_send" || r?.phase === "sending" || r?.expectingStart;
         value.canSelect = value.visible && reading.evidence && !!reading.key && !excluded && !uncertain;
+        value.holdReason = !selected ? null : excluded ? "excluded" : uncertain ? "uncertain_send" : !value.automatic ? "goal_disabled"
+          : r?.humanRequired || a.pendingPermissions > 0 ? "input" : value.attempts >= value.maxAttempts ? "goal_limit"
+          : value.state !== "active" ? value.state === "paused" ? "goal_paused" : value.state === "blocked" ? "goal_blocked" : value.state === "limited" ? "goal_limited" : "goal_unknown"
+          : r?.reason === "user_stop" || r?.phase === "review" && !r.reason.startsWith("goal_") ? r.reason : null;
         value.note = excluded ? reasonText.excluded : uncertain ? reasonText.uncertain_send : !value.automatic ? "Automatic goal continuation is off in Settings."
           : r?.humanRequired || a.pendingPermissions > 0 ? reasonText.input : value.attempts >= value.maxAttempts ? reasonText.goal_limit
           : reading.source === "opencode" ? value.state === "active" ? reading.nativeContinuation ? "OpenCode is managing continuation. Paseo will not send an extra message while the native continuation or child-session guard is in effect."

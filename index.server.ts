@@ -17,7 +17,7 @@ export default function contribute(server: PluginServerContext) {
   server.on("agent.archived", (e) => service.observe({ kind: "archived", agent: e.agent }));
   server.handle(statusRpc, (input) => service.status(input));
   server.handle(scanRpc, () => service.requestScan());
-  server.handle(watchGoalRpc, ({ id, key, resetAttempts }) => service.watchGoal(id, key, resetAttempts));
+  server.handle(watchGoalRpc, ({ id, key, resetAttempts, resumeBlocked }) => service.watchGoal(id, key, resetAttempts, resumeBlocked));
   server.handle(unwatchGoalRpc, ({ id }) => service.unwatchGoal(id));
   server.handle(goalControlRpc, ({ id, fresh }) => service.goalControl(id, fresh));
   server.handle(excludeRpc, ({ id, excluded }) => service.exclude(id, excluded));

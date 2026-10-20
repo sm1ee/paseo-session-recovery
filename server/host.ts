@@ -22,6 +22,7 @@ export interface RecoveryHost {
   fetch(id: string): Promise<Agent | null>;
   workspace(id: string): Promise<Workspace | null>;
   goal?(id: string): Promise<GoalReading>;
+  resumeBlockedGoal?(id: string, key: string, expected: Agent, check: () => void, messageId: string): Promise<GoalReading>;
   shuttingDown(): Promise<boolean>;
   send(id: string, prompt: string, messageId: string, expected: Agent, check: () => void): Promise<void>;
   close(): Promise<void>;
@@ -172,6 +173,25 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         // Workspace descriptors include active workspaces only; archived ones
         // return null. Session archivedAt is checked independently before send.
         return w ? { id: w.id, archived: false, archiving: Boolean(w.archivingAt) } : null;
+      },
+      async resumeBlockedGoal(id, key, expected, guard, messageId) {
+        await check(); guard();
+        const agent = (await paseo.agents.ref(id).refresh())?.agent;
+        const latest = agent ? metadata(agent) : null;
+        if (!agent?.persistence?.sessionId || !latest || busy(latest) || latest.archivedAt || fingerprint(latest) !== fingerprint(expected)) throw new RecoveryError("The session changed before its goal could resume. Check it and try again.");
+        const workspace = latest.workspaceId ? await paseo.workspaces.ref(latest.workspaceId).refresh() : null;
+        if (!workspace || workspace.archivingAt) throw new RecoveryError("This workspace is unavailable.");
+        await check(); guard();
+        try {
+          return await codexGoals.resumeBlocked(agent.provider, agent.persistence.sessionId, key, guard, async () => {
+            if (driver.getLastServerInfoMessage()?.features?.agentRequestReceipts !== true) throw new RecoveryError("This daemon does not advertise durable message receipts.");
+            const current = await fetch(id);
+            if (!current || busy(current) || current.archivedAt || fingerprint(current) !== fingerprint(expected)) throw new RecoveryError("The session changed before its goal could resume. Check it and try again.");
+            await check(); guard();
+            await driver.sendAgentMessage(id, "/goal resume", { messageId, activeTurnBehavior: "steer" });
+          });
+        }
+        catch (error) { throw new RecoveryError(error instanceof Error ? error.message : "Codex could not resume this goal. Check its native state."); }
       },
       async shuttingDown() {
         await identity();

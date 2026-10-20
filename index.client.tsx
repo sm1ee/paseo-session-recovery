@@ -25,7 +25,7 @@ export default function contribute(client: PluginClientContext) {
   client.addCommandCenterItem({ id: "settings", title: "session-recovery settings", icon: "Settings2", context: "global", onSelect({ openSettings }) { openSettings("preferences"); } });
   client.addCommandCenterItem({ id: "exclude", title: "Exclude this session from recovery", icon: "CirclePause", context: "agent", async onSelect({ agent, rpc }) { await rpc(excludeRpc, { id: agent.id, excluded: true }); } });
   client.addCommandCenterItem({ id: "include", title: "Allow future recovery for this session", icon: "RotateCcw", context: "agent", async onSelect({ agent, rpc }) { await rpc(excludeRpc, { id: agent.id, excluded: false }); } });
-  client.addCommandCenterItem({ id: "watch-goal", title: "Continue this session's goal", icon: "Target", context: "agent", async onSelect({ agent, rpc, openScreen }) { await rpc(watchGoalRpc, { id: agent.id, resetAttempts: false }); openScreen({ screenId: "main", params: { agentId: agent.id, view: "goals" } }); } });
+  client.addCommandCenterItem({ id: "watch-goal", title: "Continue this session's goal", icon: "Target", context: "agent", async onSelect({ agent, rpc, openScreen }) { await rpc(watchGoalRpc, { id: agent.id, resetAttempts: false, resumeBlocked: true }); openScreen({ screenId: "main", params: { agentId: agent.id, view: "goals" } }); } });
   client.addCommandCenterItem({ id: "unwatch-goal", title: "Stop continuing this session's goal", icon: "CirclePause", context: "agent", async onSelect({ agent, rpc }) { await rpc(unwatchGoalRpc, { id: agent.id }); } });
   return stopGoalPills;
 }

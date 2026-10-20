@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 export type GoalState = "active" | "paused" | "blocked" | "limited" | "complete" | "cleared" | "unknown";
-export interface GoalReading { state: GoalState; key: string | null; evidence: boolean; modeId?: string; source?: "opencode"; nativeContinuation?: boolean }
+export interface GoalReading { state: GoalState; key: string | null; evidence: boolean; modeId?: string; source?: "codex" | "opencode"; nativeContinuation?: boolean }
 export interface GoalItem { type: string; [key: string]: unknown }
 const names = new Set(["goal", "create_goal", "get_goal", "update_goal", "set_goal_tasks", "update_goal_task", "omp_goal_updated"]);
 function object(value: unknown): Record<string, unknown> | null { return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null; }

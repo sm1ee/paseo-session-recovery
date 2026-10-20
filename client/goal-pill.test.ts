@@ -35,14 +35,14 @@ describe("direct goal toggle", () => {
   });
   it("switches on and off directly without a popover", async () => {
     const f = await fixture(); await f.press();
-    expect(f.rpc).toHaveBeenCalledWith(watchGoalRpc, { id: agent.id, key: "old-goal", resetAttempts: false });
+    expect(f.rpc).toHaveBeenCalledWith(watchGoalRpc, { id: agent.id, key: "old-goal", resetAttempts: false, resumeBlocked: true });
     expect(f.update).toHaveBeenLastCalledWith(expect.objectContaining({ label: "Goal · On" }));
     await f.press(); expect(f.rpc).toHaveBeenCalledWith(unwatchGoalRpc, { id: agent.id });
     expect(f.update).toHaveBeenLastCalledWith(expect.objectContaining({ label: "Goal · Off" }));
   });
   it("reads the current objective again before selecting it", async () => {
     const f = await fixture(); f.set({ key: "new-goal" }); await f.press();
-    expect(f.rpc).toHaveBeenCalledWith(watchGoalRpc, { id: agent.id, key: "new-goal", resetAttempts: false });
+    expect(f.rpc).toHaveBeenCalledWith(watchGoalRpc, { id: agent.id, key: "new-goal", resetAttempts: false, resumeBlocked: true });
   });
   it("allows a selected but unverifiable goal to be turned off", async () => {
     const f = await fixture(); f.set({ state: "unknown", selected: true, canSelect: false, key: null }); await f.press();
@@ -52,5 +52,13 @@ describe("direct goal toggle", () => {
     const f = await fixture(); f.set({ visible: false, canSelect: false, key: null });
     await expect(f.press()).rejects.toThrow(/unavailable/);
     expect(f.rpc.mock.calls.some(([contract]) => contract === watchGoalRpc || contract === unwatchGoalRpc)).toBe(false);
+  });
+  it.each([
+    [{ state: "blocked" }, "Blocked"], [{ state: "paused" }, "Paused"], [{ state: "limited" }, "Limit"],
+    [{ state: "unknown" }, "Review"], [{ state: "active", holdReason: "input" }, "Waiting"],
+    [{ state: "active", automatic: false }, "Paused"], [{ state: "active", attempts: 10 }, "Limit"],
+  ] as const)("shows a compact %j hold without calling it On", async (patch, text) => {
+    const f = await fixture(); f.set(patch); await f.press();
+    expect(f.update).toHaveBeenLastCalledWith(expect.objectContaining({ label: `Goal · ${text}` }));
   });
 });

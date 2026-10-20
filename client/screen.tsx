@@ -26,7 +26,7 @@ export function RecoveryScreen({ theme, layout, params, navigation, host, onOpen
       if (action.kind === "exclude") await exclude({ id: action.row.id, excluded: !action.row.excluded });
       if (action.kind === "dismiss") await dismiss({ id: action.row.id });
       if (action.kind === "watch" || action.kind === "reset-goal") {
-        await watch({ id: action.row.id, key: action.row.goalKey ?? undefined, resetAttempts: action.kind === "reset-goal" });
+        await watch({ id: action.row.id, key: action.row.goalKey ?? undefined, resetAttempts: action.kind === "reset-goal", resumeBlocked: action.kind === "watch" });
         setView("goals"); setPage(0);
       }
       if (action.kind === "unwatch") await unwatch({ id: action.row.id });
@@ -76,7 +76,7 @@ export function RecoveryScreen({ theme, layout, params, navigation, host, onOpen
         {row.goalState && <Text style={text}>Goal: {row.goalState} · {row.goalAttempts} continuations</Text>}
         {!row.excluded && (row.goalSelected || row.goalKey && row.goalState && !["complete", "cleared"].includes(row.goalState)) && <SettingsCard><SettingsSwitch label="Continue this session's goal"
           hint={row.goalSelected ? data.goalContinuationEnabled ? "Selected. Paused goals, limits, and requests for input still stop continuation." : "Selected. Turn on Continue selected goals in Settings to run it automatically."
-            : "Off. Turning this on checks and selects the current active goal only."}
+            : "Off. Turning this on selects the goal and resumes it if Codex marked it blocked."}
           value={row.goalSelected} disabled={mutation.isPending}
           onValueChange={(value) => mutation.mutate({ kind: value ? "watch" : "unwatch", row })} /></SettingsCard>}
         <View style={{ flexDirection: "row", gap: 6, flexWrap: "wrap" }}>

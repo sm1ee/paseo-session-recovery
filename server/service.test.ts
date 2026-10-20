@@ -23,18 +23,22 @@ function fixture(options: Record<string, unknown> = {}) {
   const fetch = vi.fn(async (id: string) => structuredClone(id === a.id ? a : others.get(id) ?? null));
   const getWorkspace = vi.fn(async () => structuredClone(workspace));
   const goal = vi.fn(async () => structuredClone(goalReading));
+  const resumeBlockedGoal = vi.fn(async (_id: string, key: string, _expected: Agent, check: () => void) => {
+    check(); if (goalReading.state !== "blocked" || goalReading.key !== key) throw new Error("Goal changed");
+    goalReading = { ...goalReading, state: "active" }; return structuredClone(goalReading);
+  });
   const send = vi.fn(async (_id: string, _prompt: string, _messageId: string, _expected: Agent, check: () => void) => { check(); });
   const settings = preferences.schema.parse(options);
   const hosts: RecoveryHost[] = [];
   const create = (bootKey: string) => {
     const host: RecoveryHost = { bootKey, serverId: "host", store, fetch, workspace: getWorkspace,
-      shuttingDown: vi.fn(async () => shuttingDown), goal, send, close: vi.fn(async () => {}) };
+      shuttingDown: vi.fn(async () => shuttingDown), goal, resumeBlockedGoal, send, close: vi.fn(async () => {}) };
     hosts.push(host); service = new RecoveryService(async () => host, () => clock, false); return service;
   };
   create("boot-a");
   const event = (value: Omit<RecoveryEvent, "agent">) => service.observe({ ...value, agent: { ...hook, parentAgentId: a.parentId } } as RecoveryEvent);
   return {
-    a, others, workspace, settings, store, fetch, getWorkspace, goal, send, hosts,
+    a, others, workspace, settings, store, fetch, getWorkspace, goal, resumeBlockedGoal, send, hosts,
     setGoal: (reading: GoalReading) => { goalReading = reading; },
     get service() { return service; },
     get saved() { return structuredClone(saved); }, setSaved: (s: SavedState) => { saved = structuredClone(s); },
@@ -79,6 +83,85 @@ describe("goal composer inspection", () => {
     await f.event({ kind: "start", turnId: "turn-2" } as Omit<RecoveryEvent, "agent">);
     f.idle(); await f.event({ kind: "end", turnId: "turn-2", outcome: { kind: "completed" } } as Omit<RecoveryEvent, "agent">);
     await f.service.scanNow(); expect(f.saved.records.session.reason).toBe("goal_active");
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledOnce();
+  });
+  it("resumes a blocked Codex goal only when the user explicitly enables that behavior", async () => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.service.configure(f.settings);
+    await f.service.watchGoal("session", active.key!);
+    expect(f.resumeBlockedGoal).not.toHaveBeenCalled();
+    await f.service.unwatchGoal("session"); await f.service.watchGoal("session", active.key!, false, true);
+    expect(f.resumeBlockedGoal).toHaveBeenCalledOnce();
+    expect(f.saved.records.session).toMatchObject({ phase: "scheduled", reason: "goal_active", goal: { selectedKey: active.key, state: "active", attempts: 0 } });
+    f.advance(59_999); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+    f.advance(1); await f.service.scanNow(); expect(f.send).toHaveBeenCalledOnce();
+    expect(f.saved.records.session.goal?.attempts).toBe(1);
+  });
+  it("replaces an old observation gap after an explicit blocked-goal resume", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.track(); f.idle(); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("unknown_end");
+    await f.service.watchGoal("session", active.key!, false, true);
+    expect(f.saved.records.session.reason).toBe("goal_active");
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledOnce();
+  });
+  it("persists the resume-command intent and follows its updated conversation timestamp", async () => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.service.configure(f.settings);
+    f.resumeBlockedGoal.mockImplementationOnce(async (_id, key, _expected, check) => {
+      expect(f.saved.records.session).toMatchObject({ phase: "sending", reason: "goal_blocked", attemptMessageId: expect.stringMatching(/^session-recovery-goal-/) });
+      check(); f.a.lastUserMessageAt = new Date(epoch + 1).toISOString(); f.setGoal({ ...active, source: "codex" });
+      return { ...active, key, source: "codex" };
+    });
+    await f.service.watchGoal("session", active.key!, false, true);
+    expect(f.saved.records.session.messageAt).toBe(f.a.lastUserMessageAt);
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledOnce();
+  });
+  it("keeps an unconfirmed native resume command in review without replaying it", async () => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.service.configure(f.settings);
+    f.resumeBlockedGoal.mockRejectedValueOnce(new Error("Receipt lost"));
+    await expect(f.service.watchGoal("session", active.key!, false, true)).rejects.toThrow("Receipt lost");
+    expect(f.saved.records.session.reason).toBe("uncertain_send");
+    await f.restart("boot-a"); f.advance(60_000); await f.service.scanNow();
+    expect(f.resumeBlockedGoal).toHaveBeenCalledOnce(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it.each(["paused", "limited", "unknown"] as const)("does not reactivate a native %s goal from the toggle", async (state) => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, source: "codex", state }); await f.service.configure(f.settings);
+    await f.service.watchGoal("session", active.key!, false, true); f.advance(60_000); await f.service.scanNow();
+    expect(f.resumeBlockedGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("keeps OpenCode's blocked goal under its native control", async () => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, state: "blocked", source: "opencode" }); await f.service.configure(f.settings);
+    await f.service.watchGoal("session", active.key!, false, true);
+    expect(f.resumeBlockedGoal).not.toHaveBeenCalled(); expect(f.saved.records.session.reason).toBe("goal_blocked");
+  });
+  it.each(["input", "stop", "limit", "disabled", "workspace"])("does not reactivate a blocked goal past a %s guard", async (block) => {
+    const f = fixture({ continueGoals: true, goalMaxAttempts: 1 }); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.track(); f.idle();
+    if (block === "input") await f.event({ kind: "permission", requestId: "approval" } as Omit<RecoveryEvent, "agent">);
+    if (block === "stop") await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
+    if (block === "limit") { const saved = f.saved; saved.records.session.goal = { ...active, selectedKey: active.key, attempts: 1 }; f.setSaved(saved); await f.restart(); }
+    if (block === "disabled") await f.service.configure({ ...f.settings, continueGoals: false });
+    if (block === "workspace") f.workspace.archiving = true;
+    await expect(f.service.watchGoal("session", active.key!, false, true)).rejects.toThrow();
+    expect(f.resumeBlockedGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("cancels native reactivation if a stop arrives during its final check", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal({ ...active, state: "blocked", source: "codex" }); await f.track(); f.idle();
+    let stop!: Promise<void>;
+    f.resumeBlockedGoal.mockImplementationOnce(async (_id, _key, _expected, check) => {
+      stop = f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
+      check(); return active;
+    });
+    await expect(f.service.watchGoal("session", active.key!, false, true)).rejects.toThrow(/changed/); await stop;
+    expect(f.saved.records.session.reason).toBe("user_stop"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it.each(["blocked", "paused", "limited", "unknown"] as const)("notices when a selected %s goal becomes active without a new turn", async (state) => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, state }); await f.service.configure(f.settings); await f.service.watchGoal("session");
+    const history = f.saved.history.length; f.advance(10_000); await f.service.scanNow(); expect(f.saved.history).toHaveLength(history);
+    f.setGoal(active); await f.service.scanNow(); expect(f.saved.records.session.reason).toBe("goal_active");
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledOnce(); expect(f.resumeBlockedGoal).not.toHaveBeenCalled();
+  });
+  it("checks a selected goal after a missed completion event instead of silently ending the watch", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await f.service.watchGoal("session");
+    f.idle(); f.a.attentionReason = "finished"; f.a.attentionTimestamp = new Date(epoch + 1000).toISOString();
+    await f.restart("boot-a"); expect(f.saved.records.session.reason).toBe("goal_active");
     f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledOnce();
   });
   it("can select an OpenCode goal paused by user intervention without resuming or resetting it", async () => {
@@ -320,6 +403,13 @@ describe("goal continuation", () => {
     f.advance(1); await f.service.scanNow(); await f.service.scanNow();
     expect(f.send).toHaveBeenCalledTimes(1); expect(f.send.mock.calls[0][1]).toContain("goal was still active");
     expect(f.saved.records.session.goal?.attempts).toBe(1);
+  });
+  it("does not treat an old finished marker as completion of an unobserved continuation", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f);
+    f.advance(60_000); await f.service.scanNow();
+    f.advance(30_000); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("uncertain_send");
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledOnce();
   });
   it("does not read conversations or change completed turns unless enabled", async () => {
     const f = fixture(); f.setGoal(active); await f.track(); await ended(f); f.advance(HOUR); await f.service.scanNow();

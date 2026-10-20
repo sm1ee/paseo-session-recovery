@@ -1,6 +1,16 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
-import { goalControlRpc, unwatchGoalRpc, watchGoalRpc } from "../shared/contracts";
+import { goalControlRpc, unwatchGoalRpc, watchGoalRpc, type GoalControl } from "../shared/contracts";
 import { GoalPillController } from "./goal-pill-controller";
+
+function label(goal: GoalControl): string {
+  if (!goal.selected) return "Goal · Off";
+  if (goal.holdReason === "input") return "Goal · Waiting";
+  if (!goal.automatic || goal.state === "paused") return "Goal · Paused";
+  if (goal.state === "blocked") return "Goal · Blocked";
+  if (goal.state === "limited" || goal.attempts >= goal.maxAttempts) return "Goal · Limit";
+  if (goal.state !== "active" || goal.holdReason) return "Goal · Review";
+  return "Goal · On";
+}
 
 export function contributeGoalPills(client: PluginClientContext): () => void {
   const lifetime = new AbortController();
@@ -13,10 +23,10 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
           if (!goal.visible || !goal.selected && (!goal.canSelect || !goal.key)) throw new Error("This goal is unavailable. Try again.");
           try {
             if (goal.selected) await client.rpc(unwatchGoalRpc, { id });
-            else await client.rpc(watchGoalRpc, { id, key: goal.key!, resetAttempts: false });
+            else await client.rpc(watchGoalRpc, { id, key: goal.key!, resetAttempts: false, resumeBlocked: true });
           } finally { await controller.refresh(id).catch(() => {}); }
         } } } });
-      return { remove: () => pill.remove(), update: (value) => pill.update({ label: `Goal · ${value.selected ? "On" : "Off"}`, title: `Turn goal continuation ${value.selected ? "off" : "on"}` }) };
+      return { remove: () => pill.remove(), update: (value) => pill.update({ label: label(value), title: value.selected ? `Turn goal continuation off${value.note ? `: ${value.note}` : ""}` : "Turn goal continuation on; resume a blocked Codex goal" }) };
     },
   );
   const timer = setInterval(() => { void controller.poll(); }, 5000);

@@ -30,11 +30,13 @@ Open **session-recovery** in the sidebar. Settings are in the upper-right corner
 - **History:** completed, stopped, and dismissed records.
 - **Excluded:** sessions excluded from recovery.
 
-**Goal · On / Off** appears beside Tasks and Subagents above the message composer when a supported current goal is found. Press it to switch continuation on or off directly. Goal states and continuation counts are on the recovery screen. Sessions without a verified goal and completed or cleared goals have no pill. A previously selected goal with an unavailable state keeps the control so you can turn it off.
+**Goal · On / Off** appears beside Tasks and Subagents above the message composer when a supported current goal is found. Press it to switch continuation on or off directly. A selected goal shows **Blocked**, **Paused**, **Waiting**, **Limit**, or **Review** when it cannot continue. Goal details and continuation counts are on the recovery screen. Sessions without a verified goal and completed or cleared goals have no pill. A previously selected goal with an unavailable state keeps the control so you can turn it off.
 
 Goal sessions also have a toggle on their recovery card. Turning either toggle off cancels that goal's pending continuation while keeping interruption recovery available.
 
-You can select a paused, blocked, or limited goal. Selection does not change its provider status or resume it. Automatic continuation waits until a later turn records the same objective as active.
+Turning the toggle on explicitly resumes a **blocked Codex goal**, then schedules its next continuation after the configured delay. For a goal already selected before this update, turn it off and on once to resume it. The goal's objective, token budget, usage, and continuation count are preserved. Pending input, an explicit session stop, and exhausted limits still prevent resumption. A later automatic check never clears another blocker.
+
+Paused, limited, and non-Codex blocked goals can be selected without changing their native status. The plugin rechecks selected goals and waits for the same objective to become active.
 
 **Resume…** previews the continuation message and rechecks the session before sending it. **Dismiss** ends a pending recovery and releases its cleanup protection. **Exclude recovery** also excludes future turns until you allow them again. Command Center has per-session exclusion and inclusion actions.
 
@@ -46,7 +48,7 @@ Enable **Continue selected goals** in settings, then press **Goal · Off** in ea
 
 After a normal turn ends, the plugin checks the goal, waits for the configured delay, then checks again before sending a continuation. If the provider has already started its own next turn, the plugin leaves that turn running.
 
-Codex goals are read through the official `thread/goal/get` API. A local subprocess uses the configured Codex command and environment. It receives only initialization and goal lookup requests; it never loads or resumes a thread. Codex must support the goals feature and this API. An unavailable or unrecognized response requires review.
+Codex goals are read through the official `thread/goal/get` API. A local subprocess uses the configured Codex command and environment. It only initializes and reads goal state; it never loads a thread or starts a turn. Turning the toggle on for a blocked goal sends Paseo's native `/goal resume` command through the owning daemon. That command updates only the status through Codex's goal API. A separate process cannot safely update a thread held by Codex's active writer. The plugin records the command intent and waits for the same objective to become active before scheduling a continuation. Unconfirmed delivery requires review and is not retried automatically. Codex must support these goal APIs. An unavailable or unrecognized response requires review.
 
 OpenCode uses the **Goal** agent mode supplied by [opencode-goal-plugin](https://github.com/william-ricchiuti/OpenCode-goal-plugin). The plugin reads that mode's focused objective from its version 1 native session snapshot. Choosing Goal mode alone does not create an objective; set one with `/goal <objective>` first. Build, Plan, unrelated custom modes, and background or queued objectives are excluded. Leaving Goal mode blocks pending goal continuation. A renamed goal agent is supported when it retains the upstream mode registration.
 
@@ -56,7 +58,7 @@ OpenCode state is read from `<session cwd>/.opencode/goals/state.json.sessions/<
 
 For OMP, the plugin reads structured `goal` tool results and Paseo's `omp_goal_updated` timeline records. It also reads structured `create_goal`, `get_goal`, and `update_goal` results, including compatible Pi goal extensions. Detection depends on the provider exposing these records in Paseo. Ordinary chat text, plans, and to-do lists are not treated as goals. Conversation inspection is bounded to the most recent 2,000 canonical timeline entries; an unverifiable state requires review.
 
-Paused, blocked, completed, cleared, and limited goals are not automatically resumed. Questions, approvals, direct stops, exclusions, and uncertain delivery also block continuation. The continuation message asks the agent to verify its work before marking the goal complete. The plugin cannot independently prove that a provider's completed goal was actually achieved.
+Paused, blocked, completed, cleared, and limited goals are not automatically resumed. Only an explicit toggle-on action can reactivate a blocked Codex goal. Questions, approvals, direct stops, exclusions, and uncertain delivery also block continuation. The continuation message asks the agent to verify its work before marking the goal complete. The plugin cannot independently prove that a provider's completed goal was actually achieved.
 
 Selection is tied to the current objective in that session. A different objective, completion, or clearing the goal removes the selection. Existing goals from earlier plugin versions start unselected. An unselected goal does not create a cleanup hold just because it remains active.
 
@@ -92,7 +94,7 @@ paseo plugin install /absolute/path/to/paseo-session-recovery
 
 Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed.
 
-For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.4.1`. The public registry listing requires a separate review.
+For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.4.2`. The public registry listing requires a separate review.
 
 ## Local data
 
