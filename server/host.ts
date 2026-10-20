@@ -12,7 +12,7 @@ import { FileStore, RecoveryError, type StateStore } from "./store";
 import { daemonCompatibilityError } from "./compatibility";
 import { localWebSocketFactory } from "./transport";
 import { readGoal, type GoalItem, type GoalReading } from "./goals";
-import { CodexGoals } from "./codex-goals";
+import { CodexGoals, type CodexGoalDetails } from "./codex-goals";
 import { OpenCodeGoals } from "./opencode-goals";
 
 export interface RecoveryHost {
@@ -23,6 +23,8 @@ export interface RecoveryHost {
   workspace(id: string): Promise<Workspace | null>;
   goal?(id: string, options?: { allowTimeline?: boolean }): Promise<GoalReading>;
   supportsGoalCommand?(id: string): Promise<boolean>;
+  goalDetails?(id: string): Promise<CodexGoalDetails | null>;
+  editGoal?(id: string, revision: string, objective: string, expected: Agent, check: () => void, messageId: string, submitted: () => void): Promise<GoalReading>;
   resumeBlockedGoal?(id: string, key: string, expected: Agent, check: () => void, messageId: string, submitted?: () => void): Promise<GoalReading>;
   shuttingDown(): Promise<boolean>;
   send(id: string, prompt: string, messageId: string, expected: Agent, check: () => void): Promise<void>;
@@ -194,6 +196,35 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         const result = await paseo.agents.ref(id).commands(); await check();
         if (result.error) throw new RecoveryError("Could not check this session's native goal commands. Try again.");
         return result.commands.some((command) => command.name === "goal" && command.kind === "command" && command.description === "Set, pause, resume, or clear the agent's goal");
+      },
+      async goalDetails(id) {
+        await check();
+        const agent = (await paseo.agents.ref(id).refresh())?.agent;
+        if (!agent?.persistence?.sessionId) return null;
+        const details = await codexGoals.details(agent.provider, agent.persistence.sessionId);
+        await check(); return details;
+      },
+      async editGoal(id, revision, objective, expected, guard, messageId, submitted) {
+        await check(); guard();
+        const agent = (await paseo.agents.ref(id).refresh())?.agent;
+        checkGoalSession(agent ? metadata(agent) : null, expected, "initial");
+        if (!agent?.persistence?.sessionId) throw new RecoveryError("The session's saved history is unavailable.");
+        const workspace = agent.workspaceId ? await paseo.workspaces.ref(agent.workspaceId).refresh() : null;
+        if (!workspace || workspace.archivingAt) throw new RecoveryError("This workspace is unavailable.");
+        const commands = await paseo.agents.ref(id).commands();
+        if (commands.error || !commands.commands.some((command) => command.name === "goal" && command.kind === "command" && command.description === "Set, pause, resume, or clear the agent's goal")) throw new RecoveryError("Native Codex goal commands are unavailable for this session.");
+        await check(); guard();
+        try {
+          return await codexGoals.edit(agent.provider, agent.persistence.sessionId, revision, objective, guard, async () => {
+            if (driver.getLastServerInfoMessage()?.features?.agentRequestReceipts !== true) throw new RecoveryError("This daemon does not advertise durable message receipts.");
+            checkGoalSession(await fetch(id), expected, "final");
+            const currentWorkspace = await paseo.workspaces.ref(workspace.id).refresh();
+            if (!currentWorkspace || currentWorkspace.archivingAt) throw new RecoveryError("This workspace is unavailable.");
+            await check(); guard(); submitted();
+            try { await driver.sendAgentMessage(id, `/goal ${objective.trim()}`, { messageId, activeTurnBehavior: "steer" }); }
+            catch { throw new RecoveryError("The goal edit delivery could not be confirmed. Check the conversation and reload before trying again."); }
+          });
+        } catch (error) { throw new RecoveryError(error instanceof Error ? error.message : "Codex could not confirm the goal edit. Reload the editor before trying again."); }
       },
       async resumeBlockedGoal(id, key, expected, guard, messageId, submitted) {
         await check(); guard();

@@ -120,6 +120,21 @@ describe("native Codex goal commands", () => {
     commands.mockResolvedValue({ agentId: "fixture", commands: [{ name: "goal", kind: "skill", description: "A custom goal skill", argumentHint: "" }], error: null, requestId: "fixture" });
     expect(await host.supportsGoalCommand!("fixture")).toBe(false);
   });
+  it("목표 본문 변경도 대화를 소유한 Paseo의 네이티브 명령으로 한 번 전송한다", async () => {
+    const f = nativeFixture();
+    vi.spyOn(CodexGoals.prototype, "edit").mockImplementation(async (_provider, _thread, _revision, _objective, guard, submit) => { guard(); await submit(); return { state: "active", key: "edited-goal", evidence: true, source: "codex" }; });
+    host = await openLocalHost(home, process.pid); const expected = await host.fetch("fixture"), submitted = vi.fn();
+    await expect(host.editGoal!("fixture", "revision", "Edited fixture", expected!, () => {}, "fixture-edit", submitted)).resolves.toMatchObject({ key: "edited-goal" });
+    expect(f.send).toHaveBeenCalledExactlyOnceWith("fixture", "/goal Edited fixture", { messageId: "fixture-edit", activeTurnBehavior: "steer" });
+    expect(submitted).toHaveBeenCalledOnce();
+  });
+  it("네이티브 저장 직전에 대화가 바뀌면 목표 변경을 전송하지 않는다", async () => {
+    const f = nativeFixture();
+    vi.spyOn(CodexGoals.prototype, "edit").mockImplementation(async (_provider, _thread, _revision, _objective, _guard, submit) => { f.agent.lastUserMessageAt = "2026-10-20T01:00:00Z"; await submit(); return { state: "active", key: "edited-goal", evidence: true }; });
+    host = await openLocalHost(home, process.pid); const expected = await host.fetch("fixture"), submitted = vi.fn();
+    await expect(host.editGoal!("fixture", "revision", "Edited fixture", expected!, () => {}, "fixture-edit", submitted)).rejects.toThrow(/session changed/);
+    expect(f.send).not.toHaveBeenCalled(); expect(submitted).not.toHaveBeenCalled();
+  });
 });
 
 describe("conversation goal lookup", () => {

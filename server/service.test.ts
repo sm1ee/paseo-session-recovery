@@ -5,6 +5,7 @@ import type { RecoveryHost } from "./host";
 import { RecoveryService, type RecoveryEvent } from "./service";
 import { RecoveryError } from "./store";
 import type { GoalReading } from "./goals";
+import type { CodexGoalDetails } from "./codex-goals";
 
 const epoch = Date.parse("2026-10-20T00:00:00Z");
 const hook = { id: "session", title: "Test session", provider: "codex", workspaceId: "workspace", parentAgentId: null as string | null };
@@ -24,6 +25,11 @@ function fixture(options: Record<string, unknown> = {}) {
   const getWorkspace = vi.fn(async () => structuredClone(workspace));
   const goal = vi.fn(async (_id: string, _options?: { allowTimeline?: boolean }) => structuredClone(goalReading));
   const supportsGoalCommand = vi.fn(async () => true);
+  let details: CodexGoalDetails | null = null;
+  const goalDetails = vi.fn(async (_id: string) => structuredClone(details));
+  const editGoal = vi.fn(async (_id: string, _revision: string, _objective: string, _expected: Agent, check: () => void, _messageId: string, submitted: () => void): Promise<GoalReading> => {
+    check(); submitted(); return { state: "active", key: "edited-goal", evidence: true, source: "codex" };
+  });
   const resumeBlockedGoal = vi.fn(async (_id: string, key: string, _expected: Agent, check: () => void, _messageId: string, submitted?: () => void) => {
     check(); if (goalReading.state !== "blocked" || goalReading.key !== key) throw new Error("Goal changed");
     submitted?.();
@@ -34,13 +40,14 @@ function fixture(options: Record<string, unknown> = {}) {
   const hosts: RecoveryHost[] = [];
   const create = (bootKey: string) => {
     const host: RecoveryHost = { bootKey, serverId: "host", store, fetch, workspace: getWorkspace,
-      shuttingDown: vi.fn(async () => shuttingDown), goal, supportsGoalCommand, resumeBlockedGoal, send, close: vi.fn(async () => {}) };
+      shuttingDown: vi.fn(async () => shuttingDown), goal, goalDetails, editGoal, supportsGoalCommand, resumeBlockedGoal, send, close: vi.fn(async () => {}) };
     hosts.push(host); service = new RecoveryService(async () => host, () => clock, false); return service;
   };
   create("boot-a");
   const event = (value: Omit<RecoveryEvent, "agent">) => service.observe({ ...value, agent: { ...hook, parentAgentId: a.parentId } } as RecoveryEvent);
   return {
-    a, others, workspace, settings, store, fetch, getWorkspace, goal, supportsGoalCommand, resumeBlockedGoal, send, hosts,
+    a, others, workspace, settings, store, fetch, getWorkspace, goal, goalDetails, editGoal, supportsGoalCommand, resumeBlockedGoal, send, hosts,
+    setDetails: (value: CodexGoalDetails | null) => { details = value; },
     setGoal: (reading: GoalReading) => { goalReading = reading; },
     get service() { return service; },
     get saved() { return structuredClone(saved); }, setSaved: (s: SavedState) => { saved = structuredClone(s); },
@@ -52,6 +59,80 @@ function fixture(options: Record<string, unknown> = {}) {
     row() { return service.status(statusInput.parse({})).rows[0]; },
   };
 }
+describe("명시적인 Goal 편집", () => {
+  async function editor() {
+    const f = fixture({ continueGoals: true }); f.a.sessionId = "native-fixture"; f.idle();
+    const reading: GoalReading = { state: "active", key: "original-goal", evidence: true, source: "codex" };
+    f.setGoal(reading); f.setDetails({ reading, objective: "Original fixture", revision: "native-revision", tokenBudget: 100, tokensUsed: 3 });
+    await f.service.configure(f.settings); return f;
+  }
+  it("편집창을 볼 때만 본문을 읽고 본문이나 수정 티켓을 디스크에 저장하지 않는다", async () => {
+    const f = await editor(), before = f.saved;
+    await f.service.goalControl("session"); expect(f.goalDetails).not.toHaveBeenCalled();
+    expect(await f.service.readGoalEditor("session")).toMatchObject({ supported: true, objective: "Original fixture", ticket: expect.any(String) });
+    expect(f.goalDetails).toHaveBeenCalledExactlyOnceWith("session"); expect(f.saved).toEqual(before);
+    expect(f.editGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("새 목표를 자동 선택하지 않고 이전 목표의 예약된 진행을 취소한다", async () => {
+    const f = await editor(); await f.service.watchGoal("session");
+    const view = await f.service.readGoalEditor("session");
+    await f.service.editGoal({ ticket: view.ticket!, objective: "Edited fixture" });
+    expect(f.editGoal).toHaveBeenCalledOnce(); expect(f.saved.records.session.goal).toMatchObject({ key: "edited-goal", selectedKey: null, attempts: 0 });
+    expect(f.saved.records.session.phase).toBe("completed"); f.advance(120_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+    expect(JSON.stringify(f.saved)).not.toContain("Edited fixture"); expect(JSON.stringify(f.saved)).not.toContain(view.ticket!);
+  });
+  it("다른 클라이언트가 편집기를 읽어도 기존 편집 티켓은 유효하다", async () => {
+    const f = await editor(), first = await f.service.readGoalEditor("session"), second = await f.service.readGoalEditor("session");
+    expect(first.ticket).not.toBe(second.ticket);
+    await f.service.editGoal({ ticket: first.ticket!, objective: "Edited fixture" });
+    await expect(f.service.editGoal({ ticket: second.ticket!, objective: "Other edit" })).rejects.toThrow(/session changed/);
+    expect(f.editGoal).toHaveBeenCalledOnce();
+  });
+  it("명시적인 저장으로 Codex의 자체 Goal 턴이 시작돼도 중복 진행을 보내지 않는다", async () => {
+    const f = await editor(); await f.service.watchGoal("session"); const view = await f.service.readGoalEditor("session");
+    let started!: Promise<void>;
+    f.editGoal.mockImplementationOnce(async (_id, _revision, _objective, _expected, guard, _messageId, submitted) => {
+      guard(); submitted(); f.a.status = "running"; f.a.activeTurn = "native-goal-turn";
+      started = f.event({ kind: "start", turnId: "native-goal-turn" } as Omit<RecoveryEvent, "agent">); guard();
+      return { state: "active", key: "edited-goal", evidence: true, source: "codex" };
+    });
+    await expect(f.service.editGoal({ ticket: view.ticket!, objective: "Edited fixture" })).resolves.toEqual({ ok: true });
+    await started; expect(f.saved.records.session.goal?.selectedKey).toBeNull(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("설정 변경과 만료 후에는 이전 편집을 제출하지 않는다", async () => {
+    const f = await editor(); let view = await f.service.readGoalEditor("session"); f.advance(300_000);
+    await expect(f.service.editGoal({ ticket: view.ticket!, objective: "Edited fixture" })).rejects.toThrow(/expired/);
+    view = await f.service.readGoalEditor("session"); await f.service.configure(f.settings);
+    await expect(f.service.editGoal({ ticket: view.ticket!, objective: "Edited fixture" })).rejects.toThrow(/expired/);
+    expect(f.editGoal).not.toHaveBeenCalled();
+  });
+  it("새 턴이나 사용자 중지가 오면 오래된 편집을 제출하지 않는다", async () => {
+    const f = await editor(), view = await f.service.readGoalEditor("session");
+    await f.event({ kind: "start", turnId: "new-turn" } as Omit<RecoveryEvent, "agent">);
+    await expect(f.service.editGoal({ ticket: view.ticket!, objective: "Edited fixture" })).rejects.toThrow(/session changed/);
+    expect(f.editGoal).not.toHaveBeenCalled();
+  });
+  it("제출 이후 확인되지 않은 편집은 선택을 해제하고 자동 재전송하지 않는다", async () => {
+    const f = await editor(); await f.service.watchGoal("session"); const view = await f.service.readGoalEditor("session");
+    f.editGoal.mockImplementationOnce(async (_id, _revision, _objective, _expected, guard, _messageId, submitted) => { guard(); submitted(); throw new Error("Receipt lost"); });
+    await expect(f.service.editGoal({ ticket: view.ticket!, objective: "Edited fixture" })).rejects.toThrow("Receipt lost");
+    await expect(f.service.editGoal({ ticket: view.ticket!, objective: "Edited fixture" })).rejects.toThrow(/expired/);
+    expect(f.saved.records.session.goal?.selectedKey).toBeNull(); expect(f.saved.records.session.reason).toBe("uncertain_send");
+    f.advance(120_000); await f.service.scanNow(); expect(f.editGoal).toHaveBeenCalledOnce(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("다른 제공자에서는 본문을 복원하거나 변경하지 않는다", async () => {
+    const f = await editor(); f.a.provider = "omp"; f.setDetails(null);
+    expect(await f.service.readGoalEditor("session")).toMatchObject({ supported: false, ticket: null });
+    expect(f.goal).not.toHaveBeenCalled(); expect(f.editGoal).not.toHaveBeenCalled();
+  });
+  it("승인을 기다리거나 예산이 소진된 Goal은 읽기 전용이다", async () => {
+    const f = await editor(); f.a.pendingPermissions = 1;
+    expect(await f.service.readGoalEditor("session")).toMatchObject({ ticket: null, objective: "Original fixture" });
+    f.a.pendingPermissions = 0; f.setDetails({ reading: { state: "limited", key: "original-goal", evidence: true }, objective: "Original fixture", revision: "native-revision", tokenBudget: 100, tokensUsed: 100 });
+    expect(await f.service.readGoalEditor("session")).toMatchObject({ ticket: null, state: "limited" });
+    expect(f.editGoal).not.toHaveBeenCalled();
+  });
+});
 describe("goal composer inspection", () => {
   const active: GoalReading = { state: "active", key: "current-goal", evidence: true };
   it("수동 새로고침을 포함한 표시 조회는 대화 복원을 요청하지 않는다", async () => {

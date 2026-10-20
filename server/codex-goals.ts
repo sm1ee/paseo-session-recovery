@@ -3,6 +3,12 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { readGoal, type GoalReading } from "./goals";
+import { goalObjectiveError } from "../shared/goal-editor";
+
+export interface CodexGoalDetails {
+  reading: GoalReading; objective: string | null; revision: string;
+  tokenBudget: number | null; tokensUsed: number | null;
+}
 
 export interface CodexLaunch { command: string; args: string[]; env: Record<string, string> }
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
@@ -83,6 +89,42 @@ export class CodexGoalConnection {
   async read(threadId: string): Promise<GoalReading> {
     return this.decode(await this.get(threadId));
   }
+  async details(threadId: string): Promise<CodexGoalDetails> {
+    const data = await this.get(threadId), goal = record(data.goal);
+    const objective = typeof goal.objective === "string" ? goal.objective : null;
+    // Usage changes while a turn is running. A changed objective, native state,
+    // identity or budget invalidates the editor; ordinary usage increments do not.
+    const revision = createHash("sha256").update(JSON.stringify({
+      id: goal.id ?? null, objective, status: goal.status ?? null,
+      createdAt: goal.createdAt ?? goal.created_at ?? null, tokenBudget: goal.tokenBudget ?? null,
+    })).digest("hex");
+    const count = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+    return { reading: this.decode(data), objective, revision, tokenBudget: count(goal.tokenBudget), tokensUsed: count(goal.tokensUsed) };
+  }
+  async edit(threadId: string, revision: string, objective: string, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
+    const invalid = goalObjectiveError(objective); if (invalid) throw new Error(invalid);
+    const before = await this.details(threadId); check();
+    if (before.revision !== revision) throw new Error("The goal changed while you were editing. Reload it and review your changes before saving.");
+    if (!before.objective || !["active", "paused", "blocked"].includes(before.reading.state)) throw new Error("This goal cannot be edited in its current state. Review its native state and limits.");
+    if (before.tokensUsed === null || before.tokenBudget !== null && (before.tokenBudget <= 0 || before.tokensUsed >= before.tokenBudget)) throw new Error("The native goal budget could not be verified. Review its limits before editing.");
+    const text = objective.trim();
+    if (text === before.objective.trim()) return before.reading;
+    // Only the owning Paseo connection may write. This reader never acquires
+    // the thread writer lease or issues thread/goal/set itself.
+    await send(); check();
+    for (let n = 0; n < 20; n++) {
+      const after = await this.details(threadId); check();
+      if (after.objective?.trim() === text && after.reading.state === "active") {
+        if (after.tokenBudget !== before.tokenBudget || before.tokensUsed !== null && (after.tokensUsed === null || after.tokensUsed < before.tokensUsed)) {
+          throw new Error("The native goal budget changed. Check the conversation before making another change.");
+        }
+        return after.reading;
+      }
+      if (after.revision !== revision && after.objective?.trim() !== text) break;
+      await new Promise((resolve) => setTimeout(resolve, 250)); check();
+    }
+    throw new Error("Codex has not confirmed the edited goal. Check the conversation and reload the editor before trying again.");
+  }
   private async get(threadId: string): Promise<Record<string, unknown>> {
     await this.start();
     const data = record(await this.request("thread/goal/get", { threadId }));
@@ -158,6 +200,21 @@ export class CodexGoals {
     const reader = await this.reader(provider);
     if (!reader) throw new Error("Only native Codex blocked goals can be resumed from this toggle.");
     return reader.resumeBlocked(threadId, key, check, send);
+  }
+  async details(provider: string, threadId: string): Promise<CodexGoalDetails | null> {
+    if (this.closed) throw new Error("Goal reader is closed");
+    let reader: CodexGoalConnection | null = null;
+    try { reader = await this.reader(provider); return reader ? await reader.details(threadId) : null; }
+    catch {
+      await reader?.close(); if (this.readers.get(provider)?.reader === reader) this.readers.delete(provider);
+      throw new Error("The current Codex goal could not be read. Check the connection and try again.");
+    }
+  }
+  async edit(provider: string, threadId: string, revision: string, objective: string, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
+    let reader: CodexGoalConnection | null;
+    try { reader = await this.reader(provider); } catch { throw new Error("Codex goal commands could not be initialized. Check the provider configuration."); }
+    if (!reader) throw new Error("Goal editing is currently supported for native Codex sessions.");
+    return reader.edit(threadId, revision, objective, check, send);
   }
   async close(): Promise<void> { this.closed = true; for (const { reader } of this.readers.values()) await reader.close(); this.readers.clear(); }
 }

@@ -2,6 +2,8 @@ session-recovery tracks running Paseo turns and continues unfinished sessions af
 
 The sidebar shortcut appears on desktop and web. In the iOS and Android apps, open the screen from the Command Center. Per-session Goal toggles are available on all clients.
 
+For a native Codex session, enter /goal or /goal edit to view its current objective, state, and token usage. Edit the prefilled objective and choose Save goal. A paused or blocked goal uses Save and activate because Codex's native command makes it active. Completed goals, exhausted limits, pending approvals, and uncertain delivery are read-only. The editor does not change token budgets. An edited objective needs a new continuation selection. /goal-edit and View or edit this session's goal in the Command Center open the same editor. The editor works on desktop and mobile; it reads only the requested session when opened or reloaded. Other providers retain their native /goal behavior.
+
 ![Recovery and goal settings](assets/goal-settings.png)
 
 Automatic recovery is on by default for main sessions, with a 60-second delay, up to three attempts per interruption, and a 24-hour recovery window. The delay doubles after each attempt, up to 15 minutes. Subagent recovery and retries for recognized temporary provider errors can be enabled separately.

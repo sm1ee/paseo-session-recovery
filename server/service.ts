@@ -3,6 +3,7 @@ import { GOAL_PROMPT, preferences, reasonText, statusInput, type GoalControl, ty
 import { automaticBlock, backoff, busy, emptyState, fingerprint, goalCommandReady, isGoalContinuation, isSelectedGoal, isTransient, OPEN_PHASES, snapshotBlock, time, type Agent, type RecordEntry, type SavedState } from "../shared/model";
 import { openLocalHost, type RecoveryHost } from "./host";
 import { RecoveryError } from "./store";
+import { MAX_GOAL_LENGTH, editGoalInput, type GoalEditorSnapshot } from "../shared/goal-editor";
 
 interface HookAgent { id: string; title: string | null; provider: string; workspaceId: string | null; parentAgentId: string | null }
 export type RecoveryEvent =
@@ -13,6 +14,7 @@ export type RecoveryEvent =
   | { kind: "closed" | "archived"; agent: HookAgent };
 interface Ticket { id: string; revision: number; generation: number; expiresAt: number; fingerprint: string; prompt: string }
 interface NativeGoalResume { submitted: boolean; starts: number }
+interface GoalEditTicket { id: string; generation: number; changed: number; revision: string; expected: Agent; expiresAt: number }
 function suspendedGoal(r: RecordEntry): boolean {
   return isSelectedGoal(r) && ["review", "stopped"].includes(r.phase) && ["goal_paused", "goal_blocked", "goal_limited", "goal_unknown"].includes(r.reason);
 }
@@ -37,6 +39,7 @@ export class RecoveryService {
   private controlRequests = new Map<string, object>();
   private controlReads = new Map<string, { signature: string; promise: Promise<GoalControl> }>();
   private nativeGoalResumes = new Map<string, NativeGoalResume>();
+  private goalEditTickets = new Map<string, GoalEditTicket>();
   constructor(private readonly connect = openLocalHost, private readonly now = Date.now, private readonly automaticTimer = true) {}
   private enqueue<T>(work: () => Promise<T>, report = true): Promise<T> {
     const task = this.queue.then(work);
@@ -92,7 +95,7 @@ export class RecoveryService {
   }
   configure(settings: Preferences): Promise<void> {
     const generation = ++this.generation;
-    this.tickets.clear(); clearTimeout(this.timer);
+    this.tickets.clear(); this.goalEditTickets.clear(); clearTimeout(this.timer);
     return this.enqueue(async () => {
       if (this.stopped || generation !== this.generation) return;
       if (settings.daemonHome !== this.settings.daemonHome && this.host) { await this.host.close(); this.host = null; }
@@ -109,7 +112,7 @@ export class RecoveryService {
   }
   invalidSettings(): Promise<void> {
     this.validSettings = false;
-    ++this.generation; clearTimeout(this.timer); this.tickets.clear();
+    ++this.generation; clearTimeout(this.timer); this.tickets.clear(); this.goalEditTickets.clear();
     return this.enqueue(async () => { this.error = "Settings could not be read. Automatic recovery is paused."; if (this.host) await this.host.close(); this.host = null; });
   }
   private scheduleTimer(): void {
@@ -438,6 +441,68 @@ export class RecoveryService {
     void promise.then(clear, clear);
     return promise;
   }
+  async readGoalEditor(id: string): Promise<GoalEditorSnapshot> {
+    // Explicit inspection of one session only. Do not add objective reads to
+    // background discovery, persist them in the journal, or hold its scan queue.
+    const { host, generation, changed } = await this.action(async () => ({ host: await this.ready(), generation: this.generation, changed: this.changes.get(id) ?? 0 }));
+    const a = await host.fetch(id); this.check(generation);
+    if (!a || a.internal || a.archivedAt || !a.workspaceId) throw new RecoveryError("This session is unavailable. Open a current session and try again.");
+    const view: GoalEditorSnapshot = { id, title: a.title, provider: a.provider, supported: false, objective: null, state: "unknown", tokenBudget: null, tokensUsed: null, ticket: null, note: null };
+    const details = await host.goalDetails?.(id); this.check(generation);
+    if (!details) return { ...view, note: "Goal editing is currently supported for native Codex sessions. Use this provider's native goal controls." };
+    Object.assign(view, { supported: true, objective: details.objective, state: details.reading.state, tokenBudget: details.tokenBudget, tokensUsed: details.tokensUsed });
+    if (!details.objective) return { ...view, note: "There is no current goal. Set one in the conversation with /goal <objective>." };
+    if (!details.reading.key || !["active", "paused", "blocked"].includes(details.reading.state) || details.objective.length > MAX_GOAL_LENGTH) return { ...view, note: "This goal is read-only in its current state. Review completed goals and native limits in the conversation." };
+    const r = this.saved.records[id];
+    if (!goalCommandReady(a) || !a.sessionId || r?.humanRequired || r?.phase === "sending" || r?.expectingStart || r?.reason === "uncertain_send") return { ...view, note: "Resolve pending input or uncertain delivery in this session before editing its goal." };
+    const workspace = await host.workspace(a.workspaceId); this.check(generation);
+    if (!workspace || workspace.archived || workspace.archiving || !await host.supportsGoalCommand?.(id) || !host.editGoal) return { ...view, note: "Native Codex goal commands are unavailable for this session. Reload it when idle." };
+    this.check(generation);
+    if ((this.changes.get(id) ?? 0) !== changed) throw new RecoveryError("The session changed while reading its goal. Reload the editor.");
+    const ticket = randomUUID(), now = this.now();
+    for (const [key, value] of this.goalEditTickets) if (value.expiresAt <= now) this.goalEditTickets.delete(key);
+    if (this.goalEditTickets.size >= 100) this.goalEditTickets.delete(this.goalEditTickets.keys().next().value!);
+    this.goalEditTickets.set(ticket, { id, generation, changed, revision: details.revision, expected: a, expiresAt: now + 300_000 });
+    return { ...view, ticket, note: "Saving uses Codex's native /goal command and makes the edited goal active. Goal continuation must be selected again for the new objective." };
+  }
+  editGoal(input: { ticket: string; objective: string }): Promise<{ ok: true }> {
+    const { ticket: token, objective } = editGoalInput.parse(input);
+    const ticket = this.goalEditTickets.get(token); this.goalEditTickets.delete(token);
+    return this.action(async () => {
+      this.check(ticket?.generation);
+      if (!ticket || ticket.expiresAt <= this.now()) throw new RecoveryError("This goal editor expired. Reload the current goal before saving.");
+      const { id, generation, changed } = ticket;
+      const nativeEdit: NativeGoalResume = { submitted: false, starts: 0 };
+      const guard = () => { this.check(generation); if ((this.changes.get(id) ?? 0) !== changed + nativeEdit.starts) throw new RecoveryError("The session changed while you were editing. Reload the current goal before saving."); };
+      guard(); const host = await this.ready(); guard();
+      const r = this.saved.records[id];
+      if (!host.editGoal || r?.humanRequired || r?.phase === "sending" || r?.expectingStart || r?.reason === "uncertain_send") throw new RecoveryError("Review pending input or uncertain delivery in this session before editing.");
+      let submitted = false;
+      this.nativeGoalResumes.set(id, nativeEdit);
+      try {
+        const reading = await host.editGoal(id, ticket.revision, objective, ticket.expected, guard, `session-recovery-edit-${randomUUID()}`, () => { submitted = true; nativeEdit.submitted = true; });
+        guard();
+        if (r?.goal && reading.key !== r.goal.key) {
+          r.goal = { key: reading.key, state: reading.state, selectedKey: null, attempts: 0 }; r.revision++;
+          if (r.reason.startsWith("goal_") && ["scheduled", "review"].includes(r.phase) && !r.humanRequired && !r.expectingStart) this.set(r, "completed", "goal_unselected");
+          await this.persist();
+        }
+        return { ok: true };
+      } catch (error) {
+        // Never automatically replay a goal edit whose result is uncertain.
+        if (submitted && r?.goal) {
+          r.goal.selectedKey = null; r.revision++;
+          if (r.reason.startsWith("goal_") && ["scheduled", "review"].includes(r.phase)) this.review(r, "uncertain_send");
+          await this.persist();
+        }
+        throw error;
+      } finally {
+        this.nativeGoalResumes.delete(id);
+        this.controls.delete(id);
+        this.changes.set(id, (this.changes.get(id) ?? 0) + 1);
+      }
+    });
+  }
   private inspectGoalControl(id: string, fresh: boolean): Promise<GoalControl> {
     // Passive discovery must not hold up recovery actions while a provider is slow.
     const request = {}; this.controlRequests.set(id, request);
@@ -530,7 +595,7 @@ export class RecoveryService {
       rows: filtered.slice(page * 30, page * 30 + 30), total: filtered.length, page, history: [...this.saved.history].reverse().slice(0, 30) };
   }
   async stop(): Promise<void> {
-    this.stopped = true; ++this.generation; clearTimeout(this.timer); this.tickets.clear(); await this.queue;
+    this.stopped = true; ++this.generation; clearTimeout(this.timer); this.tickets.clear(); this.goalEditTickets.clear(); await this.queue;
     const host = this.host; if (!host) return;
     try {
       if (!this.fatal && !await host.shuttingDown()) { for (const r of Object.values(this.saved.records)) if (["watching", "waiting"].includes(r.phase)) this.review(r, r.humanRequired ? "input" : "monitor_gap"); await this.persist(); }

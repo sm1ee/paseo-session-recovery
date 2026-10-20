@@ -88,4 +88,53 @@ describe("Codex goal reader", () => {
     try { await expect(f.reader.resumeBlocked("fixture", (await f.reader.read("fixture")).key!, () => {}, f.send)).rejects.toThrow("Receipt lost"); expect(f.send).toHaveBeenCalledOnce(); }
     finally { await f.close(); }
   });
+  async function editFixture() {
+    const home = await mkdtemp(join(tmpdir(), "goal-edit-reader-")), path = join(home, "goal.json");
+    let goal = { id: "fixture-goal", objective: "Original fixture", status: "paused", tokensUsed: 3, tokenBudget: 20, createdAt: 1 };
+    await writeFile(path, JSON.stringify(goal));
+    const script = `require("node:readline").createInterface({input:process.stdin}).on("line",s=>{const m=JSON.parse(s);if(m.method==="initialized")return;if(!["initialize","thread/goal/get"].includes(m.method))process.exit(2);process.stdout.write(JSON.stringify({id:m.id,result:m.method==="initialize"?{}:{goal:JSON.parse(require("node:fs").readFileSync(process.env.GOAL_FILE,"utf8"))}})+"\\n")});`;
+    const reader = new CodexGoalConnection({ command: process.execPath, args: ["-e", script], env: { GOAL_FILE: path } }, process.cwd());
+    const change = async (patch: Partial<typeof goal>) => { goal = { ...goal, ...patch }; await writeFile(path, JSON.stringify(goal)); };
+    const send = vi.fn(async () => { await change({ objective: "Edited fixture", status: "active" }); });
+    return { reader, send, change, async close() { await reader.close(); await rm(home, { recursive: true, force: true }); } };
+  }
+  it("목표 본문을 읽고 사용량 증가를 허용하면서 저장 직전에 같은 Goal인지 확인한다", async () => {
+    const f = await editFixture();
+    try {
+      const before = await f.reader.details("fixture"); expect(before).toMatchObject({ objective: "Original fixture", tokenBudget: 20, tokensUsed: 3 });
+      await f.change({ tokensUsed: 4 }); expect((await f.reader.details("fixture")).revision).toBe(before.revision);
+      expect(await f.reader.edit("fixture", before.revision, "Edited fixture", () => {}, f.send)).toMatchObject({ state: "active", source: "codex" });
+      expect(f.send).toHaveBeenCalledOnce(); expect(await f.reader.details("fixture")).toMatchObject({ objective: "Edited fixture", tokensUsed: 4, tokenBudget: 20 });
+    } finally { await f.close(); }
+  });
+  it.each([{ objective: "Other editor's change" }, { tokenBudget: 21 }, { status: "active" }, { id: "replacement-goal" }])("목표나 예산의 변경 %j을 덮어쓰지 않는다", async (patch) => {
+    const f = await editFixture();
+    try { const before = await f.reader.details("fixture"); await f.change(patch); await expect(f.reader.edit("fixture", before.revision, "Edited fixture", () => {}, f.send)).rejects.toThrow(/changed/); expect(f.send).not.toHaveBeenCalled(); }
+    finally { await f.close(); }
+  });
+  it.each(["pause", " RESUME ", "Clear"])("제어 명령 %s을 목표 본문으로 전송하지 않는다", async (objective) => {
+    const f = await editFixture();
+    try { await expect(f.reader.edit("fixture", "unused", objective, () => {}, f.send)).rejects.toThrow(/control command/); expect(f.send).not.toHaveBeenCalled(); }
+    finally { await f.close(); }
+  });
+  it("같은 본문을 저장해 멈춘 Goal을 재개하지 않는다", async () => {
+    const f = await editFixture();
+    try { const before = await f.reader.details("fixture"); expect(await f.reader.edit("fixture", before.revision, before.objective!, () => {}, f.send)).toMatchObject({ state: "paused" }); expect(f.send).not.toHaveBeenCalled(); }
+    finally { await f.close(); }
+  });
+  it("예산이 소진된 Goal을 편집으로 재개하지 않는다", async () => {
+    const f = await editFixture();
+    try { await f.change({ status: "active", tokensUsed: 20 }); const before = await f.reader.details("fixture"); await expect(f.reader.edit("fixture", before.revision, "Edited fixture", () => {}, f.send)).rejects.toThrow(/limits/); expect(f.send).not.toHaveBeenCalled(); }
+    finally { await f.close(); }
+  });
+  it("네이티브 편집의 예산 변경이나 사용량 초기화를 성공으로 보고하지 않는다", async () => {
+    const f = await editFixture();
+    try { const before = await f.reader.details("fixture"); f.send.mockImplementationOnce(async () => f.change({ objective: "Edited fixture", status: "active", tokensUsed: 0 })); await expect(f.reader.edit("fixture", before.revision, "Edited fixture", () => {}, f.send)).rejects.toThrow(/budget changed/); expect(f.send).toHaveBeenCalledOnce(); }
+    finally { await f.close(); }
+  });
+  it("결과가 불분명한 편집을 자동 재전송하지 않는다", async () => {
+    const f = await editFixture();
+    try { const before = await f.reader.details("fixture"); f.send.mockRejectedValueOnce(new Error("Receipt lost")); await expect(f.reader.edit("fixture", before.revision, "Edited fixture", () => {}, f.send)).rejects.toThrow("Receipt lost"); expect(f.send).toHaveBeenCalledOnce(); }
+    finally { await f.close(); }
+  });
 });

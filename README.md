@@ -48,6 +48,16 @@ Paused, limited, and non-Codex blocked goals can be selected without changing th
 
 Turning automatic recovery off leaves monitoring and manual review available. Settings are shared by clients connected to the same daemon.
 
+## View and edit a Codex goal
+
+In a native Codex session, enter `/goal`, `/goal edit`, or `/goal-edit`, or choose **View or edit this session's goal** in the Command Center. The desktop and mobile editor shows the current objective, native state, and token usage. The objective is prefilled so you can change it in place.
+
+**Save goal** uses the existing Paseo connection's native `/goal <objective>` command. For paused or blocked goals the button is **Save and activate**: that native command sets the edited goal active. It does not explicitly start a model turn, but Codex's own goal loop may continue an active goal. Completed goals, exhausted limits, unavailable state, pending approvals, and uncertain delivery are read-only. The editor does not change token budgets; it checks the native result and never retries an unconfirmed edit automatically.
+
+Saving rechecks the native objective, state, identity, budget, and the session before sending. An edit ticket expires after five minutes and is consumed once. These checks reduce stale overwrites; Paseo does not expose an atomic conditional goal update. The new objective is not automatically selected for Paseo continuation. Select it again if desired. Opening the editor never selects a goal or starts work, and its objective reads are not part of background discovery. Objective text and edit tickets are not written to the recovery journal.
+
+`/goal pause`, `/goal resume`, `/goal clear`, and `/goal <objective>` retain their native behavior. Other providers retain their native `/goal` and `/goal edit` behavior; their goal editor integration is not included in this release.
+
 ## Goal continuation
 
 Enable **Continue selected goals** in settings, then press **Goal · Off** in each session you want to select. The settings switch is a master control; turning it on does not select any goals. You can also select an existing session from the Command Center.
