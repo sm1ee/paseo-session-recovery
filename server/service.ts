@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { GOAL_PROMPT, preferences, statusInput, type Preferences, type Reason, type RecoveryRow, type RecoveryStatus, type ResumePreview } from "../shared/contracts";
+import { GOAL_PROMPT, preferences, reasonText, statusInput, type GoalControl, type Preferences, type Reason, type RecoveryRow, type RecoveryStatus, type ResumePreview } from "../shared/contracts";
 import { automaticBlock, backoff, busy, emptyState, fingerprint, isGoalContinuation, isSelectedGoal, isTransient, OPEN_PHASES, snapshotBlock, time, type Agent, type RecordEntry, type SavedState } from "../shared/model";
 import { openLocalHost, type RecoveryHost } from "./host";
 import { RecoveryError } from "./store";
@@ -29,6 +29,8 @@ export class RecoveryService {
   private scanQueued = false;
   private lastScanAt: number | null = null;
   private cursor = 0;
+  private controls = new Map<string, { at: number; generation: number; changed: number; value: GoalControl }>();
+  private controlQueue: Promise<unknown> = Promise.resolve();
   constructor(private readonly connect = openLocalHost, private readonly now = Date.now, private readonly automaticTimer = true) {}
   private enqueue<T>(work: () => Promise<T>, report = true): Promise<T> {
     const task = this.queue.then(work);
@@ -316,7 +318,7 @@ export class RecoveryService {
       if (existing?.expectingStart || existing?.phase === "sending" || existing?.reason === "uncertain_send") throw new RecoveryError("A previous continuation has uncertain delivery. Check the conversation and dismiss that candidate before watching its goal again.");
       const reading = await host.goal?.(id);
       if (!reading?.evidence) throw new RecoveryError("No supported goal state was found in the recent conversation. Goal tools must expose their result in Paseo.");
-      if (reading.state !== "active" || !reading.key) throw new RecoveryError("Only a verified active goal can be selected. Open the session and check its current goal.");
+      if (!reading.key || reading.state === "complete" || reading.state === "cleared") throw new RecoveryError("The current goal could not be verified or has already ended. Open the session and check its goal.");
       if (expectedKey && expectedKey !== reading.key) throw new RecoveryError("The goal changed. Refresh and select the new goal if you want to continue it.");
       const previous = this.saved.records[id]; const at = this.now();
       const goal = { key: reading.key, state: reading.state, selectedKey: reading.key, attempts: !resetAttempts && previous?.goal?.key === reading.key ? previous.goal.attempts : 0 };
@@ -347,6 +349,38 @@ export class RecoveryService {
       }
       return { ok: true };
     });
+  }
+  goalControl(id: string, fresh = false): Promise<GoalControl> {
+    // Passive discovery must not hold up recovery actions while a provider is slow.
+    const task = this.controlQueue.then(async () => {
+      const { host, generation, changed } = await this.action(async () => ({ host: await this.ready(), generation: this.generation, changed: this.changes.get(id) ?? 0 }));
+      const cached = this.controls.get(id);
+      if (!fresh && cached && cached.generation === generation && cached.changed === changed && this.now() - cached.at < 10_000) return cached.value;
+      const a = await host.fetch(id); this.check(generation);
+      const r = this.saved.records[id];
+      const value: GoalControl = { id, workspaceId: a?.workspaceId ?? null, visible: false, state: null, key: null, selected: false, canSelect: false,
+        automatic: this.settings.enabled && this.settings.continueGoals, attempts: 0, maxAttempts: this.settings.goalMaxAttempts, delaySeconds: this.settings.goalDelaySeconds, note: null };
+      if (a && !a.internal && !a.archivedAt && a.workspaceId) {
+        const reading = await host.goal?.(id) ?? { state: "unknown" as const, key: null, evidence: false }; this.check(generation);
+        // Inspection never opts a session in, schedules a turn, or writes a recovery record.
+        if ((this.changes.get(id) ?? 0) !== changed) return value;
+        const terminal = reading.state === "complete" || reading.state === "cleared";
+        const selected = !terminal && !!r?.goal?.selectedKey && (!reading.key || r.goal.selectedKey === reading.key);
+        value.visible = !terminal && (reading.evidence && !!reading.key || selected);
+        value.state = reading.state === "active" && !reading.key ? "unknown" : reading.state;
+        value.key = reading.key ?? (selected ? r?.goal?.key ?? null : null); value.selected = selected;
+        value.attempts = r?.goal?.key === value.key ? r?.goal?.attempts ?? 0 : 0;
+        const excluded = this.saved.excluded.includes(id);
+        const uncertain = r?.reason === "uncertain_send" || r?.phase === "sending" || r?.expectingStart;
+        value.canSelect = value.visible && reading.evidence && !!reading.key && !excluded && !uncertain;
+        value.note = excluded ? reasonText.excluded : uncertain ? reasonText.uncertain_send : !value.automatic ? "Automatic goal continuation is off in Settings."
+          : r?.humanRequired || a.pendingPermissions > 0 ? reasonText.input : value.attempts >= value.maxAttempts ? reasonText.goal_limit
+          : value.state !== "active" ? reasonText[value.state === "paused" ? "goal_paused" : value.state === "blocked" ? "goal_blocked" : value.state === "limited" ? "goal_limited" : "goal_unknown"] : null;
+      }
+      if (this.controls.size >= 2000) this.controls.delete(this.controls.keys().next().value!);
+      this.controls.set(id, { at: this.now(), generation, changed, value }); return value;
+    });
+    this.controlQueue = task.catch(() => {}); return task;
   }
   prepare(id: string): Promise<ResumePreview> {
     return this.action(async () => {

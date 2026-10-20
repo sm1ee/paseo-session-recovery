@@ -74,7 +74,7 @@ export function RecoveryScreen({ theme, layout, params, navigation, host, onOpen
         {row.dueAt && <Text style={muted}>Resume after {date(row.dueAt)}</Text>}
         <Text style={muted}>{row.attempts} recovery attempts{row.lastSeenAt ? ` · Last seen ${date(row.lastSeenAt)}` : ""}</Text>
         {row.goalState && <Text style={text}>Goal: {row.goalState} · {row.goalAttempts} continuations</Text>}
-        {!row.excluded && <SettingsCard><SettingsSwitch label="Continue this session's goal"
+        {!row.excluded && (row.goalSelected || row.goalKey && row.goalState && !["complete", "cleared"].includes(row.goalState)) && <SettingsCard><SettingsSwitch label="Continue this session's goal"
           hint={row.goalSelected ? data.goalContinuationEnabled ? "Selected. Paused goals, limits, and requests for input still stop continuation." : "Selected. Turn on Continue selected goals in Settings to run it automatically."
             : "Off. Turning this on checks and selects the current active goal only."}
           value={row.goalSelected} disabled={mutation.isPending}

@@ -1,7 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { CodexGoalConnection, codexLaunch } from "./codex-goals";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CodexGoalConnection, CodexGoals, codexLaunch } from "./codex-goals";
 
 describe("Codex goal reader", () => {
+  it("shares one reader across concurrent visibility and recovery lookups and stays closed", async () => {
+    const home = await mkdtemp(join(tmpdir(), "goal-reader-concurrency-")); const starts = join(home, "starts");
+    const script = `require("node:fs").appendFileSync(process.env.STARTS_FILE,"x");require("node:readline").createInterface({input:process.stdin}).on("line",s=>{const m=JSON.parse(s);if(m.method==="initialized")return;if(!["initialize","thread/goal/get"].includes(m.method))process.exit(2);process.stdout.write(JSON.stringify({id:m.id,result:m.method==="initialize"?{}:{goal:{objective:"Fixture goal",status:"active"}}})+"\\n")});`;
+    await writeFile(join(home, "config.json"), JSON.stringify({ agents: { providers: { codex: { command: [process.execPath, "-e", script, "--"], env: { STARTS_FILE: starts } } } } }));
+    const goals = new CodexGoals(home);
+    try {
+      const readings = await Promise.all([goals.read("codex", "one"), goals.read("codex", "two")]);
+      expect(readings.every((r) => r?.state === "active")).toBe(true); expect(await readFile(starts, "utf8")).toBe("x");
+      await goals.close(); expect(await goals.read("codex", "three")).toMatchObject({ state: "unknown" });
+      expect(await readFile(starts, "utf8")).toBe("x");
+    } finally { await goals.close(); await rm(home, { recursive: true, force: true }); }
+  });
   it("resolves configured command prefixes and inherited provider environments", () => {
     const config = { agents: { providers: { codex: { command: ["wrapper", "codex", "--", "codex"], env: { BASE_SETTING: "base" } }, custom: { extends: "codex", env: { TASK_SETTING: "custom" } } } } };
     expect(codexLaunch(config, "custom")).toEqual({ command: "wrapper", args: ["codex", "--", "codex", "app-server", "--enable", "goals"], env: { BASE_SETTING: "base", TASK_SETTING: "custom" } });

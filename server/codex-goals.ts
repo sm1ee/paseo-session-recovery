@@ -100,22 +100,28 @@ export class CodexGoalConnection {
 }
 export class CodexGoals {
   private readers = new Map<string, { signature: string; reader: CodexGoalConnection }>();
+  private closed = false;
   constructor(private readonly home: string) {}
   async read(provider: string, threadId: string): Promise<GoalReading | null> {
     const config = JSON.parse(await readFile(join(this.home, "config.json"), "utf8"));
+    if (this.closed) return { state: "unknown", key: null, evidence: true };
     const launch = codexLaunch(config, provider); if (!launch) return null;
     const signature = createHash("sha256").update(JSON.stringify(launch)).digest("hex");
     let current = this.readers.get(provider);
+    while (current && current.signature !== signature) {
+      this.readers.delete(provider); await current.reader.close();
+      if (this.closed) return { state: "unknown", key: null, evidence: true };
+      current = this.readers.get(provider);
+    }
     if (current?.signature !== signature) {
-      await current?.reader.close();
       current = { signature, reader: new CodexGoalConnection(launch, this.home) };
       this.readers.set(provider, current);
     }
     try { return await current!.reader.read(threadId); }
     catch {
-      await current!.reader.close(); this.readers.delete(provider);
+      await current!.reader.close(); if (this.readers.get(provider) === current) this.readers.delete(provider);
       return { state: "unknown", key: null, evidence: true };
     }
   }
-  async close(): Promise<void> { for (const { reader } of this.readers.values()) await reader.close(); this.readers.clear(); }
+  async close(): Promise<void> { this.closed = true; for (const { reader } of this.readers.values()) await reader.close(); this.readers.clear(); }
 }

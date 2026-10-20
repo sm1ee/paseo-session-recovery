@@ -46,6 +46,86 @@ function fixture(options: Record<string, unknown> = {}) {
     row() { return service.status(statusInput.parse({})).rows[0]; },
   };
 }
+describe("goal composer inspection", () => {
+  const active: GoalReading = { state: "active", key: "current-goal", evidence: true };
+  it("does not show a pill or track a session without goal evidence", async () => {
+    const f = fixture(); await f.service.configure(f.settings);
+    expect(await f.service.goalControl("session")).toMatchObject({ visible: false, selected: false, canSelect: false });
+    expect(f.saved.records).toEqual({}); expect(holdIds(f.saved)).toEqual([]); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("finds a goal on an existing session without selecting, scheduling, or persisting it", async () => {
+    const f = fixture(); f.idle(); f.setGoal(active); await f.service.configure(f.settings); const before = f.saved;
+    expect(await f.service.goalControl("session")).toMatchObject({ visible: true, selected: false, canSelect: true, automatic: false, key: active.key });
+    expect(f.saved).toEqual(before); expect(f.send).not.toHaveBeenCalled(); expect(f.fetch.mock.calls.every(([id]) => id === "session")).toBe(true);
+  });
+  it.each(["complete", "cleared"] as const)("hides the pill for a %s goal", async (state) => {
+    const f = fixture(); f.setGoal(active); f.idle(); await f.service.configure(f.settings); await f.service.watchGoal("session");
+    f.setGoal({ ...active, state }); expect(await f.service.goalControl("session", true)).toMatchObject({ visible: false, selected: false, canSelect: false });
+  });
+  it.each(["paused", "blocked", "limited"] as const)("allows selecting a %s goal without continuing it", async (state) => {
+    const f = fixture(); f.idle(); f.setGoal({ ...active, state }); await f.service.configure(f.settings);
+    expect(await f.service.goalControl("session")).toMatchObject({ visible: true, selected: false, canSelect: true, state });
+    await f.service.watchGoal("session", active.key!);
+    expect(await f.service.goalControl("session")).toMatchObject({ selected: true, state });
+    await f.service.configure({ ...f.settings, continueGoals: true }); f.advance(60_000); await f.service.scanNow();
+    expect(f.send).not.toHaveBeenCalled();
+    await f.service.unwatchGoal("session"); expect(await f.service.goalControl("session")).toMatchObject({ selected: false });
+  });
+  it("continues a selected blocked goal only after a later turn makes it active", async () => {
+    const f = fixture({ continueGoals: true }); f.idle(); f.setGoal({ ...active, state: "blocked" }); await f.service.configure(f.settings);
+    await f.service.watchGoal("session", active.key!); f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("goal_blocked"); expect(f.send).not.toHaveBeenCalled();
+    f.setGoal(active); f.a.status = "running"; f.a.activeTurn = "turn-2";
+    await f.event({ kind: "start", turnId: "turn-2" } as Omit<RecoveryEvent, "agent">);
+    f.idle(); await f.event({ kind: "end", turnId: "turn-2", outcome: { kind: "completed" } } as Omit<RecoveryEvent, "agent">);
+    await f.service.scanNow(); expect(f.saved.records.session.reason).toBe("goal_active");
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledOnce();
+  });
+  it("shows an unverified selected goal only so its selection can be turned off", async () => {
+    const f = fixture(); f.setGoal(active); await f.track(); await f.service.watchGoal("session");
+    f.setGoal({ state: "unknown", key: null, evidence: false });
+    expect(await f.service.goalControl("session", true)).toMatchObject({ visible: true, selected: true, canSelect: false, state: "unknown" });
+    await f.service.unwatchGoal("session"); expect(await f.service.goalControl("session")).toMatchObject({ visible: false });
+  });
+  it("shows a replacement objective as off before the next turn ends", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await f.service.watchGoal("session");
+    f.setGoal({ ...active, key: "new-goal" });
+    expect(await f.service.goalControl("session", true)).toMatchObject({ visible: true, selected: false, canSelect: true, key: "new-goal" });
+    expect(f.send).not.toHaveBeenCalled();
+  });
+  it("caches discovery briefly and invalidates the cache on a toggle or settings change", async () => {
+    const f = fixture(); f.setGoal(active); await f.service.configure(f.settings);
+    await f.service.goalControl("session"); await f.service.goalControl("session"); expect(f.goal).toHaveBeenCalledOnce();
+    await f.service.watchGoal("session"); expect(await f.service.goalControl("session")).toMatchObject({ selected: true });
+    await f.service.configure({ ...f.settings, continueGoals: true });
+    expect(await f.service.goalControl("session")).toMatchObject({ automatic: true });
+  });
+  it("does not enable excluded sessions and hides archived or missing sessions", async () => {
+    const f = fixture(); f.setGoal(active); await f.service.configure(f.settings); await f.service.exclude("session", true);
+    expect(await f.service.goalControl("session")).toMatchObject({ visible: true, canSelect: false });
+    f.a.archivedAt = "2026-10-20T00:00:00Z";
+    expect(await f.service.goalControl("session", true)).toMatchObject({ visible: false });
+    expect(await f.service.goalControl("missing", true)).toMatchObject({ visible: false });
+  });
+  it("discards a goal reading if a stop arrives during discovery", async () => {
+    const f = fixture(); await f.track(); let release!: (value: GoalReading) => void;
+    f.goal.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const reading = f.service.goalControl("session");
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    const stop = f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
+    release(active); expect(await reading).toMatchObject({ visible: false, selected: false }); await stop;
+    expect(f.send).not.toHaveBeenCalled();
+  });
+  it("does not delay recovery actions while a visibility lookup waits on the provider", async () => {
+    const f = fixture(); await f.track(); let release!: (value: GoalReading) => void;
+    f.goal.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const reading = f.service.goalControl("session");
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    await f.service.exclude("session", true);
+    release(active); await expect(reading).rejects.toThrow(/changed/);
+    expect(f.saved.excluded).toEqual(["session"]); expect(f.send).not.toHaveBeenCalled();
+  });
+});
 describe("goal continuation", () => {
   const active: GoalReading = { state: "active", key: "goal-fingerprint", evidence: true };
   async function select(f: ReturnType<typeof fixture>) { await f.track(); await f.service.watchGoal("session"); }

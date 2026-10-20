@@ -30,7 +30,11 @@ Open **session-recovery** in the sidebar. Settings are in the upper-right corner
 - **History:** completed, stopped, and dismissed records.
 - **Excluded:** sessions excluded from recovery.
 
-**Continue this session's goal** selects the current objective with a toggle on each session card. Turn it off to cancel that goal's pending continuation while keeping interruption recovery available.
+**Goal · On / Off** appears beside Tasks and Subagents above the message composer when a supported current goal is found. Open it to toggle **Continue this goal**, check its state and continuation count, or open settings. Sessions without a verified goal and completed or cleared goals have no pill. A previously selected goal with an unavailable state keeps the control so you can turn it off.
+
+Goal sessions also have a toggle on their recovery card. Turning either toggle off cancels that goal's pending continuation while keeping interruption recovery available.
+
+You can select a paused, blocked, or limited goal. Selection does not change its provider status or resume it. Automatic continuation waits until a later turn records the same objective as active.
 
 **Resume…** previews the continuation message and rechecks the session before sending it. **Dismiss** ends a pending recovery and releases its cleanup protection. **Exclude recovery** also excludes future turns until you allow them again. Command Center has per-session exclusion and inclusion actions.
 
@@ -82,13 +86,13 @@ paseo plugin install /absolute/path/to/paseo-session-recovery
 
 Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed.
 
-For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.3.0`. The public registry listing requires a separate review.
+For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.3.1`. The public registry listing requires a separate review.
 
 ## Local data
 
 Session IDs, titles, providers, turn IDs, timestamps, attempt counts, exclusions, goal fingerprints, selections and states, and recent outcomes stay under `plugin-data/session-recovery/` in the daemon's Paseo home. `state.json` is the journal, `holds.json` is the cleanup protection list, and `worker.lock` prevents duplicate monitors. Files use owner-only permissions. Journal writes use sync and atomic rename.
 
-With goal continuation enabled or an explicit goal selection, conversation records are inspected in memory. Conversation bodies, goal objectives, raw provider errors, API tokens, and credentials are not stored in the journal. The local credential is read in memory to authenticate to the owning daemon's loopback listener or Unix socket. Continuations go through the session's existing provider. No separate model or external review service is used.
+Composer visibility checks, goal continuation, and explicit goal selection inspect supported goal state and conversation records in memory. Connected clients check the unarchived session directory. Running sessions and visible goal controls are checked about every 15 seconds; other idle sessions about every minute. The daemon briefly caches these read-only results. Discovery does not select, schedule, or resume sessions, and still works when the automatic continuation setting is off. Conversation bodies, goal objectives, raw provider errors, API tokens, and credentials are not stored in the journal. The local credential is read in memory to authenticate to the owning daemon's loopback listener or Unix socket. Continuations go through the session's existing provider. No separate model or external review service is used.
 
 The startup connection uses a version-pinned adapter because Paseo does not provide an SDK context at plugin entry startup. Stable 0.11.4 through 0.12.x are supported. On 0.12, workspace lookups include background workspaces. Unknown versions and prereleases pause recovery until compatibility has been checked.
 
