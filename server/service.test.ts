@@ -80,6 +80,16 @@ describe("목표 미리보기와 명시적인 네이티브 제어", () => {
     expect(f.saved).toEqual(before); expect(f.controlGoal).not.toHaveBeenCalled();
     expect(JSON.stringify(f.saved)).not.toContain("Private fixture objective");
   });
+  it("여러 화면의 같은 fresh 미리보기는 진행 중인 네이티브 읽기를 공유한다", async () => {
+    const f = await controls(); let release!: (value: CodexGoalDetails | null) => void;
+    f.goalDetails.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const first = f.service.goalControl("session", true, false, true);
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    const second = f.service.goalControl("session", true, false, true);
+    expect(second).toBe(first);
+    release({ reading: { state: "active", key: "shared", evidence: true, source: "codex" }, objective: "Synthetic", revision: "native", tokenBudget: null, tokensUsed: null });
+    await Promise.all([first, second]); expect(f.goalDetails).toHaveBeenCalledOnce(); expect(f.editGoal).not.toHaveBeenCalled();
+  });
   it("자동 이어가기가 꺼져 있어도 사용자가 네이티브 Goal을 일시정지할 수 있다", async () => {
     const f = await controls(), view = await f.service.readGoalEditor("session");
     expect(view).toMatchObject({ action: "pause", actionTicket: expect.any(String), key: "original-goal" });
