@@ -427,7 +427,7 @@ export class RecoveryService {
       if (a && !a.internal && !a.archivedAt && a.workspaceId) {
         const reading = await host.goal?.(id) ?? { state: "unknown" as const, key: null, evidence: false }; this.check(generation);
         // Inspection never opts a session in, schedules a turn, or writes a recovery record.
-        if ((this.changes.get(id) ?? 0) !== changed) return value;
+        if ((this.changes.get(id) ?? 0) !== changed) { value.note = "The session changed while checking its goal. Try again."; return value; }
         const terminal = reading.state === "complete" || reading.state === "cleared";
         const selected = !terminal && !!r?.goal?.selectedKey && (!reading.key || r.goal.selectedKey === reading.key);
         value.visible = !terminal && (reading.evidence && !!reading.key || selected);

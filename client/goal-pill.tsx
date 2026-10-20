@@ -19,8 +19,12 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
     (id, workspaceId) => {
       const pill = client.addComposerPill({ id: "goal-continuation", agentId: id, workspaceId,
         button: { title: "Toggle goal continuation", icon: "Target", label: "Goal", behavior: { kind: "action", async onPress() {
-          const goal = await controller.refresh(id);
-          if (!goal.visible || !goal.selected && (!goal.canSelect || !goal.key)) throw new Error("This goal is unavailable. Try again.");
+          let goal = await controller.refresh(id);
+          const available = (value: GoalControl) => value.visible && (value.selected || value.canSelect && !!value.key);
+          // A turn can finish while the read is in flight. Retry inspection once;
+          // never retry a selection, resume command, or other mutation here.
+          if (!available(goal) && (goal.state === null || goal.state === "unknown")) goal = await controller.refresh(id);
+          if (!available(goal)) throw new Error(goal.note || "This goal is unavailable. Try again.");
           try {
             if (goal.selected) await client.rpc(unwatchGoalRpc, { id });
             else await client.rpc(watchGoalRpc, { id, key: goal.key!, resetAttempts: false, resumeBlocked: true });

@@ -68,6 +68,22 @@ describe("direct goal toggle", () => {
     await expect(f.press()).rejects.toThrow(/unavailable/);
     expect(f.rpc.mock.calls.some(([contract]) => contract === watchGoalRpc || contract === unwatchGoalRpc)).toBe(false);
   });
+  it("rechecks a transient goal lookup once without repeating the selection", async () => {
+    const f = await fixture();
+    f.rpc.mockImplementationOnce(async (contract) => {
+      expect(contract).toBe(goalControlRpc);
+      return { id: agent.id, workspaceId: agent.workspaceId, visible: false, state: null, key: null, selected: false, canSelect: false,
+        automatic: true, attempts: 0, maxAttempts: 10, delaySeconds: 60, note: "The session changed while checking its goal. Try again." };
+    });
+    await f.press();
+    expect(f.rpc.mock.calls.filter(([contract]) => contract === watchGoalRpc)).toHaveLength(1);
+    expect(f.update).toHaveBeenLastCalledWith(expect.objectContaining({ label: "Goal · On" }));
+  });
+  it("shows the actual selection blocker without retrying a command", async () => {
+    const f = await fixture(); f.set({ canSelect: false, note: "A previous continuation has uncertain delivery." });
+    await expect(f.press()).rejects.toThrow("A previous continuation has uncertain delivery.");
+    expect(f.rpc.mock.calls.some(([contract]) => contract === watchGoalRpc || contract === unwatchGoalRpc)).toBe(false);
+  });
   it.each([
     [{ state: "blocked" }, "Blocked"], [{ state: "paused" }, "Paused"], [{ state: "limited" }, "Limit"],
     [{ state: "unknown" }, "Review"], [{ state: "active", holdReason: "input" }, "Waiting"],

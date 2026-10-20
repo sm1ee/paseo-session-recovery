@@ -64,6 +64,19 @@ describe("goal composer inspection", () => {
     expect(await f.service.goalControl("session")).toMatchObject({ visible: true, selected: false, canSelect: true, automatic: false, key: active.key });
     expect(f.saved).toEqual(before); expect(f.send).not.toHaveBeenCalled(); expect(f.fetch.mock.calls.every(([id]) => id === "session")).toBe(true);
   });
+  it("identifies a raced goal lookup so the client can inspect the stable state again", async () => {
+    const f = fixture(); f.idle(); f.setGoal(active); await f.service.configure(f.settings);
+    let release!: (reading: GoalReading) => void;
+    f.goal.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const pending = f.service.goalControl("session", true);
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    f.a.status = "running"; f.a.activeTurn = "next-turn";
+    await f.event({ kind: "start", turnId: "next-turn" } as Omit<RecoveryEvent, "agent">);
+    release(active);
+    expect(await pending).toMatchObject({ visible: false, canSelect: false, state: null, note: expect.stringContaining("session changed") });
+    expect(await f.service.goalControl("session", true)).toMatchObject({ visible: true, canSelect: true, state: "active" });
+    expect(f.send).not.toHaveBeenCalled(); expect(f.resumeBlockedGoal).not.toHaveBeenCalled();
+  });
   it.each(["complete", "cleared"] as const)("hides the pill for a %s goal", async (state) => {
     const f = fixture(); f.setGoal(active); f.idle(); await f.service.configure(f.settings); await f.service.watchGoal("session");
     f.setGoal({ ...active, state }); expect(await f.service.goalControl("session", true)).toMatchObject({ visible: false, selected: false, canSelect: false });
