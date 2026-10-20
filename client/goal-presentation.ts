@@ -1,4 +1,5 @@
 import type { GoalControl } from "../shared/contracts";
+import type { GoalEditorSnapshot } from "../shared/goal-editor";
 
 export function goalPreviewLabel(goal: GoalControl | null): string {
   const text = goal?.objective?.replace(/\s+/g, " ").trim();
@@ -13,4 +14,16 @@ export function goalErrorText(error: unknown): string {
   if (/budget|limit/i.test(raw)) return "Check goal limits.";
   if (/unavailable|disconnected|connection|timed out/i.test(raw)) return "Unavailable. Reload.";
   return "Couldn’t confirm. Reload.";
+}
+
+export function goalReadOnlyText(goal: GoalEditorSnapshot): string {
+  if (goal.state === "complete") return "Goal completed.";
+  if (!goal.supported) return "Viewing only. Native controls unavailable.";
+  const note = goal.note ?? "";
+  if (/current turn/.test(note)) return "Turn running. Edit when idle.";
+  if (/pending input|uncertain delivery/.test(note)) return "Resolve pending input or delivery first.";
+  if (/session changed/i.test(note)) return "Session changed. Reload.";
+  if (/commands are unavailable/.test(note)) return "Native controls unavailable.";
+  if (goal.state === "unknown") return "Goal unavailable. Reload.";
+  return "Read only. Check Details.";
 }

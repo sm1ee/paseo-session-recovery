@@ -98,14 +98,15 @@ export class CodexGoalConnection {
     })).digest("hex");
     const count = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
     const identity = createHash("sha256").update(JSON.stringify({ id: goal.id ?? null, objective, createdAt: goal.createdAt ?? goal.created_at ?? null, tokenBudget: goal.tokenBudget ?? null })).digest("hex");
-    return { reading: this.decode(data), objective, revision, identity, tokenBudget: count(goal.tokenBudget), tokensUsed: count(goal.tokensUsed) };
+    // User controls follow Codex's reported state. Usage guards belong only to
+    // automatic continuation; they must not prevent editing or pausing a goal.
+    return { reading: this.decode(data, false), objective, revision, identity, tokenBudget: count(goal.tokenBudget), tokensUsed: count(goal.tokensUsed) };
   }
   async edit(threadId: string, revision: string, objective: string, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
     const invalid = goalObjectiveError(objective); if (invalid) throw new Error(invalid);
     const before = await this.details(threadId); check();
     if (before.revision !== revision) throw new Error("The goal changed while you were editing. Reload it and review your changes before saving.");
-    if (!before.objective || !["active", "paused", "blocked"].includes(before.reading.state)) throw new Error("This goal cannot be edited in its current state. Review its native state and limits.");
-    if (before.tokensUsed === null || before.tokenBudget !== null && (before.tokenBudget <= 0 || before.tokensUsed >= before.tokenBudget)) throw new Error("The native goal budget could not be verified. Review its limits before editing.");
+    if (!before.objective || !["active", "paused", "blocked", "limited"].includes(before.reading.state)) throw new Error("This goal cannot be edited in its current state. Review its native state.");
     const text = objective.trim();
     if (text === before.objective.trim()) return before.reading;
     // Only the owning Paseo connection may write. This reader never acquires
@@ -113,7 +114,7 @@ export class CodexGoalConnection {
     await send(); check();
     for (let n = 0; n < 20; n++) {
       const after = await this.details(threadId); check();
-      if (after.objective?.trim() === text && after.reading.state === "active") {
+      if (after.objective?.trim() === text && ["active", "paused", "blocked", "limited"].includes(after.reading.state)) {
         if (after.tokenBudget !== before.tokenBudget || before.tokensUsed !== null && (after.tokensUsed === null || after.tokensUsed < before.tokensUsed)) {
           throw new Error("The native goal budget changed. Check the conversation before making another change.");
         }
@@ -127,8 +128,7 @@ export class CodexGoalConnection {
   async control(threadId: string, revision: string, action: GoalAction, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
     const before = await this.details(threadId); check();
     if (before.revision !== revision || !before.reading.key || !before.objective ||
-      !(action === "pause" ? before.reading.state === "active" : ["paused", "blocked"].includes(before.reading.state))) throw new Error("The goal changed. Reload its controls before trying again.");
-    if (action === "resume" && (before.tokensUsed === null || before.tokenBudget !== null && (before.tokenBudget <= 0 || before.tokensUsed >= before.tokenBudget))) throw new Error("Review the native goal budget before resuming.");
+      !(action === "pause" ? before.reading.state === "active" : ["paused", "blocked", "limited"].includes(before.reading.state))) throw new Error("The goal changed. Reload its controls before trying again.");
     await send(); check();
     for (let n = 0; n < 20; n++) {
       const after = await this.details(threadId); check();
@@ -146,9 +146,9 @@ export class CodexGoalConnection {
     if (!("goal" in data)) throw new Error("Unrecognized Codex goal response");
     return data;
   }
-  private decode(data: Record<string, unknown>): GoalReading {
+  private decode(data: Record<string, unknown>, checkUsage = true): GoalReading {
     if (data.goal === null) return { state: "cleared", key: null, evidence: false, source: "codex" };
-    return { ...readGoal([{ type: "tool_call", name: "get_goal", status: "completed", detail: { type: "unknown", input: {}, output: data.goal } }]), source: "codex" };
+    return { ...readGoal([{ type: "tool_call", name: "get_goal", status: "completed", detail: { type: "unknown", input: {}, output: data.goal } }], { checkUsage }), source: "codex" };
   }
   async resumeBlocked(threadId: string, key: string, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
     const data = await this.get(threadId); check();

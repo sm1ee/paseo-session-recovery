@@ -6,7 +6,7 @@ import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import { goalLengthLimit, editGoalRpc, goalObjectiveError, readGoalRpc, type GoalEditorSnapshot } from "../shared/goal-editor";
 import { goalControlRpc, watchGoalRpc, unwatchGoalRpc } from "../shared/contracts";
 import { actOnGoalRpc } from "../shared/goal-actions";
-import { goalErrorText } from "./goal-presentation";
+import { goalErrorText, goalReadOnlyText } from "./goal-presentation";
 
 export function GoalEditorScreen(props: PluginScreenProps) {
   return <ScrollView keyboardShouldPersistTaps="handled" style={{ flex: 1, backgroundColor: props.theme.colors.surface0 }}
@@ -80,7 +80,7 @@ function GoalEditor({ theme, layout, agentId: id, host, onChanged, openSession }
       <TextInput multiline value={text} onChangeText={(value) => setDraft({ ticket: goal.ticket, text: value })} maxLength={maxLength}
         editable={!!goal.ticket && !needsReload && !result.isError && !pending} accessibilityLabel="Goal objective" placeholderTextColor={c.foregroundMuted}
         style={{ ...normal, minHeight: layout.compact ? 120 : 160, maxHeight: 280, padding: 12, backgroundColor: c.surface1, borderWidth: 1, borderColor: dirty ? c.accent : c.border, borderRadius: 10, textAlignVertical: "top" }} />
-      {!goal.ticket && <Text style={muted}>Read only</Text>}
+      {!goal.ticket && <Text style={muted}>{goalReadOnlyText(goal)}</Text>}
       {dirty && <Text style={muted}>{text.length.toLocaleString()} / {maxLength.toLocaleString()}</Text>}
       {dirty && validation && <Text accessibilityRole="alert" style={{ color: c.statusDanger }}>{validation}</Text>}
     </View>}
@@ -88,9 +88,9 @@ function GoalEditor({ theme, layout, agentId: id, host, onChanged, openSession }
     {goal?.source === "claude" && dirty && <Text style={muted}>Restarts the goal timer and usage.</Text>}
     {notice && <Text accessibilityRole="alert" style={normal}>{notice}</Text>}
     <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-      {goal?.actionTicket && !dirty && button(playback.isPending ? "Updating…" : goal.action === "pause" ? "Pause" : "Resume", () => playback.mutate(goal), needsReload || result.isError)}
-      {goal?.ticket && dirty && button(save.isPending ? "Saving…" : goal.source === "claude" ? "Replace & start" : goal.state === "active" ? "Save" : "Save & start", () => save.mutate(goal), !!validation || needsReload || result.isError, true)}
-      {!!id && (needsReload || result.isError) && button("Reload", () => dirty ? setConfirmReload(true) : reload())}
+      {goal?.action && !dirty && button(playback.isPending ? "Updating…" : goal.action === "pause" ? "Pause" : "Resume", () => playback.mutate(goal), !goal.actionTicket || needsReload || result.isError)}
+      {goal?.ticket && dirty && button(save.isPending ? "Saving…" : goal.source === "claude" ? "Replace & start" : "Save", () => save.mutate(goal), !!validation || needsReload || result.isError, true)}
+      {!!id && (needsReload || result.isError || goal?.objective != null && !goal.ticket) && button("Reload", () => dirty ? setConfirmReload(true) : reload())}
       {dirty && button("Discard", () => setDraft(null))}
     </View>
     {confirmReload && <View style={{ gap: 10, padding: 12, backgroundColor: c.surface1, borderRadius: 8 }}>

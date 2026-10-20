@@ -101,6 +101,20 @@ describe("목표 미리보기와 명시적인 네이티브 제어", () => {
     const view = await f.service.readGoalEditor("session"); await f.service.actOnGoal({ ticket: view.actionTicket!, confirmBudgetReset: true });
     expect(f.controlGoal).toHaveBeenCalledOnce();
   });
+  it.each(["codex", "opencode"] as const)("%s 수동 제어는 사용량이나 네이티브 limited 상태만으로 잠그지 않는다", async (source) => {
+    const f = await controls(source, "limited");
+    f.setDetails({ reading: { state: "limited", key: "original-goal", evidence: true, source }, objective: "Fixture", revision: "native", tokenBudget: 100, tokensUsed: 934916 });
+    const view = await f.service.readGoalEditor("session");
+    expect(view).toMatchObject({ ticket: expect.any(String), action: "resume", actionTicket: expect.any(String) });
+    expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ nativeAction: "resume", nativeActionReady: true });
+    expect(f.controlGoal).not.toHaveBeenCalled(); expect(f.editGoal).not.toHaveBeenCalled();
+  });
+  it("OpenCode 턴 실행 중에도 제어를 숨기지 않고 사용할 수 없는 상태로 표시한다", async () => {
+    const f = await controls("opencode"); f.a.status = "running"; f.a.activeTurn = "current";
+    expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ nativeAction: "pause", nativeActionReady: false });
+    expect(await f.service.readGoalEditor("session")).toMatchObject({ ticket: null, action: "pause", actionTicket: null, note: expect.stringContaining("current turn") });
+    expect(f.controlGoal).not.toHaveBeenCalled();
+  });
   it.each(["claude", "timeline"] as const)("%s의 미지원 pause/resume 티켓을 발행하지 않는다", async (source) => {
     const f = await controls(); f.setDetails({ reading: { state: "active", key: "original-goal", evidence: true, source }, objective: "Fixture", revision: "native", tokenBudget: null, tokensUsed: null });
     const view = await f.service.readGoalEditor("session"); expect(view.objective).toBe("Fixture"); expect(view.actionTicket).toBeNull();
@@ -239,11 +253,11 @@ describe("명시적인 Goal 편집", () => {
     view = await f.service.readGoalEditor("session"); expect(view.ticket).toBeNull(); expect(view.note).toContain("Wait");
     expect(f.editGoal).not.toHaveBeenCalled();
   });
-  it("승인을 기다리거나 예산이 소진된 Goal은 읽기 전용이다", async () => {
+  it("승인을 기다리거나 완료된 Goal은 읽기 전용이다", async () => {
     const f = await editor(); f.a.pendingPermissions = 1;
     expect(await f.service.readGoalEditor("session")).toMatchObject({ ticket: null, objective: "Original fixture" });
-    f.a.pendingPermissions = 0; f.setDetails({ reading: { state: "limited", key: "original-goal", evidence: true, source: "codex" }, objective: "Original fixture", revision: "native-revision", tokenBudget: 100, tokensUsed: 100 });
-    expect(await f.service.readGoalEditor("session")).toMatchObject({ ticket: null, state: "limited" });
+    f.a.pendingPermissions = 0; f.setDetails({ reading: { state: "complete", key: "original-goal", evidence: true, source: "codex" }, objective: "Original fixture", revision: "native-revision", tokenBudget: 100, tokensUsed: 100 });
+    expect(await f.service.readGoalEditor("session")).toMatchObject({ ticket: null, state: "complete" });
     expect(f.editGoal).not.toHaveBeenCalled();
   });
 });

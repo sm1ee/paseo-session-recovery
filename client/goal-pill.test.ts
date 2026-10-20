@@ -95,6 +95,11 @@ describe("목표 미리보기와 네이티브 재생 제어", () => {
     expect(f.buttons.get("goal-playback")).toMatchObject({ icon: "Play", label: "Resume", behavior: { kind: "popover" } });
     expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc)).toBe(false);
   });
+  it("턴 실행 등 일시적인 제한은 제어 버튼을 숨기는 대신 비활성화한다", async () => {
+    const f = await fixture({ source: "opencode", nativeAction: "pause", nativeActionReady: false });
+    expect(f.buttons.get("goal-playback")).toMatchObject({ label: "Pause", disabled: true, visible: true });
+    expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc)).toBe(false);
+  });
   it.each(["claude", "timeline"] as const)("%s의 미지원 제어를 재생이나 일시정지로 표시하지 않는다", async (source) => {
     const f = await fixture({ source, nativeAction: null }); expect(f.buttons.has("goal-playback")).toBe(false);
   });

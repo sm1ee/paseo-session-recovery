@@ -42,7 +42,7 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
         const action = value?.nativeAction;
         if (!action) { playback?.update({ visible: false }); return; }
         const button = { title: action === "pause" ? "Pause goal" : "Resume goal",
-          icon: action === "pause" ? "Pause" : "Play", label: action === "pause" ? "Pause" : "Resume", visible: true,
+          icon: action === "pause" ? "Pause" : "Play", label: action === "pause" ? "Pause" : "Resume", visible: true, disabled: value.nativeActionReady === false,
           behavior: action === "resume" && value.source === "opencode" ? { kind: "popover" as const, Content } : { kind: "action" as const, onPress: act } };
         if (playback) playback.update(button);
         else playback = client.addComposerPill({ id: "goal-playback", agentId: id, workspaceId, button });

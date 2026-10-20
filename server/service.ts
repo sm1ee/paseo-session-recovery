@@ -465,7 +465,8 @@ export class RecoveryService {
     Object.assign(view, { supported: true, source, actionNote: source === "claude" ? "Claude does not expose a separate native pause/resume command. Replacing its goal starts a new turn and resets its timer and counters." : null });
     if (details.reading.state === "unknown") return { ...view, note: "The current native goal could not be verified. Check its state in the conversation and reload." };
     if (!details.objective) return { ...view, note: source === "opencode" && !details.reading.modeId ? "Select the registered OpenCode Goal mode and set an objective with /goal <objective>." : "There is no current goal. Set one in the conversation with /goal <objective>." };
-    if (!details.reading.key || !["active", "paused", "blocked"].includes(details.reading.state) || details.objective.length > goalLengthLimit(source)) return { ...view, note: "This goal is read-only in its current state. Review completed goals and native limits in the conversation." };
+    if (!details.reading.key || !["active", "paused", "blocked", "limited"].includes(details.reading.state) || details.objective.length > goalLengthLimit(source)) return { ...view, note: "This goal is read-only in its current state. Review it in the conversation." };
+    if (source === "codex" || source === "opencode") view.action = details.reading.state === "active" ? "pause" : "resume";
     const r = this.saved.records[id];
     if (!goalCommandReady(a) || !a.sessionId || r?.humanRequired || r?.phase === "sending" || r?.expectingStart || r?.reason === "uncertain_send") return { ...view, note: "Resolve pending input or uncertain delivery in this session before editing its goal." };
     if (source !== "codex" && busy(a)) return { ...view, note: "Wait for this session's current turn to finish before editing its goal. Saving starts native goal work." };
@@ -499,7 +500,7 @@ export class RecoveryService {
         : action === "pause" ? "Pause the native goal's continuation. A current turn may finish before work stops." : "Resume the native goal using its existing limits." });
     }
     const note = source === "claude" ? "Replacing uses Claude's native /goal command and immediately starts a turn. Claude resets its goal timer, evaluated turn count, and token-spend baseline. Existing session limits are unchanged."
-      : source === "opencode" ? "Saving uses OpenCode's native /goal edit command, preserves turn/token/time budgets and history, and starts work on the edited goal. Paused or blocked goals become active."
+      : source === "opencode" ? "Saving uses OpenCode's native /goal edit command and preserves turn/token/time budgets and history. OpenCode decides whether the edited goal can continue."
       : "Saving uses Codex's native /goal command and makes the edited goal active. Goal continuation must be selected again for the new objective.";
     return { ...view, ticket, note };
   }
@@ -611,9 +612,10 @@ export class RecoveryService {
         if ((this.changes.get(id) ?? 0) !== changed) { value.note = "The session changed while checking its goal. Try again."; return value; }
         if (preview) {
           value.objective = details?.objective ?? null; value.source = reading.source ?? null;
-          value.nativeAction = !this.saved.excluded.includes(id) && !r?.humanRequired && r?.reason !== "uncertain_send" && r?.phase !== "sending" && !r?.expectingStart &&
-            goalCommandReady(a) && (reading.source === "codex" || reading.source === "opencode" && !busy(a)) && !!reading.key
-            ? reading.state === "active" ? "pause" : ["paused", "blocked"].includes(reading.state) ? "resume" : null : null;
+          value.nativeAction = (reading.source === "codex" || reading.source === "opencode") && !!reading.key
+            ? reading.state === "active" ? "pause" : ["paused", "blocked", "limited"].includes(reading.state) ? "resume" : null : null;
+          value.nativeActionReady = !this.saved.excluded.includes(id) && !r?.humanRequired && r?.reason !== "uncertain_send" && r?.phase !== "sending" && !r?.expectingStart &&
+            goalCommandReady(a) && (reading.source === "codex" || reading.source === "opencode" && !busy(a));
         }
         const terminal = reading.state === "complete" || reading.state === "cleared";
         const selected = !terminal && !!r?.goal?.selectedKey && (!reading.key || r.goal.selectedKey === reading.key);

@@ -122,9 +122,16 @@ describe("Codex goal reader", () => {
     try { const before = await f.reader.details("fixture"); expect(await f.reader.edit("fixture", before.revision, before.objective!, () => {}, f.send)).toMatchObject({ state: "paused" }); expect(f.send).not.toHaveBeenCalled(); }
     finally { await f.close(); }
   });
-  it("예산이 소진된 Goal을 편집으로 재개하지 않는다", async () => {
+  it("사용량으로 수동 편집을 막지 않고 Codex가 반환한 상태를 따른다", async () => {
     const f = await editFixture();
-    try { await f.change({ status: "active", tokensUsed: 20 }); const before = await f.reader.details("fixture"); await expect(f.reader.edit("fixture", before.revision, "Edited fixture", () => {}, f.send)).rejects.toThrow(/limits/); expect(f.send).not.toHaveBeenCalled(); }
+    try {
+      await f.change({ status: "active", tokensUsed: 20 }); const before = await f.reader.details("fixture");
+      expect(before.reading.state).toBe("active");
+      expect(await f.reader.edit("fixture", before.revision, "Edited fixture", () => {}, f.send)).toMatchObject({ state: "active" });
+      expect(f.send).toHaveBeenCalledOnce();
+      expect(await f.reader.read("fixture")).toMatchObject({ state: "limited" });
+      expect((await f.reader.details("fixture")).tokensUsed).toBe(20);
+    }
     finally { await f.close(); }
   });
   it("네이티브 편집의 예산 변경이나 사용량 초기화를 성공으로 보고하지 않는다", async () => {
@@ -148,13 +155,16 @@ describe("Codex goal reader", () => {
       expect(after.tokenBudget).toBe(before.tokenBudget); expect(after.tokensUsed).toBe(before.tokensUsed); expect(f.send).toHaveBeenCalledOnce();
     } finally { await f.close(); }
   });
-  it("다른 목표로 바뀌었거나 사용량이 소진되면 재개하지 않는다", async () => {
+  it("다른 목표로 바뀌면 거부하지만 명시적인 재개를 사용량으로 막지 않는다", async () => {
     const f = await editFixture();
     try {
       const before = await f.reader.details("fixture"); await f.change({ objective: "Replacement" });
       await expect(f.reader.control("fixture", before.revision, "resume", () => {}, f.send)).rejects.toThrow(/changed/);
+      expect(f.send).not.toHaveBeenCalled();
       await f.change({ tokensUsed: 20 }); const latest = await f.reader.details("fixture");
-      await expect(f.reader.control("fixture", latest.revision, "resume", () => {}, f.send)).rejects.toThrow(/budget/); expect(f.send).not.toHaveBeenCalled();
+      f.send.mockImplementationOnce(async () => f.change({ status: "active" }));
+      expect(await f.reader.control("fixture", latest.revision, "resume", () => {}, f.send)).toMatchObject({ state: "active" });
+      expect(f.send).toHaveBeenCalledOnce(); expect((await f.reader.details("fixture")).tokensUsed).toBe(20);
     } finally { await f.close(); }
   });
   it("일시정지 중 예산 초기화와 목표 교체를 성공으로 보고하지 않는다", async () => {

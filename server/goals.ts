@@ -44,7 +44,7 @@ function result(value: unknown, depth = 0): Record<string, unknown> | null {
   }
   return null;
 }
-function goalSnapshot(items: readonly GoalItem[]): GoalDetails {
+function goalSnapshot(items: readonly GoalItem[], checkUsage = true): GoalDetails {
   let reading: GoalReading = { state: "unknown", key: null, evidence: false };
   let identity: Record<string, unknown> = {};
   let tokenBudget: number | null = null, tokensUsed: number | null = null;
@@ -55,7 +55,7 @@ function goalSnapshot(items: readonly GoalItem[]): GoalDetails {
     if (reset) { tokenBudget = null; tokensUsed = null; }
     if (typeof budget === "number" && Number.isFinite(budget) && budget >= 0) tokenBudget = budget;
     if (typeof used === "number" && Number.isFinite(used) && used >= 0) tokensUsed = used;
-    if (state === "active" && tokenBudget !== null && tokenBudget > 0 && tokensUsed !== null && tokensUsed >= tokenBudget) state = "limited";
+    if (checkUsage && state === "active" && tokenBudget !== null && tokenBudget > 0 && tokensUsed !== null && tokensUsed >= tokenBudget) state = "limited";
     const next: Record<string, unknown> = reset ? {} : { ...identity };
     for (const key of ["id", "objective", "createdAt", "created_at"]) {
       const value = data[key] ?? fallback[key];
@@ -110,7 +110,7 @@ function goalSnapshot(items: readonly GoalItem[]): GoalDetails {
   const objective = !["unknown", "cleared"].includes(reading.state) && typeof identity.objective === "string" && identity.objective.trim() ? identity.objective : null;
   return { reading, objective, tokenBudget, tokensUsed, revision: createHash("sha256").update(JSON.stringify({ identity, state: reading.state, tokenBudget })).digest("hex") };
 }
-export function readGoal(items: readonly GoalItem[]): GoalReading { return goalSnapshot(items).reading; }
+export function readGoal(items: readonly GoalItem[], options?: { checkUsage?: boolean }): GoalReading { return goalSnapshot(items, options?.checkUsage).reading; }
 export function readGoalDetails(items: readonly GoalItem[]): GoalDetails {
   const details = goalSnapshot(items);
   return { ...details, reading: { ...details.reading, source: "timeline" } };

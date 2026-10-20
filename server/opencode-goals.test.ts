@@ -31,6 +31,13 @@ describe("OpenCode native goal state", () => {
   it("일시 중지된 목표도 네이티브 예산이 소진됐으면 편집으로 재개하지 않는다", () => {
     expect(readOpenCodeGoal(snapshot([{ ...goal, stopped: true, stopReason: "paused", totalTokens: 1000 }]), sessionId, 2000).state).toBe("limited");
   });
+  it("수동 제어의 상태는 토큰·시간 계산 대신 네이티브 stopped 값을 따른다", () => {
+    const native = { ...goal, totalTokens: 934916, startedAt: 0, options: { ...goal.options, maxTokens: 200000 } }, data = snapshot([native]);
+    expect(readOpenCodeGoal(data, sessionId, 120000).state).toBe("limited");
+    expect(openCodeGoalDetails(data, sessionId, 120000).reading.state).toBe("active");
+    const stopped = snapshot([{ ...native, stopped: true, stopReason: "provider error" }]);
+    expect(openCodeGoalDetails(stopped, sessionId, 120000).reading.state).toBe("paused");
+  });
   it("사용량 증가에는 편집을 유지하고 ID, 예산, 실행 창이나 상태 변경에는 만료시킨다", () => {
     const original = { ...goal, goalId: "owned-goal", runId: "original-run" };
     const before = openCodeGoalDetails(snapshot([original]), sessionId, 2000);
@@ -147,13 +154,25 @@ describe("read-only OpenCode goal snapshots", () => {
     expect(await reader.edit(agent, before.revision, "Edited fixture", () => {}, send)).toMatchObject({ state: "active", source: "opencode" });
     expect(send).toHaveBeenCalledOnce(); expect((await reader.details(agent))?.tokenBudget).toBe(1000);
   });
-  it("오래된 편집, 한도 소진, 다른 모드에서는 전송하지 않는다", async () => {
+  it("오래된 편집과 다른 모드는 거부하되 사용량으로 수동 편집을 막지 않는다", async () => {
     const before = (await reader.details(agent))!, native = JSON.parse(await readFile(path, "utf8")), send = vi.fn(async () => {});
     await expect(reader.edit(agent, "stale", "Edited fixture", () => {}, send)).rejects.toThrow(/changed/);
     native.goals[0].totalTokens = 1000; await writeFile(path, JSON.stringify(native));
-    await expect(reader.edit(agent, (await reader.details(agent))!.revision, "Edited fixture", () => {}, send)).rejects.toThrow(/limits/);
     await expect(reader.edit({ ...agent, currentModeId: "build" }, before.revision, "Edited fixture", () => {}, send)).rejects.toThrow(/changed/);
     expect(send).not.toHaveBeenCalled();
+    send.mockImplementationOnce(async () => {
+      native.goals[0] = { ...native.goals[0], condition: "Edited fixture", stopped: true, stopReason: "max context tokens reached (1000)" };
+      await writeFile(path, JSON.stringify(native));
+    });
+    expect(await reader.edit(agent, (await reader.details(agent))!.revision, "Edited fixture", () => {}, send)).toMatchObject({ state: "limited" });
+    expect(send).toHaveBeenCalledOnce(); expect((await reader.details(agent))!.tokensUsed).toBe(1000);
+  });
+  it("한도 때문에 멈춘 네이티브 목표도 명시적인 resume에 전달한다", async () => {
+    const native = JSON.parse(await readFile(path, "utf8"));
+    native.goals[0] = { ...native.goals[0], totalTokens: 1000, stopReason: "max context tokens reached (1000)" };
+    await writeFile(path, JSON.stringify(native)); const before = (await reader.details(agent))!;
+    const send = vi.fn(async () => { native.goals[0] = { ...native.goals[0], stopped: false, stopReason: "", totalTokens: 0, turnCount: 0, startedAt: Date.now() }; await writeFile(path, JSON.stringify(native)); });
+    expect(await reader.control(agent, before.revision, "resume", () => {}, send)).toMatchObject({ state: "active" }); expect(send).toHaveBeenCalledOnce();
   });
   it.each(["goalId", "startedAt", "options", "totalTokens", "turnCount"])("네이티브 편집의 %s 초기화나 교체를 성공으로 보고하지 않는다", async (field) => {
     const before = (await reader.details(agent))!, native = JSON.parse(await readFile(path, "utf8"));

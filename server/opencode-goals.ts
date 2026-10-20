@@ -21,12 +21,19 @@ function focusedGoal(data: Record<string, unknown>, sessionId: string): Record<s
 }
 export function openCodeGoalDetails(value: unknown, sessionId: string, now = Date.now()): GoalDetails {
   const data = object(value), reading = readOpenCodeGoal(value, sessionId, now), goal = focusedGoal(data, sessionId);
+  // Native commands own their limits. For explicit controls, report their
+  // actual stopped state without inferring a stop from counters or elapsed time.
+  if (goal && reading.state !== "unknown") reading.state = nativeGoalState(goal);
   const record = goal ?? (Array.isArray(data.results) ? data.results.map(object).filter((g) => g.sessionID === sessionId).at(-1) : undefined);
   const objective = reading.state !== "unknown" && typeof record?.condition === "string" ? record.condition : null;
   const count = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null;
   return { reading, objective, tokenBudget: count(object(record?.options).maxTokens), tokensUsed: count(record?.totalTokens),
     revision: createHash("sha256").update(JSON.stringify({ sessionId, goalId: record?.goalId ?? null, runId: record?.runId ?? null,
       objective, state: reading.state, stopped: record?.stopped, stopReason: record?.stopReason, startedAt: record?.startedAt, options: record?.options })).digest("hex") };
+}
+function nativeGoalState(goal: Record<string, unknown>): GoalReading["state"] {
+  return !goal.stopped ? "active" : goal.stopReason === "blocked" ? "blocked"
+    : /^max (?:turns|(?:context )?tokens|duration) reached\b/.test(String(goal.stopReason)) ? "limited" : "paused";
 }
 
 // OpenCode modes are agents, including custom agents named "goal". Require the
@@ -72,7 +79,7 @@ export function readOpenCodeGoal(value: unknown, sessionId: string, now = Date.n
   const limit = typeof options.maxTurns === "number" && options.maxTurns > 0 && typeof goal.turnCount === "number" && goal.turnCount >= options.maxTurns
     || typeof options.maxTokens === "number" && options.maxTokens > 0 && typeof goal.totalTokens === "number" && goal.totalTokens >= options.maxTokens
     || typeof options.maxDurationMs === "number" && options.maxDurationMs > 0 && typeof goal.startedAt === "number" && now - goal.startedAt >= options.maxDurationMs;
-  const state = limit ? "limited" : goal.stopped ? goal.stopReason === "blocked" ? "blocked" : /^max (?:turns|(?:context )?tokens|duration) reached\b/.test(goal.stopReason) ? "limited" : "paused" : "active";
+  const state = limit ? "limited" : nativeGoalState(goal);
   return { state, key, evidence: true, source: "opencode",
     ...(state === "active" && (goal.continuationClaim != null || options.noContinueWhileChildrenActive === true) ? { nativeContinuation: true } : {}) };
 }
@@ -80,13 +87,13 @@ export function readOpenCodeGoal(value: unknown, sessionId: string, now = Date.n
 export class OpenCodeGoals {
   constructor(private readonly home: string) {}
   async read(agent: PaseoAgent): Promise<GoalReading | null> {
-    return (await this.load(agent))?.details.reading ?? null;
+    return (await this.load(agent))?.reading ?? null;
   }
   async details(agent: PaseoAgent): Promise<GoalDetails | null> { return (await this.load(agent))?.details ?? null; }
   async control(agent: PaseoAgent, revision: string, action: GoalAction, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
     const before = await this.load(agent); check();
     if (!before?.record || typeof before.record.goalId !== "string" || !before.record.goalId || before.details.revision !== revision || !before.details.reading.key || !before.details.objective ||
-      !(action === "pause" ? before.details.reading.state === "active" : ["paused", "blocked"].includes(before.details.reading.state))) throw new Error("The OpenCode goal changed. Reload before trying again.");
+      !(action === "pause" ? before.details.reading.state === "active" : ["paused", "blocked", "limited"].includes(before.details.reading.state))) throw new Error("The OpenCode goal changed. Reload before trying again.");
     await send(); check();
     for (let n = 0; n < 20; n++) {
       const after = await this.load(agent); check();
@@ -108,7 +115,7 @@ export class OpenCodeGoals {
     const before = await this.load(agent); check();
     if (!before || before.details.revision !== revision) throw new Error("The OpenCode goal changed. Reload the editor before saving.");
     const { details, record } = before;
-    if (!record || typeof record.goalId !== "string" || !record.goalId || !details.objective || !["active", "paused", "blocked"].includes(details.reading.state)) throw new Error("This OpenCode goal cannot be edited in its current state. Review its native limits.");
+    if (!record || typeof record.goalId !== "string" || !record.goalId || !details.objective || !["active", "paused", "blocked", "limited"].includes(details.reading.state)) throw new Error("This OpenCode goal cannot be edited in its current state. Review its native state.");
     const text = objective.trim(); if (text === details.objective.trim()) return details.reading;
     await send(); check();
     for (let n = 0; n < 20; n++) {
@@ -117,14 +124,14 @@ export class OpenCodeGoals {
         if (after.record.goalId !== record.goalId || after.record.startedAt !== record.startedAt || JSON.stringify(after.record.options) !== JSON.stringify(record.options)
           || typeof after.record.turnCount !== "number" || after.record.turnCount < (record.turnCount as number)
           || typeof after.record.totalTokens !== "number" || after.record.totalTokens < (record.totalTokens as number)) throw new Error("OpenCode's goal identity or budget changed. Check the conversation before editing again.");
-        if (after.details.reading.state === "active") return after.details.reading;
+        if (["active", "paused", "blocked", "limited"].includes(after.details.reading.state)) return after.details.reading;
       }
       if (after && after.details.revision !== revision && after.details.objective?.trim() !== text) break;
       await new Promise((resolve) => setTimeout(resolve, 250)); check();
     }
     throw new Error("OpenCode has not confirmed the edited goal. Check the conversation and reload before trying again.");
   }
-  private async load(agent: PaseoAgent): Promise<{ details: GoalDetails; record?: Record<string, unknown> } | null> {
+  private async load(agent: PaseoAgent): Promise<{ details: GoalDetails; reading: GoalReading; record?: Record<string, unknown> } | null> {
     let config: unknown = {};
     try { config = JSON.parse(await readFile(join(this.home, "config.json"), "utf8")); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -135,7 +142,7 @@ export class OpenCodeGoals {
     // A live conflicting registration or explicit non-Goal mode still wins.
     const recordedMode = agent.currentModeId === undefined ? agent.runtimeInfo?.modeId : agent.currentModeId;
     const modeId = openCodeGoalMode(agent) ?? (!agent.availableModes?.length && recordedMode === "goal" ? "goal" : null);
-    const empty = (reading: GoalReading) => ({ details: { reading, objective: null, revision: "", tokenBudget: null, tokensUsed: null } });
+    const empty = (reading: GoalReading) => ({ reading, details: { reading, objective: null, revision: "", tokenBudget: null, tokensUsed: null } });
     if (!modeId) return empty(cleared);
     const sessionId = agent.persistence?.sessionId;
     if (!sessionId || !agent.cwd) return empty(unknown);
@@ -148,7 +155,7 @@ export class OpenCodeGoals {
       const state = await this.snapshot(shard);
       const details = openCodeGoalDetails(state, sessionId);
       details.reading = { ...details.reading, modeId };
-      return { details, record: focusedGoal(object(state), sessionId) };
+      return { details, reading: { ...readOpenCodeGoal(state, sessionId), modeId }, record: focusedGoal(object(state), sessionId) };
     } catch { return empty(unknown); }
   }
   private async snapshot(path: string): Promise<unknown> {

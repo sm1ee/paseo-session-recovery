@@ -77,6 +77,7 @@ export const goalControlSchema = z.object({
   note: z.string().nullable(), holdReason: reasonSchema.nullable().optional(),
   objective: z.string().nullable().optional(), source: z.enum(["codex", "opencode", "claude", "timeline"]).nullable().optional(),
   nativeAction: z.enum(["pause", "resume"]).nullable().optional(),
+  nativeActionReady: z.boolean().optional(),
 });
 export type GoalControl = z.infer<typeof goalControlSchema>;
 export const goalControlRpc = defineRpc({ name: "recovery.goal.control", input: z.object({ id: z.string().min(1), fresh: z.boolean().default(false), inspect: z.boolean().default(false), preview: z.boolean().default(false) }), output: goalControlSchema });
