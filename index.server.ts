@@ -1,6 +1,6 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { RecoveryService } from "./server/service";
-import { dismissRpc, excludeRpc, preferences, prepareRpc, resumeRpc, scanRpc, statusRpc, watchGoalRpc } from "./shared/contracts";
+import { dismissRpc, excludeRpc, preferences, prepareRpc, resumeRpc, scanRpc, statusRpc, watchGoalRpc, unwatchGoalRpc } from "./shared/contracts";
 
 export default function contribute(server: PluginServerContext) {
   const settings = server.registerSettings(preferences);
@@ -17,7 +17,8 @@ export default function contribute(server: PluginServerContext) {
   server.on("agent.archived", (e) => service.observe({ kind: "archived", agent: e.agent }));
   server.handle(statusRpc, (input) => service.status(input));
   server.handle(scanRpc, () => service.requestScan());
-  server.handle(watchGoalRpc, ({ id }) => service.watchGoal(id));
+  server.handle(watchGoalRpc, ({ id, key, resetAttempts }) => service.watchGoal(id, key, resetAttempts));
+  server.handle(unwatchGoalRpc, ({ id }) => service.unwatchGoal(id));
   server.handle(excludeRpc, ({ id, excluded }) => service.exclude(id, excluded));
   server.handle(dismissRpc, ({ id }) => service.dismiss(id));
   server.handle(prepareRpc, ({ id }) => service.prepare(id));

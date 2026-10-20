@@ -21,7 +21,7 @@ function Draft({ values, save, busy, theme }: { values: Preferences; save: (v: P
         <SettingsInput label="Maximum automatic attempts" hint="1 to 10 per interruption. The count survives daemon restarts." initialValue={attempts} onChangeText={setAttempts} disabled={busy} />
         <SettingsInput label="Recovery window (hours)" hint="0.25 to 168. Older interruptions require review." initialValue={window} onChangeText={setWindow} disabled={busy} />
         <SettingsInput label="Goal continuation delay (seconds)" hint="30 to 900 after a completed turn. Allows the provider's own goal loop to start first." initialValue={goalDelay} onChangeText={setGoalDelay} disabled={busy} />
-        <SettingsInput label="Maximum continuations per goal" hint="1 to 100. The count survives restarts and resets for a new goal or an explicit Watch goal again action." initialValue={goalAttempts} onChangeText={setGoalAttempts} disabled={busy} />
+        <SettingsInput label="Maximum continuations per goal" hint="1 to 100. The count survives restarts and toggling. Reset it explicitly with Reset continuation count." initialValue={goalAttempts} onChangeText={setGoalAttempts} disabled={busy} />
       </SettingsCard>
     </SettingsSection>
     <SettingsSection title="Continuation message">
@@ -52,14 +52,15 @@ export function RecoverySettings({ theme }: PluginSurfaceProps) {
         <SettingsSwitch label="Automatic recovery" hint="Continue interrupted work after this daemon restarts. Turning this off keeps monitoring and manual review available." value={values.enabled} disabled={settings.saving} onValueChange={(enabled) => save({ ...values, enabled })} />
         <SettingsSwitch label="Automatically recover subagents" hint="Off by default. Every parent must be idle, available, and free of pending approvals. Provider-internal subagents are not managed here." value={values.recoverSubagents} disabled={settings.saving} onValueChange={(recoverSubagents) => save({ ...values, recoverSubagents })} />
         <SettingsSwitch label="Retry temporary provider errors" hint="Off by default. Only recognized connection and service error codes qualify; other errors require review." value={values.retryTransientErrors} disabled={settings.saving} onValueChange={(retryTransientErrors) => save({ ...values, retryTransientErrors })} />
-        <SettingsSwitch label="Continue active goals" hint="Read goal tool results in observed conversations. Continue an idle session when its goal is still active. Paused, blocked, completed, and limited goals are left for review. Off by default." value={values.continueGoals} disabled={settings.saving} onValueChange={(continueGoals) => save({ ...values, continueGoals })} />
+        <SettingsSwitch label="Continue selected goals" hint="Use the toggle on each session to choose its current goal. This switch allows those selections to run; it does not select every goal. Off by default." value={values.continueGoals} disabled={settings.saving} onValueChange={(continueGoals) => save({ ...values, continueGoals })} />
       </SettingsCard>
       {settings.saveError && <Text accessibilityRole="alert" style={{ color: theme.colors.statusDanger }}>Could not save settings. Reload and try again.</Text>}
     </SettingsSection>
     <Draft key={settings.revision} values={values} save={save} busy={settings.saving} theme={theme} />
     <SettingsSection title="When recovery pauses">
-      <Text style={{ color: theme.colors.foregroundMuted }}>Direct stops, questions, approvals, and uncertain delivery require your attention. Completed turns continue only when goal continuation is enabled and the conversation still records an active goal. A completed goal is not restarted.</Text>
-      <Text style={{ color: theme.colors.foregroundMuted }}>Goal detection supports structured create_goal, get_goal, update_goal, and OMP goal results, plus acknowledged /goal commands. Plain text plans and to-do lists do not count. Conversations are inspected in memory; only a goal fingerprint, status, and continuation count are saved. Use Watch this session's goal in the Command Center to include an existing idle session.</Text>
+      <Text style={{ color: theme.colors.foregroundMuted }}>Only selected goals continue after a completed turn. A different objective clears the selection. Turning off a session's goal toggle cancels that goal's pending continuation and leaves interruption recovery available. Existing goals are not selected during an upgrade.</Text>
+      <Text style={{ color: theme.colors.foregroundMuted }}>Direct stops, questions, approvals, and uncertain delivery require your attention. Paused, blocked, completed, and limited goals do not continue automatically. A completed goal is not restarted.</Text>
+      <Text style={{ color: theme.colors.foregroundMuted }}>Codex uses its goal lookup API. OMP and compatible goal tools expose structured results in the conversation. Plain text plans and to-do lists do not count. Only goal fingerprints, selection, state, and continuation counts are saved. Use Continue this session's goal in the Command Center to select an existing session.</Text>
       <Text style={{ color: theme.colors.foregroundMuted }}>Pending recovery protects sessions from the paired session-janitor plugin. Dismiss or exclude a candidate to release that protection. Other cleanup tools do not read these protections.</Text>
     </SettingsSection>
   </View>;

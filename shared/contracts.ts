@@ -25,7 +25,7 @@ export const reasonSchema = z.enum([
   "active", "input", "daemon_restart", "shutdown", "runtime_closed", "monitor_gap", "unknown_end", "transient_error", "provider_error",
   "attempt_limit", "too_old", "subagent", "parent_unavailable", "workspace_unavailable", "no_history", "unknown_state", "new_activity", "finished",
   "user_stop", "archived", "missing", "excluded", "disabled", "uncertain_send", "sent", "dismissed",
-  "goal_check", "goal_active", "goal_paused", "goal_blocked", "goal_limited", "goal_complete", "goal_cleared", "goal_unknown", "goal_limit", "goal_disabled",
+  "goal_check", "goal_active", "goal_paused", "goal_blocked", "goal_limited", "goal_complete", "goal_cleared", "goal_unknown", "goal_limit", "goal_disabled", "goal_unselected",
 ]);
 export type Phase = z.infer<typeof phaseSchema>;
 export type Reason = z.infer<typeof reasonSchema>;
@@ -46,6 +46,7 @@ export const reasonText: Record<Reason, string> = {
   goal_limited: "The goal reached a token or usage limit", goal_complete: "The goal was marked complete",
   goal_cleared: "The goal was cleared or dropped", goal_unknown: "The current goal state could not be verified",
   goal_limit: "The goal continuation limit was reached", goal_disabled: "Automatic goal continuation is off",
+  goal_unselected: "This goal is not selected for automatic continuation",
 };
 export const auditSchema = z.object({ at: z.number(), id: z.string(), action: z.enum(["scheduled", "resume", "review", "completed", "stopped", "dismissed", "excluded"]), reason: reasonSchema, attempt: z.number().int() });
 export const rowSchema = z.object({
@@ -53,19 +54,22 @@ export const rowSchema = z.object({
   phase: phaseSchema, reason: reasonSchema, dueAt: z.number().nullable(), lastSeenAt: z.number(), attempts: z.number(), excluded: z.boolean(), canResume: z.boolean(),
   goalState: z.enum(["active", "paused", "blocked", "limited", "complete", "cleared", "unknown"]).nullable().default(null),
   goalAttempts: z.number().int().nonnegative().default(0),
+  goalKey: z.string().nullable().default(null), goalSelected: z.boolean().default(false),
 });
 export type RecoveryRow = z.infer<typeof rowSchema>;
 export const statusInput = z.object({ query: z.string().max(200).default(""), view: z.enum(["queue", "watching", "goals", "history", "excluded"]).default("queue"), page: z.number().int().min(0).max(1000).default(0) });
 export const statusSchema = z.object({
   state: z.enum(["starting", "running", "paused", "error"]), error: z.string().nullable(), scanning: z.boolean(), lastScanAt: z.number().nullable(),
-  counts: z.object({ watching: z.number(), scheduled: z.number(), review: z.number(), resumed: z.number(), excluded: z.number() }),
+  counts: z.object({ watching: z.number(), scheduled: z.number(), review: z.number(), resumed: z.number(), excluded: z.number(), selectedGoals: z.number().default(0) }),
+  goalContinuationEnabled: z.boolean().default(false),
   rows: z.array(rowSchema), total: z.number(), page: z.number(), history: z.array(auditSchema),
 });
 export type RecoveryStatus = z.infer<typeof statusSchema>;
 export const statusRpc = defineRpc({ name: "recovery.status", input: statusInput, output: statusSchema });
 const ok = z.object({ ok: z.literal(true) });
 export const scanRpc = defineRpc({ name: "recovery.scan", input: z.object({}), output: ok });
-export const watchGoalRpc = defineRpc({ name: "recovery.goal.watch", input: z.object({ id: z.string().min(1) }), output: ok });
+export const watchGoalRpc = defineRpc({ name: "recovery.goal.watch", input: z.object({ id: z.string().min(1), key: z.string().min(1).optional(), resetAttempts: z.boolean().default(false) }), output: ok });
+export const unwatchGoalRpc = defineRpc({ name: "recovery.goal.unwatch", input: z.object({ id: z.string().min(1) }), output: ok });
 export const excludeRpc = defineRpc({ name: "recovery.exclude", input: z.object({ id: z.string().min(1), excluded: z.boolean() }), output: ok });
 export const dismissRpc = defineRpc({ name: "recovery.dismiss", input: z.object({ id: z.string().min(1) }), output: ok });
 export const prepareRpc = defineRpc({ name: "recovery.prepare", input: z.object({ id: z.string().min(1) }), output: z.object({ token: z.string(), title: z.string(), prompt: z.string(), expiresAt: z.number() }) });

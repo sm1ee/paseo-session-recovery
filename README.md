@@ -1,6 +1,6 @@
 # session-recovery
 
-Recover interrupted Paseo sessions after a daemon restart. Optionally continue a session when its turn ends but its goal is still active. Existing idle sessions are only included when you choose to watch their goal.
+Recover interrupted Paseo sessions after a daemon restart. Use a toggle on each session to continue its current goal after a turn ends. Only goals you select are continued; new objectives need a new selection.
 
 ![Recovery and goal settings](assets/goal-settings.png)
 
@@ -14,7 +14,7 @@ Recover interrupted Paseo sessions after a daemon restart. Optionally continue a
 | Recovery window | 24 hours since last observation |
 | Automatic subagent recovery | Off |
 | Temporary provider error retries | Off |
-| Goal continuation | Off |
+| Goal continuation | Off; each session also needs an explicit selection |
 | Goal continuation delay | 60 seconds |
 | Maximum goal continuations | 10 per objective |
 
@@ -30,13 +30,17 @@ Open **session-recovery** in the sidebar. Settings are in the upper-right corner
 - **History:** completed, stopped, and dismissed records.
 - **Excluded:** sessions excluded from recovery.
 
+**Continue this session's goal** selects the current objective with a toggle on each session card. Turn it off to cancel that goal's pending continuation while keeping interruption recovery available.
+
 **Resume…** previews the continuation message and rechecks the session before sending it. **Dismiss** ends a pending recovery and releases its cleanup protection. **Exclude recovery** also excludes future turns until you allow them again. Command Center has per-session exclusion and inclusion actions.
 
 Turning automatic recovery off leaves monitoring and manual review available. Settings are shared by clients connected to the same daemon.
 
 ## Goal continuation
 
-Enable **Continue active goals** in settings. After a normal turn ends, the plugin checks the goal, waits for the configured delay, then checks again before sending a continuation. If the provider has already started its own next turn, the plugin leaves that turn running.
+Enable **Continue selected goals** in settings, then turn on **Continue this session's goal** for the sessions you want. The settings switch is a master control; turning it on does not select any goals. You can also select an existing session from the Command Center.
+
+After a normal turn ends, the plugin checks the goal, waits for the configured delay, then checks again before sending a continuation. If the provider has already started its own next turn, the plugin leaves that turn running.
 
 Codex goals are read through the official `thread/goal/get` API. A local subprocess uses the configured Codex command and environment. It receives only initialization and goal lookup requests; it never loads or resumes a thread. Codex must support the goals feature and this API. An unavailable or unrecognized response requires review.
 
@@ -44,11 +48,13 @@ For OMP, the plugin reads structured `goal` tool results and Paseo's `omp_goal_u
 
 Paused, blocked, completed, cleared, and limited goals are not automatically resumed. Questions, approvals, direct stops, exclusions, and uncertain delivery also block continuation. The continuation message asks the agent to verify its work before marking the goal complete. The plugin cannot independently prove that a provider's completed goal was actually achieved.
 
-The per-objective limit survives turns and daemon restarts. A different objective gets a new count. Recreating the same objective retains its count; **Watch goal again** explicitly resets it. Use **Watch this session's goal** in the Command Center to include an existing session. No provider settings are changed.
+Selection is tied to the current objective in that session. A different objective, completion, or clearing the goal removes the selection. Existing goals from earlier plugin versions start unselected. An unselected goal does not create a cleanup hold just because it remains active.
+
+The per-objective limit survives turns, daemon restarts, and cycling the toggle. A different objective gets a new count. Recreating the same objective retains its count; **Reset continuation count** at the limit explicitly resets it. Turning a session toggle off cancels pending goal continuation, and leaves active turns, uncertain delivery, approvals, and ordinary interruption recovery intact. No provider settings are changed.
 
 ## Recovery rules
 
-Explicit stops and completed goals are never automatically resumed. A completed turn is only continued when goal continuation is enabled and its goal is still active. Pending questions and approvals require user input. Archived or missing sessions, unavailable history, and unavailable workspaces are excluded. Subagent recovery checks every parent; an active, archived, missing, or excluded parent blocks it. Provider-internal subagents are outside this plugin's scope.
+Explicit stops and completed goals are never automatically resumed. A completed turn is only continued when goal continuation is enabled, the current goal is selected, and that goal is still active. Pending questions and approvals require user input. Archived or missing sessions, unavailable history, and unavailable workspaces are excluded. Subagent recovery checks every parent; an active, archived, missing, or excluded parent blocks it. Provider-internal subagents are outside this plugin's scope.
 
 Unknown interruptions go to review. Temporary provider errors are retried only when enabled and when their code is recognized. Uncertain delivery is not automatically retried, even after another restart. Open the conversation to check the result.
 
@@ -76,13 +82,13 @@ paseo plugin install /absolute/path/to/paseo-session-recovery
 
 Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed.
 
-For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.2.0`. The public registry listing requires a separate review.
+For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.3.0`. The public registry listing requires a separate review.
 
 ## Local data
 
-Session IDs, titles, providers, turn IDs, timestamps, attempt counts, exclusions, goal fingerprints and states, and recent outcomes stay under `plugin-data/session-recovery/` in the daemon's Paseo home. `state.json` is the journal, `holds.json` is the cleanup protection list, and `worker.lock` prevents duplicate monitors. Files use owner-only permissions. Journal writes use sync and atomic rename.
+Session IDs, titles, providers, turn IDs, timestamps, attempt counts, exclusions, goal fingerprints, selections and states, and recent outcomes stay under `plugin-data/session-recovery/` in the daemon's Paseo home. `state.json` is the journal, `holds.json` is the cleanup protection list, and `worker.lock` prevents duplicate monitors. Files use owner-only permissions. Journal writes use sync and atomic rename.
 
-With goal continuation enabled or an explicit Watch goal action, conversation records are inspected in memory. Conversation bodies, goal objectives, raw provider errors, API tokens, and credentials are not stored in the journal. The local credential is read in memory to authenticate to the owning daemon's loopback listener or Unix socket. Continuations go through the session's existing provider. No separate model or external review service is used.
+With goal continuation enabled or an explicit goal selection, conversation records are inspected in memory. Conversation bodies, goal objectives, raw provider errors, API tokens, and credentials are not stored in the journal. The local credential is read in memory to authenticate to the owning daemon's loopback listener or Unix socket. Continuations go through the session's existing provider. No separate model or external review service is used.
 
 The startup connection uses a version-pinned adapter because Paseo does not provide an SDK context at plugin entry startup. Stable 0.11.4 through 0.12.x are supported. On 0.12, workspace lookups include background workspaces. Unknown versions and prereleases pause recovery until compatibility has been checked.
 

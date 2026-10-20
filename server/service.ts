@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { GOAL_PROMPT, preferences, statusInput, type Preferences, type Reason, type RecoveryRow, type RecoveryStatus, type ResumePreview } from "../shared/contracts";
-import { automaticBlock, backoff, busy, emptyState, fingerprint, isGoalContinuation, isTransient, OPEN_PHASES, snapshotBlock, time, type Agent, type RecordEntry, type SavedState } from "../shared/model";
+import { automaticBlock, backoff, busy, emptyState, fingerprint, isGoalContinuation, isSelectedGoal, isTransient, OPEN_PHASES, snapshotBlock, time, type Agent, type RecordEntry, type SavedState } from "../shared/model";
 import { openLocalHost, type RecoveryHost } from "./host";
 import { RecoveryError } from "./store";
 
@@ -73,6 +73,12 @@ export class RecoveryService {
         }
       }
       saved.lastBoot = host.bootKey;
+      // Older journals contain no explicit selection. Never opt them in during an upgrade.
+      for (const r of Object.values(saved.records)) {
+        if (r.goal && !r.goal.selectedKey && r.reason.startsWith("goal_") && ["scheduled", "review"].includes(r.phase) && !r.humanRequired && !r.expectingStart) {
+          this.set(r, "completed", "goal_unselected");
+        }
+      }
       await this.persist(); return host;
     } catch (e) { this.host = null; await host.close(); throw e; }
   }
@@ -86,9 +92,9 @@ export class RecoveryService {
       const enablingGoals = !this.settings.continueGoals && settings.continueGoals;
       this.settings = settings;
       this.validSettings = true;
-      if (enabling) for (const r of Object.values(this.saved.records)) if (r.phase === "scheduled") r.dueAt = this.now() + backoff(settings, r.attempts);
+      if (enabling) for (const r of Object.values(this.saved.records)) if (r.phase === "scheduled") r.dueAt = this.now() + (r.reason === "goal_active" ? settings.goalDelaySeconds * 1000 : backoff(settings, r.attempts));
       for (const r of Object.values(this.saved.records)) {
-        if (r.goal?.state === "active" && (enablingGoals && r.reason === "goal_disabled" || settings.continueGoals && r.reason === "goal_limit" && r.goal.attempts < settings.goalMaxAttempts)) this.set(r, "review", "goal_check");
+        if (isSelectedGoal(r) && r.goal?.state === "active" && (enablingGoals && r.reason === "goal_disabled" || settings.continueGoals && r.reason === "goal_limit" && r.goal.attempts < settings.goalMaxAttempts)) this.set(r, "review", "goal_check");
       }
       try { await this.scan(generation); } finally { this.scheduleTimer(); }
     });
@@ -142,8 +148,8 @@ export class RecoveryService {
           r.expectingStart = false;
           if (event.outcome.kind === "completed") {
             r.lastSeenAt = at;
-            if (this.settings.continueGoals && r.humanRequired) this.review(r, "input");
-            else if (this.settings.continueGoals) this.set(r, "review", "goal_check");
+            if ((this.settings.continueGoals || r.goal?.selectedKey) && r.humanRequired) this.review(r, "input");
+            else if (this.settings.continueGoals || r.goal?.selectedKey) this.set(r, "review", "goal_check");
             else { this.set(r, "completed", "finished"); this.audit(r, "completed"); }
           }
           else if (event.outcome.kind === "canceled") {
@@ -179,15 +185,21 @@ export class RecoveryService {
     if (!reading.evidence && !r.goal) { this.set(r, "completed", "finished"); this.audit(r, "completed"); return; }
     const previous = r.goal;
     const state = reading.state === "active" && !reading.key ? "unknown" : reading.state;
-    r.goal = { key: reading.key, state, attempts: previous?.key === reading.key ? previous?.attempts ?? 0 : 0 };
+    const selectedKey = state === "complete" || state === "cleared" ? null : previous?.selectedKey && (!reading.key || previous.selectedKey === reading.key) ? previous.selectedKey : null;
+    r.goal = { key: reading.key ?? previous?.key ?? null, state, selectedKey, attempts: !reading.key || previous?.key === reading.key || previous?.selectedKey === reading.key ? previous?.attempts ?? 0 : 0 };
     if (state === "active") {
+      if (!isSelectedGoal(r)) { this.set(r, "completed", "goal_unselected"); this.audit(r, "completed"); return; }
       if (!this.settings.continueGoals) { this.review(r, "goal_disabled"); return; }
       if (r.phase !== "scheduled" || r.reason !== "goal_active" || previous?.key !== reading.key) {
         this.scheduled(r, "goal_active"); r.dueAt = this.now() + this.settings.goalDelaySeconds * 1000;
       }
     } else if (state === "complete") { this.set(r, "completed", "goal_complete"); this.audit(r, "completed"); }
     else if (state === "paused" || state === "cleared") { this.set(r, "stopped", state === "paused" ? "goal_paused" : "goal_cleared"); this.audit(r, "stopped"); }
-    else this.review(r, state === "blocked" ? "goal_blocked" : state === "limited" ? "goal_limited" : "goal_unknown");
+    else {
+      const reason = state === "blocked" ? "goal_blocked" : state === "limited" ? "goal_limited" : "goal_unknown";
+      if (selectedKey) this.review(r, reason);
+      else { this.set(r, "completed", reason); this.audit(r, "completed"); }
+    }
   }
   private async scan(generation: number): Promise<void> {
     this.scanning = true;
@@ -294,7 +306,7 @@ export class RecoveryService {
       return { ok: true };
     });
   }
-  watchGoal(id: string): Promise<{ ok: true }> {
+  watchGoal(id: string, expectedKey?: string, resetAttempts = false): Promise<{ ok: true }> {
     this.changes.set(id, (this.changes.get(id) ?? 0) + 1);
     return this.action(async () => {
       const host = await this.ready(); const a = await host.fetch(id);
@@ -304,17 +316,36 @@ export class RecoveryService {
       if (existing?.expectingStart || existing?.phase === "sending" || existing?.reason === "uncertain_send") throw new RecoveryError("A previous continuation has uncertain delivery. Check the conversation and dismiss that candidate before watching its goal again.");
       const reading = await host.goal?.(id);
       if (!reading?.evidence) throw new RecoveryError("No supported goal state was found in the recent conversation. Goal tools must expose their result in Paseo.");
+      if (reading.state !== "active" || !reading.key) throw new RecoveryError("Only a verified active goal can be selected. Open the session and check its current goal.");
+      if (expectedKey && expectedKey !== reading.key) throw new RecoveryError("The goal changed. Refresh and select the new goal if you want to continue it.");
       const previous = this.saved.records[id]; const at = this.now();
+      const goal = { key: reading.key, state: reading.state, selectedKey: reading.key, attempts: !resetAttempts && previous?.goal?.key === reading.key ? previous.goal.attempts : 0 };
+      // Selecting a goal must not replace an unresolved interruption or approval.
+      if (previous && OPEN_PHASES.has(previous.phase) && !previous.reason.startsWith("goal_") && !["watching", "waiting"].includes(previous.phase)) {
+        previous.goal = goal; previous.revision++; await this.persist(); return { ok: true };
+      }
       const r: RecordEntry = { id, title: a.title, provider: a.provider, workspaceId: a.workspaceId, parentId: a.parentId,
         turnId: a.activeTurn ?? null, bootKey: host.bootKey, startedAt: at, lastSeenAt: at, phase: "review", reason: "goal_check", dueAt: null,
         attempts: previous?.attempts ?? 0, humanRequired: previous?.humanRequired || a.pendingPermissions !== 0, pendingIds: previous?.pendingIds ?? [],
         messageAt: a.lastUserMessageAt, attemptMessageId: null, expectingStart: false, revision: (previous?.revision ?? 0) + 1,
-        goal: { key: reading.key, state: reading.state, attempts: 0 } };
+        goal };
       this.saved.records[id] = r;
       if (busy(a)) this.set(r, a.pendingPermissions > 0 ? "waiting" : "watching", a.pendingPermissions > 0 ? "input" : "active");
       else if (r.humanRequired) this.review(r, "input");
       else await this.inspectGoal(r, host);
       await this.persist(); return { ok: true };
+    });
+  }
+  unwatchGoal(id: string): Promise<{ ok: true }> {
+    this.changes.set(id, (this.changes.get(id) ?? 0) + 1);
+    return this.action(async () => {
+      await this.ready(); const r = this.saved.records[id];
+      if (r?.goal) {
+        r.goal.selectedKey = null; r.revision++;
+        if (r.reason.startsWith("goal_") && ["scheduled", "review"].includes(r.phase) && !r.humanRequired && !r.expectingStart) this.set(r, "completed", "goal_unselected");
+        await this.persist();
+      }
+      return { ok: true };
     });
   }
   prepare(id: string): Promise<ResumePreview> {
@@ -343,8 +374,8 @@ export class RecoveryService {
   status(input = statusInput.parse({})): RecoveryStatus {
     const rows: RecoveryRow[] = Object.values(this.saved.records).map((r) => ({ id: r.id, title: r.title, provider: r.provider, workspaceId: r.workspaceId, parentId: r.parentId,
       phase: r.phase, reason: this.saved.excluded.includes(r.id) ? "excluded" : !this.settings.enabled && r.phase === "scheduled" ? "disabled" : r.reason,
-      dueAt: r.phase === "scheduled" && this.settings.enabled ? r.dueAt : null, lastSeenAt: r.lastSeenAt, attempts: r.attempts, excluded: this.saved.excluded.includes(r.id), canResume: this.canResume(r), goalState: r.goal?.state ?? null, goalAttempts: r.goal?.attempts ?? 0 }));
-    for (const id of this.saved.excluded) if (!this.saved.records[id]) rows.push({ id, title: `Excluded session (${id.slice(0, 8)})`, provider: "", parentId: null, workspaceId: null, phase: "dismissed", reason: "excluded", dueAt: null, lastSeenAt: 0, attempts: 0, excluded: true, canResume: false, goalState: null, goalAttempts: 0 });
+      dueAt: r.phase === "scheduled" && this.settings.enabled ? r.dueAt : null, lastSeenAt: r.lastSeenAt, attempts: r.attempts, excluded: this.saved.excluded.includes(r.id), canResume: this.canResume(r), goalState: r.goal?.state ?? null, goalAttempts: r.goal?.attempts ?? 0, goalKey: r.goal?.key ?? null, goalSelected: !!r.goal?.selectedKey }));
+    for (const id of this.saved.excluded) if (!this.saved.records[id]) rows.push({ id, title: `Excluded session (${id.slice(0, 8)})`, provider: "", parentId: null, workspaceId: null, phase: "dismissed", reason: "excluded", dueAt: null, lastSeenAt: 0, attempts: 0, excluded: true, canResume: false, goalState: null, goalAttempts: 0, goalKey: null, goalSelected: false });
     const query = input.query.trim().toLowerCase();
     const filtered = rows.filter((r) => {
       if (input.view === "excluded" ? !r.excluded : r.excluded) return false;
@@ -356,7 +387,8 @@ export class RecoveryService {
     }).sort((a, b) => (a.dueAt ?? Infinity) - (b.dueAt ?? Infinity) || b.lastSeenAt - a.lastSeenAt);
     const page = Math.min(input.page, Math.max(0, Math.ceil(filtered.length / 30) - 1));
     return { state: this.error || this.fatal ? "error" : !this.host ? "starting" : this.settings.enabled ? "running" : "paused", error: this.error, scanning: this.scanning, lastScanAt: this.lastScanAt,
-      counts: { watching: rows.filter((r) => !r.excluded && ["watching", "waiting", "resumed"].includes(r.phase)).length, scheduled: rows.filter((r) => !r.excluded && r.phase === "scheduled").length, review: rows.filter((r) => !r.excluded && r.phase === "review").length, resumed: this.saved.history.filter((r) => r.action === "resume").length, excluded: this.saved.excluded.length },
+      counts: { watching: rows.filter((r) => !r.excluded && ["watching", "waiting", "resumed"].includes(r.phase)).length, scheduled: rows.filter((r) => !r.excluded && r.phase === "scheduled").length, review: rows.filter((r) => !r.excluded && r.phase === "review").length, resumed: this.saved.history.filter((r) => r.action === "resume").length, excluded: this.saved.excluded.length, selectedGoals: rows.filter((r) => !r.excluded && r.goalSelected).length },
+      goalContinuationEnabled: this.settings.continueGoals,
       rows: filtered.slice(page * 30, page * 30 + 30), total: filtered.length, page, history: [...this.saved.history].reverse().slice(0, 30) };
   }
   async stop(): Promise<void> {

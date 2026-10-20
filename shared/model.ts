@@ -10,7 +10,7 @@ export const recordSchema = z.object({
   phase: phaseSchema, reason: reasonSchema, dueAt: timestamp.nullable(), attempts: z.number().int().nonnegative(),
   humanRequired: z.boolean(), pendingIds: z.array(z.string()), messageAt: z.string().nullable(),
   attemptMessageId: z.string().nullable(), expectingStart: z.boolean(), revision: z.number().int().nonnegative(),
-  goal: z.object({ key: z.string().nullable(), state: z.enum(["active", "paused", "blocked", "limited", "complete", "cleared", "unknown"]), attempts: z.number().int().nonnegative() }).optional(),
+  goal: z.object({ key: z.string().nullable(), state: z.enum(["active", "paused", "blocked", "limited", "complete", "cleared", "unknown"]), attempts: z.number().int().nonnegative(), selectedKey: z.string().nullable().default(null) }).optional(),
 });
 export type RecordEntry = z.infer<typeof recordSchema>;
 export const stateSchema = z.object({
@@ -32,11 +32,13 @@ export function backoff(settings: Preferences, attempts: number): number { retur
 export function isTransient(code: string | undefined): boolean {
   return /^(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|connection_lost|connection_reset|network_error|service_unavailable|server_overloaded|502|503|504)$/i.test(code ?? "");
 }
-export function isGoalContinuation(r: RecordEntry): boolean { return r.goal?.state === "active" && ["goal_active", "goal_limit", "goal_disabled"].includes(r.reason); }
+export function isGoalContinuation(r: RecordEntry): boolean { return r.goal?.state === "active" && ["goal_active", "goal_limit", "goal_disabled", "goal_unselected"].includes(r.reason); }
+export function isSelectedGoal(r: RecordEntry): boolean { return !!r.goal?.key && r.goal.selectedKey === r.goal.key; }
 export function automaticBlock(r: RecordEntry, settings: Preferences, now: number): Reason | null {
   if (!settings.enabled) return "disabled";
   if (r.humanRequired) return "input";
   if (r.reason === "goal_active") {
+    if (!isSelectedGoal(r)) return "goal_unselected";
     if (!settings.continueGoals) return "goal_disabled";
     if ((r.goal?.attempts ?? 0) >= settings.goalMaxAttempts) return "goal_limit";
   } else if (r.attempts >= settings.maxAttempts) return "attempt_limit";

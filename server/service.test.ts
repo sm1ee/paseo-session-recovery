@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { preferences, statusInput } from "../shared/contracts";
-import { emptyState, HOUR, holdIds, type Agent, type SavedState, type Workspace } from "../shared/model";
+import { emptyState, HOUR, holdIds, stateSchema, type Agent, type SavedState, type Workspace } from "../shared/model";
 import type { RecoveryHost } from "./host";
 import { RecoveryService, type RecoveryEvent } from "./service";
 import { RecoveryError } from "./store";
@@ -48,13 +48,144 @@ function fixture(options: Record<string, unknown> = {}) {
 }
 describe("goal continuation", () => {
   const active: GoalReading = { state: "active", key: "goal-fingerprint", evidence: true };
+  async function select(f: ReturnType<typeof fixture>) { await f.track(); await f.service.watchGoal("session"); }
   async function ended(f: ReturnType<typeof fixture>, turnId = "turn-1") {
     f.idle(); f.a.attentionReason = "finished"; f.a.attentionTimestamp = new Date(epoch + 1000).toISOString();
     await f.event({ kind: "end", turnId, outcome: { kind: "completed" } } as Omit<RecoveryEvent, "agent">);
     await f.service.scanNow();
   }
-  it("continues a completed turn with an active goal after the configured delay", async () => {
+  it("discovers an active goal without selecting or protecting it", async () => {
     const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await ended(f);
+    const row = f.service.status(statusInput.parse({ view: "goals" })).rows[0];
+    expect(row.goalSelected).toBe(false); expect(row.reason).toBe("goal_unselected");
+    expect(holdIds(f.saved)).toEqual([]); f.advance(HOUR); await f.service.scanNow();
+    expect(f.send).not.toHaveBeenCalled();
+  });
+  it("keeps a selection made during a turn while the master switch is off", async () => {
+    const f = fixture(); f.setGoal(active); await select(f); await ended(f);
+    expect(f.saved.records.session.reason).toBe("goal_disabled");
+    await f.service.configure({ ...f.settings, continueGoals: true });
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(1);
+  });
+  it("does not inherit an old selection if the objective changes with the master off", async () => {
+    const f = fixture(); f.setGoal(active); await select(f);
+    f.setGoal({ ...active, key: "new-objective" }); await ended(f);
+    await f.service.configure({ ...f.settings, continueGoals: true });
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+    expect(f.saved.records.session.goal?.selectedKey).toBeNull();
+  });
+  it("uses the goal delay when automatic recovery is switched back on", async () => {
+    const f = fixture({ enabled: false, continueGoals: true, delaySeconds: 30, goalDelaySeconds: 120 });
+    f.setGoal(active); await select(f); await ended(f);
+    await f.service.configure({ ...f.settings, enabled: true });
+    f.advance(30_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+    f.advance(90_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(1);
+  });
+  it("continues only the selected session when several have active goals", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f);
+    f.others.set("other", { ...f.a, id: "other", status: "idle", activeTurn: null });
+    await f.service.observe({ kind: "start", agent: { ...hook, id: "other" }, turnId: "other-turn" });
+    await f.service.observe({ kind: "end", agent: { ...hook, id: "other" }, turnId: "other-turn", outcome: { kind: "completed" } });
+    await ended(f); f.advance(60_000); await f.service.scanNow();
+    expect(f.send.mock.calls.map(([id]) => id)).toEqual(["session"]);
+    expect(f.service.status().counts.selectedGoals).toBe(1);
+  });
+  it("does not carry a selection into a different objective during the delay", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f);
+    f.setGoal({ ...active, key: "different-objective" }); f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.goal?.selectedKey).toBeNull();
+    expect(f.saved.records.session.reason).toBe("goal_unselected"); expect(holdIds(f.saved)).toEqual([]);
+    expect(f.send).not.toHaveBeenCalled();
+  });
+  it("does not carry a selection into a different objective in a later turn", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f);
+    f.a.status = "running"; f.a.activeTurn = "turn-2";
+    await f.event({ kind: "start", turnId: "turn-2" } as Omit<RecoveryEvent, "agent">);
+    f.setGoal({ ...active, key: "different-objective" }); await ended(f, "turn-2");
+    expect(f.saved.records.session.goal?.selectedKey).toBeNull();
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("rejects a toggle based on a goal that has since changed", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await ended(f);
+    f.setGoal({ ...active, key: "new-objective" });
+    await expect(f.service.watchGoal("session", active.key!)).rejects.toThrow(/goal changed/);
+    expect(f.saved.records.session.goal?.selectedKey).toBeNull(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("turning the session toggle off cancels the goal and releases its cleanup hold", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f);
+    await f.service.unwatchGoal("session");
+    expect(holdIds(f.saved)).toEqual([]); expect(f.saved.records.session.goal?.selectedKey).toBeNull();
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("turning the toggle off does not cancel daemon-restart recovery", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); f.idle(); await f.restart();
+    expect(f.saved.records.session.reason).toBe("daemon_restart");
+    await f.service.unwatchGoal("session"); expect(f.saved.records.session.reason).toBe("daemon_restart");
+    expect(holdIds(f.saved)).toEqual(["session"]); f.advance(60_000); await f.service.scanNow();
+    expect(f.send).toHaveBeenCalledTimes(1); expect(f.send.mock.calls[0][1]).toBe(f.settings.prompt);
+  });
+  it("selecting a goal preserves an existing interruption requiring review", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); f.idle();
+    await f.event({ kind: "closed" }); await f.service.watchGoal("session");
+    expect(f.saved.records.session.reason).toBe("runtime_closed");
+    expect(f.saved.records.session.goal?.selectedKey).toBe(active.key);
+    f.advance(60_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("keeps uncertain delivery protected when the goal toggle is turned off", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f);
+    f.send.mockRejectedValueOnce(new Error("response lost")); f.advance(60_000); await f.service.scanNow();
+    await f.service.unwatchGoal("session");
+    expect(f.saved.records.session.reason).toBe("uncertain_send"); expect(holdIds(f.saved)).toEqual(["session"]);
+    await f.restart(); f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(1);
+  });
+  it("cancels an in-flight verification when the toggle is turned off", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f); f.advance(60_000);
+    let release!: (w: Workspace) => void; let began!: () => void;
+    const reading = new Promise<void>((resolve) => { began = resolve; });
+    f.getWorkspace.mockImplementationOnce(async () => { began(); return new Promise((resolve) => { release = resolve; }); });
+    const scan = f.service.scanNow(); await reading;
+    const off = f.service.unwatchGoal("session"); release(f.workspace);
+    await expect(scan).rejects.toThrow(/changed/); await off;
+    expect(f.send).not.toHaveBeenCalled(); expect(holdIds(f.saved)).toEqual([]);
+  });
+  it("does not reset the continuation count when a toggle is cycled", async () => {
+    const f = fixture({ continueGoals: true, goalMaxAttempts: 1 }); f.setGoal(active); await select(f); await ended(f);
+    f.advance(60_000); await f.service.scanNow();
+    f.a.status = "running"; f.a.activeTurn = "turn-2";
+    await f.event({ kind: "start", turnId: "turn-2" } as Omit<RecoveryEvent, "agent">); await ended(f, "turn-2");
+    await f.service.unwatchGoal("session"); await f.service.watchGoal("session"); await f.service.scanNow();
+    expect(f.saved.records.session.goal?.attempts).toBe(1); expect(f.saved.records.session.reason).toBe("goal_limit");
+    await f.service.watchGoal("session", active.key!, true);
+    expect(f.saved.records.session.goal?.attempts).toBe(0); f.advance(60_000); await f.service.scanNow();
+    expect(f.send).toHaveBeenCalledTimes(2);
+  });
+  it("clears selection when the goal completes, even if its objective is reused", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f);
+    f.setGoal({ ...active, state: "complete" }); f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.goal?.selectedKey).toBeNull();
+    f.a.status = "running"; f.a.activeTurn = "turn-2";
+    await f.event({ kind: "start", turnId: "turn-2" } as Omit<RecoveryEvent, "agent">);
+    f.setGoal(active); await ended(f, "turn-2"); f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("goal_unselected"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("keeps a selected but unverifiable goal for review and preserves its fingerprint", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f);
+    f.setGoal({ state: "unknown", key: null, evidence: false }); f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("goal_unknown"); expect(holdIds(f.saved)).toEqual(["session"]);
+    expect(f.saved.records.session.goal?.key).toBe(active.key);
+    await f.service.unwatchGoal("session"); expect(holdIds(f.saved)).toEqual([]); expect(f.send).not.toHaveBeenCalled();
+  });
+  it.each(["goal_active", "goal_disabled", "goal_limit", "goal_unknown"] as const)("does not select a legacy %s record on upgrade", async (reason) => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f);
+    const legacy = f.saved;
+    Reflect.deleteProperty(legacy.records.session.goal!, "selectedKey");
+    legacy.records.session.reason = reason; legacy.records.session.phase = reason === "goal_active" ? "scheduled" : "review";
+    const migrated = stateSchema.parse(legacy); expect(migrated.records.session.goal?.selectedKey).toBeNull();
+    f.setSaved(migrated); await f.restart(); f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("goal_unselected"); expect(holdIds(f.saved)).toEqual([]); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("continues a completed turn with an active goal after the configured delay", async () => {
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f);
     expect(f.saved.records.session.reason).toBe("goal_active"); expect(holdIds(f.saved)).toContain("session");
     f.advance(59_999); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
     f.advance(1); await f.service.scanNow(); await f.service.scanNow();
@@ -66,7 +197,7 @@ describe("goal continuation", () => {
     expect(f.goal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
   });
   it.each(["complete", "paused", "blocked", "limited", "cleared", "unknown"] as const)("does not restart a goal with state %s", async (state) => {
-    const f = fixture({ continueGoals: true }); f.setGoal({ ...active, state }); await f.track(); await ended(f);
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); f.setGoal({ ...active, state }); await ended(f);
     f.advance(HOUR); await f.service.scanNow();
     expect(f.send).not.toHaveBeenCalled(); expect(f.saved.records.session.goal?.state).toBe(state);
     expect(f.service.status(statusInput.parse({ view: "goals" })).rows[0].canResume).toBe(false);
@@ -76,30 +207,30 @@ describe("goal continuation", () => {
     expect(f.saved.records.session.phase).toBe("completed"); expect(f.send).not.toHaveBeenCalled();
   });
   it("rechecks completion during the grace period", async () => {
-    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await ended(f);
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f);
     f.setGoal({ ...active, state: "complete" }); f.advance(60_000); await f.service.scanNow();
     expect(f.saved.records.session.reason).toBe("goal_complete"); expect(f.send).not.toHaveBeenCalled();
   });
   it("lets the provider's own continuation start first", async () => {
-    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await ended(f);
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f);
     f.a.activeTurn = "native-turn"; f.a.status = "running";
     f.advance(60_000); await f.service.scanNow();
     expect(f.saved.records.session.phase).toBe("watching"); expect(f.send).not.toHaveBeenCalled();
   });
   it("honors a stop while a goal continuation is scheduled", async () => {
-    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await ended(f);
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f);
     await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
     f.advance(HOUR); await f.service.scanNow();
     expect(f.saved.records.session.reason).toBe("user_stop"); expect(f.send).not.toHaveBeenCalled();
   });
   it("holds questions and approvals for the user", async () => {
-    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track();
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f);
     await f.event({ kind: "permission", requestId: "question" } as Omit<RecoveryEvent, "agent">); await ended(f);
     f.advance(HOUR); await f.service.scanNow();
     expect(f.saved.records.session.reason).toBe("input"); expect(f.send).not.toHaveBeenCalled();
   });
   it("preserves the per-goal limit across turns and restarts", async () => {
-    const f = fixture({ continueGoals: true, goalMaxAttempts: 1 }); f.setGoal(active); await f.track(); await ended(f);
+    const f = fixture({ continueGoals: true, goalMaxAttempts: 1 }); f.setGoal(active); await select(f); await ended(f);
     f.advance(60_000); await f.service.scanNow();
     f.a.status = "running"; f.a.activeTurn = "turn-2";
     await f.event({ kind: "start", turnId: "turn-2" } as Omit<RecoveryEvent, "agent">);
@@ -109,7 +240,7 @@ describe("goal continuation", () => {
     expect(f.send).toHaveBeenCalledTimes(1); expect(f.saved.records.session.goal?.attempts).toBe(1);
   });
   it("does not reuse a queued continuation after the user changes the conversation", async () => {
-    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await ended(f);
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f);
     f.a.lastUserMessageAt = new Date(epoch + 60_000).toISOString(); f.advance(60_000); await f.service.scanNow();
     expect(f.saved.records.session.reason).toBe("new_activity"); expect(f.send).not.toHaveBeenCalled();
   });
@@ -139,7 +270,7 @@ describe("goal continuation", () => {
     f.advance(60_000); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(1);
   });
   it("keeps uncertain delivery protected and blocks Watch goal from bypassing it", async () => {
-    const f = fixture({ continueGoals: true }); f.setGoal(active); await f.track(); await ended(f);
+    const f = fixture({ continueGoals: true }); f.setGoal(active); await select(f); await ended(f);
     f.send.mockRejectedValueOnce(new Error("lost response")); f.advance(60_000); await f.service.scanNow();
     await expect(f.service.watchGoal("session")).rejects.toThrow(/uncertain delivery/);
     await f.restart(); f.advance(HOUR); await f.service.scanNow();

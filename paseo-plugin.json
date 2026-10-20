@@ -1,7 +1,7 @@
 {
   "id": "session-recovery",
   "name": "session-recovery",
-  "description": "Recover interrupted sessions and continue goals that remain active after a turn ends.",
+  "description": "Recover interrupted sessions and continue the goals you select.",
   "build": [["npm", "ci", "--ignore-scripts", "--omit=dev"]],
   "media": ["assets/goal-settings.png"],
   "requirements": {
