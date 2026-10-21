@@ -72,6 +72,40 @@ describe("목표 미리보기와 명시적인 네이티브 제어", () => {
     f.setGoal(reading); f.setDetails({ reading, objective: "Private fixture objective", revision: "native-revision", tokenBudget: 100, tokensUsed: 3 });
     await f.service.configure(f.settings); return f;
   }
+  it("느린 네이티브 상태 변경 중에도 Goal 본문과 미리보기를 읽고 중복 제어는 잠근다", async () => {
+    const f = await controls(), view = await f.service.readGoalEditor("session");
+    const original = f.controlGoal.getMockImplementation()!;
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    f.controlGoal.mockImplementationOnce(async (...args) => { entered(); await blocked; return original(...args); });
+    const action = f.service.actOnGoal({ ticket: view.actionTicket! }); await started;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const reads = Promise.all([f.service.readGoalEditor("session"), f.service.goalControl("session", true, false, true)]);
+      const [editor, preview] = await Promise.race([reads, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("조회가 상태 변경 대기열에서 기다림")), 300); })]);
+      expect(editor).toMatchObject({ objective: "Private fixture objective", ticket: null, actionTicket: null });
+      expect(preview).toMatchObject({ objective: "Private fixture objective", nativeActionReady: false });
+      expect(f.controlGoal).toHaveBeenCalledOnce();
+    } finally { clearTimeout(timeout); release(); await action; }
+  });
+  it("미리보기를 읽는 동안 상태 변경이 시작되면 이전 기록으로 제어를 다시 열지 않는다", async () => {
+    const f = await controls(), view = await f.service.readGoalEditor("session");
+    let releaseRead!: (value: CodexGoalDetails) => void;
+    f.goalDetails.mockImplementationOnce(() => new Promise((resolve) => { releaseRead = resolve; }));
+    const preview = f.service.goalControl("session", true, false, true);
+    await vi.waitFor(() => expect(releaseRead).toBeTypeOf("function"));
+    const original = f.controlGoal.getMockImplementation()!; let releaseAction!: () => void, entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const blocked = new Promise<void>((resolve) => { releaseAction = resolve; });
+    f.controlGoal.mockImplementationOnce(async (...args) => { entered(); await blocked; return original(...args); });
+    const action = f.service.actOnGoal({ ticket: view.actionTicket! }); await started;
+    try {
+      releaseRead({ reading: { state: "active", key: "original-goal", evidence: true, source: "codex" }, objective: "Private fixture objective", revision: "native-revision", tokenBudget: 100, tokensUsed: 3 });
+      expect(await preview).toMatchObject({ nativeActionReady: false });
+      expect(f.controlGoal).toHaveBeenCalledOnce();
+    } finally { releaseAction(); await action; }
+  });
   it("마운트된 미리보기만 복원 없이 본문을 읽고 수동 조회와 캐시를 구분한다", async () => {
     const f = await controls(), before = f.saved;
     await f.service.goalControl("session"); expect(f.goalDetails).not.toHaveBeenCalled();
