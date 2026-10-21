@@ -1,8 +1,9 @@
 import type { PluginHostProps, PluginScreenProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
+import { TextInput } from "@getpaseo/plugin/client/react-native";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
+import { Pressable, ScrollView, Text, View } from "react-native";
 import { goalLengthLimit, editGoalRpc, goalObjectiveError, readGoalRpc, type GoalEditorSnapshot } from "../shared/goal-editor";
 import { goalControlRpc, watchGoalRpc, unwatchGoalRpc } from "../shared/contracts";
 import { actOnGoalRpc } from "../shared/goal-actions";
