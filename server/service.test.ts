@@ -175,8 +175,16 @@ describe("명시적인 Goal 편집", () => {
     const f = await editor(), before = f.saved;
     await f.service.goalControl("session"); expect(f.goalDetails).not.toHaveBeenCalled();
     expect(await f.service.readGoalEditor("session")).toMatchObject({ supported: true, objective: "Original fixture", ticket: expect.any(String) });
-    expect(f.goalDetails).toHaveBeenCalledExactlyOnceWith("session"); expect(f.saved).toEqual(before);
+    expect(f.goalDetails).toHaveBeenCalledExactlyOnceWith("session", { allowTimeline: false }); expect(f.saved).toEqual(before);
+    expect(f.supportsGoalCommand).not.toHaveBeenCalled();
     expect(f.editGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("같은 편집창의 동시 조회는 한 번만 읽고 명령 목록이나 대화를 복원하지 않는다", async () => {
+    const f = await editor();
+    const first = f.service.readGoalEditor("session"), second = f.service.readGoalEditor("session");
+    expect(first).toBe(second); await first;
+    expect(f.goalDetails).toHaveBeenCalledExactlyOnceWith("session", { allowTimeline: false });
+    expect(f.supportsGoalCommand).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
   });
   it("조회 중 네이티브 Goal의 다음 턴이 시작돼도 본문을 보여주고 최신 턴으로 티켓을 발행한다", async () => {
     const f = await editor();
@@ -257,7 +265,7 @@ describe("명시적인 Goal 편집", () => {
     f.setDetails({ reading, objective: "Original fixture", revision: "provider-revision", tokenBudget: source === "claude" ? null : 100, tokensUsed: null });
     let view = await f.service.readGoalEditor("session");
     expect(view).toMatchObject({ supported: true, source, objective: "Original fixture", ticket: expect.any(String) });
-    expect(f.supportsGoalCommand).toHaveBeenCalledWith("session", source);
+    expect(f.supportsGoalCommand).not.toHaveBeenCalled();
     expect(view.note).toContain(source === "claude" ? "resets its goal timer" : "preserves turn/token/time budgets");
     f.a.status = "running"; f.a.activeTurn = "current-turn";
     view = await f.service.readGoalEditor("session"); expect(view.ticket).toBeNull(); expect(view.note).toContain("Wait");
@@ -309,14 +317,16 @@ describe("goal composer inspection", () => {
     expect(await f.service.goalControl("session", true)).toMatchObject({ visible: true, key: active.key });
     expect(f.goal).toHaveBeenCalledTimes(2);
   });
-  it("선택된 OMP Goal의 표시가 대화를 복원하지 않아도 자동 진행 검사는 유지한다", async () => {
+  it("선택된 OMP Goal을 배경에서 복원하지 않고 현재 상태가 미확인이면 전송을 보류한다", async () => {
     const f = fixture({ continueGoals: true }); f.a.provider = "omp"; f.idle(); f.setGoal(active);
     await f.service.configure(f.settings); await f.service.watchGoal("session");
     f.goal.mockImplementation(async (_id, options) => options?.allowTimeline === false ? { state: "unknown", key: null, evidence: false, source: "timeline" } : active);
     expect(await f.service.goalControl("session")).toMatchObject({ visible: true, state: "active", selected: true, canSelect: false, note: expect.stringContaining("last checked") });
-    f.advance(60_000); await f.service.scanNow();
-    expect(f.send).toHaveBeenCalledOnce();
-    expect(f.goal.mock.calls.some(([, options]) => options === undefined)).toBe(true);
+    f.goal.mockClear(); f.advance(60_000); await f.service.scanNow();
+    expect(f.send).not.toHaveBeenCalled();
+    expect(f.goal).toHaveBeenCalledWith("session", { allowTimeline: false });
+    expect(f.saved.records.session.goal?.selectedKey).toBe(active.key);
+    expect(f.saved.records.session.reason).toBe("goal_unknown");
   });
   it("does not show a pill or track a session without goal evidence", async () => {
     const f = fixture(); await f.service.configure(f.settings);

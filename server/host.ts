@@ -192,10 +192,8 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         const openCode = await openCodeGoals.read(agent);
         await check();
         if (openCode) return openCode;
-        if (options?.allowTimeline !== false) {
-          const claude = await claudeGoals.details(agent); await check();
-          if (claude) return claude.reading;
-        }
+        const claude = await claudeGoals.details(agent); await check();
+        if (claude) return claude.reading;
         if (agent.persistence?.sessionId) {
           const native = await codexGoals.read(agent.provider, agent.persistence.sessionId);
           await check();
