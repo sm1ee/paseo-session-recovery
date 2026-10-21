@@ -126,7 +126,7 @@ paseo plugin install /absolute/path/to/paseo-session-recovery
 
 Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed. Goal entries retry a failed initial session lookup and rebuild after reconnecting, including on mobile clients. A supported provider entry is registered before any goal-state request. Goal checks run for mounted composers, rather than scanning every saved session on each connected client.
 
-For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.6.2`. The public registry listing requires a separate review.
+For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.6.3`. The public registry listing requires a separate review.
 
 ## Local data
 
@@ -150,3 +150,7 @@ npm test
 Tests simulate restarts, stops, approvals, lost responses, retry limits, concurrent user actions, and storage failures. They do not restart the real daemon or resume user sessions.
 
 The mobile check compiles the client module graph with React Native's Hermes compiler without running plugin code. CI runs it with both supported Paseo SDK versions.
+
+### Lightweight goal inspection
+
+Goal previews and the editor read native goal state without restoring conversation history or checking slash commands. Concurrent reads of the same editor share one request. Native commands and session identity are checked again before saving, pausing, or resuming. Background checks do not load history; if a selected goal cannot be verified from native state, automatic continuation waits for review.

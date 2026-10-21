@@ -44,6 +44,7 @@ export class RecoveryService {
   private nativeGoalResumes = new Map<string, NativeGoalResume>();
   private goalEditTickets = new Map<string, GoalEditTicket>();
   private goalActionTickets = new Map<string, GoalActionTicket>();
+  private editorReads = new Map<string, Promise<GoalEditorSnapshot>>();
   constructor(private readonly connect = openLocalHost, private readonly now = Date.now, private readonly automaticTimer = true) {}
   private enqueue<T>(work: () => Promise<T>, report = true): Promise<T> {
     const task = this.queue.then(work);
@@ -201,7 +202,7 @@ export class RecoveryService {
     return { agent, reason };
   }
   private async inspectGoal(r: RecordEntry, host: RecoveryHost): Promise<void> {
-    const reading = await host.goal?.(r.id) ?? { state: "unknown" as const, key: null, evidence: false };
+    const reading = await host.goal?.(r.id, { allowTimeline: false }) ?? { state: "unknown" as const, key: null, evidence: false };
     if (!reading.evidence && !r.goal) { this.set(r, "completed", "finished"); this.audit(r, "completed"); return; }
     const previous = r.goal;
     const state = reading.state === "active" && !reading.key ? "unknown" : reading.state;
@@ -452,14 +453,20 @@ export class RecoveryService {
     void promise.then(clear, clear);
     return promise;
   }
-  async readGoalEditor(id: string): Promise<GoalEditorSnapshot> {
+  readGoalEditor(id: string): Promise<GoalEditorSnapshot> {
+    const pending = this.editorReads.get(id); if (pending) return pending;
+    const task = this.readNativeGoalEditor(id); this.editorReads.set(id, task);
+    const clear = () => { if (this.editorReads.get(id) === task) this.editorReads.delete(id); };
+    void task.then(clear, clear); return task;
+  }
+  private async readNativeGoalEditor(id: string): Promise<GoalEditorSnapshot> {
     // Explicit inspection of one session only. Do not add objective reads to
     // background discovery, persist them in the journal, or hold its scan queue.
     const { host, generation, changed } = await this.action(async () => ({ host: await this.ready(), generation: this.generation, changed: this.changes.get(id) ?? 0 }));
     const a = await host.fetch(id); this.check(generation);
     if (!a || a.internal || a.archivedAt || !a.workspaceId) throw new RecoveryError("This session is unavailable. Open a current session and try again.");
     const view: GoalEditorSnapshot = { id, title: a.title, provider: a.provider, supported: false, source: null, objective: null, state: "unknown", tokenBudget: null, tokensUsed: null, ticket: null, note: null, action: null, actionTicket: null, actionNote: null, key: null };
-    const details = await host.goalDetails?.(id); this.check(generation);
+    const details = await host.goalDetails?.(id, { allowTimeline: false }); this.check(generation);
     if (!details) return { ...view, note: "This provider does not expose a supported goal editor. Use its native goal controls." };
     const source = details.reading.source;
     Object.assign(view, { objective: details.objective, state: details.reading.state, tokenBudget: details.tokenBudget, tokensUsed: details.tokensUsed, key: details.reading.key });
@@ -473,7 +480,7 @@ export class RecoveryService {
     if (!goalCommandReady(a) || !a.sessionId || r?.humanRequired || r?.phase === "sending" || r?.expectingStart || r?.reason === "uncertain_send") return { ...view, note: "Resolve pending input or uncertain delivery in this session before editing its goal." };
     if (source !== "codex" && busy(a)) return { ...view, note: "Wait for this session's current turn to finish before editing its goal. Saving starts native goal work." };
     const workspace = await host.workspace(a.workspaceId); this.check(generation);
-    if (!workspace || workspace.archived || workspace.archiving || !await host.supportsGoalCommand?.(id, source) || !host.editGoal) return { ...view, note: "Native goal commands are unavailable for this session. Reload it when idle." };
+    if (!workspace || workspace.archived || workspace.archiving || !host.editGoal) return { ...view, note: "Native goal commands are unavailable for this session. Reload it when idle." };
     this.check(generation);
     let expected = a, ticketChanged = changed;
     if ((this.changes.get(id) ?? 0) !== changed) {
