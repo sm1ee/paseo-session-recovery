@@ -25,6 +25,7 @@ export class RecoveryService {
   private saved: SavedState = emptyState("");
   private settings = preferences.schema.parse({});
   private generation = 0;
+  private configuredGeneration = 0;
   private changes = new Map<string, number>();
   private goalReadBlocks = new Map<string, number>();
   private tickets = new Map<string, Ticket>();
@@ -52,6 +53,15 @@ export class RecoveryService {
     return task;
   }
   private action<T>(work: () => Promise<T>): Promise<T> { return this.enqueue(work, false); }
+  private readContext(id: string): Promise<{ host: RecoveryHost; generation: number; changed: number }> {
+    // 이미 연결된 호스트의 읽기는 느린 명령 전송이나 복원 대기열을 기다리지 않는다.
+    // 설정 교체와 최초 연결은 기존 직렬화 경로가 끝난 뒤에 읽는다.
+    if (this.host && this.configuredGeneration === this.generation) {
+      this.check();
+      return Promise.resolve({ host: this.host, generation: this.generation, changed: this.changes.get(id) ?? 0 });
+    }
+    return this.action(async () => ({ host: await this.ready(), generation: this.generation, changed: this.changes.get(id) ?? 0 }));
+  }
   private check(generation = this.generation): void {
     if (this.stopped || this.fatal || !this.validSettings || generation !== this.generation) throw new RecoveryError("Recovery was paused or settings changed. Refresh before trying again.");
   }
@@ -108,6 +118,7 @@ export class RecoveryService {
       const enablingGoals = !this.settings.continueGoals && settings.continueGoals;
       this.settings = settings;
       this.validSettings = true;
+      this.configuredGeneration = generation;
       if (enabling) for (const r of Object.values(this.saved.records)) if (r.phase === "scheduled") r.dueAt = this.now() + (r.reason === "goal_active" ? settings.goalDelaySeconds * 1000 : backoff(settings, r.attempts));
       for (const r of Object.values(this.saved.records)) {
         if (isSelectedGoal(r) && r.goal?.state === "active" && (enablingGoals && r.reason === "goal_disabled" || settings.continueGoals && r.reason === "goal_limit" && r.goal.attempts < settings.goalMaxAttempts)) this.set(r, "review", "goal_check");
@@ -462,7 +473,7 @@ export class RecoveryService {
   private async readNativeGoalEditor(id: string): Promise<GoalEditorSnapshot> {
     // Explicit inspection of one session only. Do not add objective reads to
     // background discovery, persist them in the journal, or hold its scan queue.
-    const { host, generation, changed } = await this.action(async () => ({ host: await this.ready(), generation: this.generation, changed: this.changes.get(id) ?? 0 }));
+    const { host, generation, changed } = await this.readContext(id);
     const a = await host.fetch(id); this.check(generation);
     if (!a || a.internal || a.archivedAt || !a.workspaceId) throw new RecoveryError("This session is unavailable. Open a current session and try again.");
     const view: GoalEditorSnapshot = { id, title: a.title, provider: a.provider, supported: false, source: null, objective: null, state: "unknown", tokenBudget: null, tokensUsed: null, ticket: null, note: null, action: null, actionTicket: null, actionNote: null, key: null };
@@ -601,11 +612,10 @@ export class RecoveryService {
     // Passive discovery must not hold up recovery actions while a provider is slow.
     const request = {}; this.controlRequests.set(id, request);
     return (async () => {
-      const { host, generation, changed } = await this.action(async () => ({ host: await this.ready(), generation: this.generation, changed: this.changes.get(id) ?? 0 }));
+      const { host, generation, changed } = await this.readContext(id);
       const cached = this.controls.get(id);
       if (!fresh && cached && (!preview || cached.preview) && cached.generation === generation && cached.changed === changed && this.now() - cached.at < (cached.value.visible ? 15_000 : 300_000)) return cached.value;
       const a = await host.fetch(id); this.check(generation);
-      const r = this.saved.records[id];
       const value: GoalControl = { id, workspaceId: a?.workspaceId ?? null, visible: false, state: null, key: null, selected: false, canSelect: false,
         automatic: this.settings.enabled && this.settings.continueGoals, attempts: 0, maxAttempts: this.settings.goalMaxAttempts, delaySeconds: this.settings.goalDelaySeconds, note: null };
       if (a && !a.internal && !a.archivedAt && a.workspaceId) {
@@ -613,6 +623,7 @@ export class RecoveryService {
         // a conversation. Timeline-only providers stay behind explicit inspection.
         const details = preview ? await host.goalDetails?.(id, { allowTimeline: false }) : null;
         let reading = details?.reading ?? await host.goal?.(id, { allowTimeline: inspect }) ?? { state: "unknown" as const, key: null, evidence: false }; this.check(generation);
+        const r = this.saved.records[id];
         const snapshotOnly = reading.source === "timeline" && !reading.evidence && reading.state === "unknown" && !!r?.goal?.selectedKey;
         // 선택된 비네이티브 Goal은 마지막 검사 결과로 해제 버튼을 유지한다.
         // 이 표시 결과는 자동 전송이나 새 Goal 선택의 증거로 쓰지 않는다.
