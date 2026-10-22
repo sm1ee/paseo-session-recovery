@@ -35,6 +35,11 @@ export function backoff(settings: Preferences, attempts: number): number { retur
 export function isTransient(code: string | undefined): boolean {
   return /^(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|connection_lost|connection_reset|network_error|service_unavailable|server_overloaded|502|503|504)$/i.test(code ?? "");
 }
+export function normalizeProviderErrorCode(provider: string, error: { code?: string; message: string }): string | undefined {
+  // Paseo's Codex adapter can omit the code for this exact temporary failure.
+  if (error.code === undefined && provider === "codex" && error.message === "Selected model is at capacity. Please try a different model.") return "server_overloaded";
+  return error.code;
+}
 export function isGoalContinuation(r: RecordEntry): boolean { return r.goal?.state === "active" && ["goal_active", "goal_limit", "goal_disabled", "goal_unselected"].includes(r.reason); }
 export function isSelectedGoal(r: RecordEntry): boolean { return !!r.goal?.key && r.goal.selectedKey === r.goal.key; }
 export function automaticBlock(r: RecordEntry, settings: Preferences, now: number): Reason | null {

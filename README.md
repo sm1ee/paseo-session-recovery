@@ -100,7 +100,7 @@ The per-objective limit survives turns, daemon restarts, and cycling the toggle.
 
 Explicit stops and completed goals are never automatically resumed. A completed turn is only continued when goal continuation is enabled, the current goal is selected, and that goal is still active. Pending questions and approvals require user input. Archived or missing sessions, unavailable history, and unavailable workspaces are excluded. Subagent recovery checks every parent; an active, archived, missing, or excluded parent blocks it. Provider-internal subagents are outside this plugin's scope.
 
-Unknown interruptions go to review. Temporary provider errors are retried only when enabled and when their code is recognized. Uncertain delivery is not automatically retried, even after another restart. Open the conversation to check the result.
+Unknown interruptions go to review. Temporary provider errors are retried only when enabled and when their code is recognized. Codex's exact "Selected model is at capacity. Please try a different model." error is also recognized when Paseo omits the error code. This uses the same delay and attempt limits and continues the existing session without switching models. Uncertain delivery is not automatically retried, even after another restart. Open the conversation to check the result.
 
 Worker birth times distinguish daemon restarts from plugin reloads, including when the supervisor stays alive. Graceful shutdown detection uses Paseo 0.11.4 and 0.12.0's removal of the local credential before closing sessions. A runtime close without shutdown evidence requires review.
 

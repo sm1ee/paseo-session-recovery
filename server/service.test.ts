@@ -1019,6 +1019,36 @@ describe("restart recovery", () => {
   });
 });
 describe("bounded attempts and delivery", () => {
+  it("retries a normalized Codex capacity failure with bounded backoff in the same session", async () => {
+    const f = fixture({ retryTransientErrors: true, maxAttempts: 2 }); await f.track(); f.idle();
+    for (const [index, delay] of [60_000, 120_000].entries()) {
+      const turnId = `turn-${index + 1}`;
+      if (index) await f.event({ kind: "start", turnId } as Omit<RecoveryEvent, "agent">);
+      await f.event({ kind: "end", turnId, outcome: { kind: "failed", error: { code: "server_overloaded" } } } as Omit<RecoveryEvent, "agent">);
+      expect(f.row()?.reason).toBe("transient_error");
+      f.advance(delay - 1); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(index);
+      f.advance(1); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(index + 1);
+      expect(f.send.mock.calls[index]![0]).toBe("session");
+      expect(f.send.mock.calls[index]![3].provider).toBe("codex");
+    }
+    await f.event({ kind: "start", turnId: "turn-3" } as Omit<RecoveryEvent, "agent">);
+    await f.event({ kind: "end", turnId: "turn-3", outcome: { kind: "failed", error: { code: "server_overloaded" } } } as Omit<RecoveryEvent, "agent">);
+    f.advance(HOUR); await f.service.scanNow(); expect(f.row()?.reason).toBe("attempt_limit"); expect(f.send).toHaveBeenCalledTimes(2);
+  });
+  it("keeps normalized capacity failures in review until transient retries are enabled", async () => {
+    const f = fixture(); await f.track(); f.idle();
+    await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "failed", error: { code: "server_overloaded" } } } as Omit<RecoveryEvent, "agent">);
+    f.advance(HOUR); await f.service.scanNow(); expect(f.row()?.reason).toBe("provider_error"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it.each(["stop", "permission", "message"] as const)("blocks a scheduled capacity retry after %s", async (action) => {
+    const f = fixture({ retryTransientErrors: true }); await f.track(); f.idle();
+    await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "failed", error: { code: "server_overloaded" } } } as Omit<RecoveryEvent, "agent">);
+    expect(f.row()?.reason).toBe("transient_error");
+    if (action === "stop") await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
+    else if (action === "permission") await f.event({ kind: "permission", requestId: "approval" } as Omit<RecoveryEvent, "agent">);
+    else f.a.lastUserMessageAt = new Date(epoch + 30_000).toISOString();
+    f.advance(HOUR); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+  });
   it("never automatically repeats a submission with an unknown result", async () => {
     const f = fixture(); await f.track(); f.idle(); await f.restart();
     f.send.mockRejectedValueOnce(new Error("response lost")); f.advance(60_000); await f.service.scanNow();
