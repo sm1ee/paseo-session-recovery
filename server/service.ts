@@ -21,6 +21,10 @@ interface GoalActionTicket extends GoalEditTicket { action: GoalAction; source: 
 function suspendedGoal(r: RecordEntry): boolean {
   return isSelectedGoal(r) && ["review", "stopped"].includes(r.phase) && ["goal_paused", "goal_blocked", "goal_limited", "goal_unknown"].includes(r.reason);
 }
+function disconnectedGoal(r: RecordEntry): boolean {
+  return isSelectedGoal(r) && r.goal?.state === "active" && !r.humanRequired && !r.expectingStart &&
+    ["monitor_gap", "unknown_end", "runtime_closed", "unknown_state"].includes(r.reason);
+}
 export class RecoveryService {
   private host: RecoveryHost | null = null;
   private saved: SavedState = emptyState("");
@@ -252,9 +256,9 @@ export class RecoveryService {
       this.check(generation); const host = await this.ready();
       const all = Object.values(this.saved.records).filter((r) => (OPEN_PHASES.has(r.phase) || suspendedGoal(r)) && !this.saved.excluded.includes(r.id));
       const due = all.filter((r) => r.phase === "scheduled").sort((a, b) => (a.dueAt ?? 0) - (b.dueAt ?? 0));
-      const watch = all.filter((r) => suspendedGoal(r) || ["watching", "waiting", "resumed"].includes(r.phase) || r.phase === "review" && ["monitor_gap", "unknown_end", "runtime_closed", "goal_check"].includes(r.reason));
+      const watch = all.filter((r) => disconnectedGoal(r) || suspendedGoal(r) || ["watching", "waiting", "resumed"].includes(r.phase) || r.phase === "review" && ["monitor_gap", "unknown_end", "runtime_closed", "goal_check"].includes(r.reason));
       const rotating = watch.slice(this.cursor).concat(watch.slice(0, this.cursor));
-      const batch = [...due.slice(0, 3), ...rotating.slice(0, 7)]; this.cursor = watch.length ? (this.cursor + 7) % watch.length : 0;
+      const batch = [...new Set([...due.slice(0, 3), ...rotating.slice(0, 7)])]; this.cursor = watch.length ? (this.cursor + 7) % watch.length : 0;
       // Read tracked sessions only. Old idle sessions are never discovered or resumed.
       for (const r of batch) {
         this.check(generation); const changed = this.changes.get(r.id) ?? 0;
@@ -270,7 +274,9 @@ export class RecoveryService {
           if (this.now() - r.lastSeenAt >= 30_000) this.review(r, "uncertain_send");
           continue;
         }
-        if (r.reason === "goal_check" || r.reason === "goal_active" || suspendedGoal(r)) {
+        if (r.reason === "goal_check" || r.reason === "goal_active" || disconnectedGoal(r) || suspendedGoal(r)) {
+          if (disconnectedGoal(r) && (r.messageAt !== null && a.lastUserMessageAt !== r.messageAt ||
+            r.messageAt === null && time(a.lastUserMessageAt) > r.lastSeenAt)) { this.review(r, "new_activity"); continue; }
           if (r.reason !== "goal_active") r.messageAt = a.lastUserMessageAt;
           await this.inspectGoal(r, host); this.check(generation);
           if ((this.changes.get(r.id) ?? 0) !== changed) continue;
@@ -310,23 +316,23 @@ export class RecoveryService {
   }
   private async attempt(r: RecordEntry, manual: boolean, generation: number, ticket?: Ticket): Promise<void> {
     const host = await this.ready(); const changed = this.changes.get(r.id) ?? 0;
-    const guard = () => { this.check(generation); if ((this.changes.get(r.id) ?? 0) !== changed || this.saved.excluded.includes(r.id)) throw new RecoveryError("The session changed during recovery. Open it before trying again."); };
+    let reconnecting: NativeGoalResume | undefined;
+    const guard = () => { this.check(generation); if ((this.changes.get(r.id) ?? 0) !== changed + (reconnecting?.starts ?? 0) || this.saved.excluded.includes(r.id)) throw new RecoveryError("The session changed during recovery. Open it before trying again."); };
     guard();
     if (!manual) { const block = automaticBlock(r, this.settings, this.now()); if (block) { this.review(r, block); return; } }
     const goalAttempt = isGoalContinuation(r);
-    if (goalAttempt) {
+    const recoverGoal = goalAttempt || isSelectedGoal(r) && r.reason === "daemon_restart" && this.settings.continueGoals;
+    let nativeContinuation = false;
+    if (recoverGoal) {
+      if ((r.goal?.attempts ?? 0) >= this.settings.goalMaxAttempts) { this.review(r, "goal_limit"); await this.persist(); return; }
       const key = r.goal!.key;
-      const reading = await host.goal?.(r.id); guard();
+      const reading = await host.goal?.(r.id, { allowTimeline: false, inspectOmp: true }); guard();
       if (!reading || reading.state !== "active" || reading.key !== key || !key) {
         await this.inspectGoal(r, host); await this.persist();
         if (manual) throw new RecoveryError("The goal changed after the preview. Check its latest state.");
         return;
       }
-      if (reading.nativeContinuation) {
-        if (manual) throw new RecoveryError("The provider is managing this goal's continuation. Review its native goal state before sending another message.");
-        r.dueAt = this.now() + this.settings.goalDelaySeconds * 1000;
-        return;
-      }
+      nativeContinuation = reading.nativeContinuation === true && reading.source !== "claude";
     }
     const result = await this.verified(r, host); guard();
     if (result.reason || !result.agent) {
@@ -334,6 +340,31 @@ export class RecoveryService {
       if (manual) throw new RecoveryError("The session cannot be resumed in its current state. Open it and review the latest state."); return;
     }
     if (ticket && (ticket.revision !== r.revision || ticket.fingerprint !== fingerprint(result.agent))) throw new RecoveryError("The session changed after the preview. Prepare recovery again.");
+    if (recoverGoal && !manual && host.connection && host.reconnectSession) {
+      const connection = await host.connection(r.id); guard();
+      if (connection === "detached") {
+        // Reopening a native active goal can start its own turn. Journal the
+        // operation first and allow only those start events through the guard.
+        this.set(r, "sending", r.reason); r.attemptMessageId = `session-recovery-reconnect-${randomUUID()}`;
+        r.expectingStart = true; r.goal!.attempts++; r.lastSeenAt = this.now();
+        await this.persist();
+        reconnecting = { submitted: true, starts: 0 }; this.nativeGoalResumes.set(r.id, reconnecting);
+        try {
+          guard(); const current = await host.reconnectSession(r.id, result.agent, guard); guard();
+          this.set(r, "review", "goal_check"); r.expectingStart = false; r.messageAt = current.lastUserMessageAt;
+          this.audit(r, "resume", "reconnected");
+          // No prompt or goal command on this pass. Observe the native loop
+          // first; an idle Codex/Claude fallback gets a fresh grace period.
+        } catch { this.review(r, "uncertain_send"); }
+        finally { this.nativeGoalResumes.delete(r.id); }
+        await this.persist(); return;
+      }
+    }
+    if (nativeContinuation) {
+      if (manual) throw new RecoveryError("The provider is managing this goal's continuation. Review its native goal state before sending another message.");
+      r.dueAt = this.now() + this.settings.goalDelaySeconds * 1000;
+      return;
+    }
     const messageId = `session-recovery-${randomUUID()}`;
     // Persist intent before submission. Uncertain delivery is never automatically replayed.
     this.set(r, "sending", r.reason); r.attemptMessageId = messageId; r.expectingStart = true;

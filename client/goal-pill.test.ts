@@ -60,6 +60,15 @@ describe("목표 미리보기와 네이티브 재생 제어", () => {
   it("전송 계층의 requestType와 code는 사용자 오류 문구에 노출하지 않는다", () => {
     expect(goalErrorText(new Error("Request failed: The session changed while reading its goal.\nrequestType=plugin.rpc.invoke.request\ncode=handler_error"))).toBe("Changed. Reload.");
   });
+  it("활성 Goal과 실제 세션 실행 상태를 구분한다", () => {
+    const goal = { state: "active", objective: "Finish the fixture" } as GoalControl;
+    expect(goalPreviewLabel(goal, { ...agent, status: "closed" })).toBe("Stopped · Finish the fixture");
+    expect(goalPreviewLabel(goal, { ...agent, status: "error", activeTurn: null })).toBe("Error · Finish the fixture");
+    expect(goalPreviewLabel(goal, { ...agent, activeTurn: null })).toBe("Idle · Finish the fixture");
+    expect(goalPreviewLabel(goal, { ...agent, status: "running", activeTurn: { turnId: "live" } })).toBe("Finish the fixture");
+    expect(goalPreviewLabel(goal, { ...agent, status: "running" })).toBe("Finish the fixture");
+    expect(goalPreviewLabel({ ...goal, state: "paused" }, { ...agent, status: "closed" })).toBe("Finish the fixture");
+  });
   it.each(["omp", "claude", "opencode", "codex"])("%s는 조회 전에 편집 시트 진입을 등록하고 전체 Goal RPC를 보내지 않는다", async (provider) => {
     const rpc = vi.fn(() => new Promise(() => {})), addComposerPill = vi.fn(() => ({ update: vi.fn(), remove: vi.fn() }));
     const subscription = { subscribe: vi.fn((handlers) => handlers.snapshot({ entries: [{ agent: { ...agent, provider } }] })) };

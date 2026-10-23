@@ -1005,6 +1005,71 @@ describe("goal continuation", () => {
   });
 });
 describe("restart recovery", () => {
+  async function selectedRecovery(source: "codex" | "omp" | "claude" = "codex") {
+    const f = fixture({ continueGoals: true, goalDelaySeconds: 30 }); f.a.provider = source; f.a.sessionId = "original-thread";
+    const reading: GoalReading = { state: "active", key: "selected-objective", evidence: true, source,
+      ...(source !== "codex" ? { nativeContinuation: true } : {}) };
+    f.setGoal(reading); await f.track(); await f.service.watchGoal("session", reading.key!); f.idle(); await f.restart();
+    const connection = vi.fn(async () => "detached" as "loaded" | "detached" | "unknown");
+    const reconnect = vi.fn(async (_id: string, _expected: Agent, guard: () => void) => { guard(); connection.mockResolvedValue("loaded"); return structuredClone(f.a); });
+    Object.assign(f.hosts.at(-1)!, { connection, reconnectSession: reconnect });
+    return Object.assign(f, { connection, reconnect, reading });
+  }
+  it.each(["codex", "omp", "claude"] as const)("선택한 %s Goal의 소유 연결을 먼저 복원하고 같은 스캔에 메시지나 Goal 명령을 보내지 않는다", async (source) => {
+    const f = await selectedRecovery(source); f.advance(60_000);
+    await f.service.scanNow();
+    expect(f.reconnect).toHaveBeenCalledOnce(); expect(f.send).not.toHaveBeenCalled(); expect(f.controlGoal).not.toHaveBeenCalled();
+    expect(f.saved.records.session.goal).toMatchObject({ key: f.reading.key, selectedKey: f.reading.key, attempts: 1 });
+    expect(f.saved.history.at(-1)).toMatchObject({ action: "resume", reason: "reconnected" });
+  });
+  it("재연결로 시작된 네이티브 턴을 인정하고 추가 요청을 보내지 않는다", async () => {
+    const f = await selectedRecovery(); let started: Promise<void> | undefined;
+    f.reconnect.mockImplementationOnce(async (_id, _expected, guard) => {
+      expect(f.saved.records.session).toMatchObject({ phase: "sending", expectingStart: true });
+      f.a.status = "running"; f.a.activeTurn = "native-turn";
+      started = f.event({ kind: "start", turnId: "native-turn" } as Omit<RecoveryEvent, "agent">); guard();
+      return structuredClone(f.a);
+    });
+    f.advance(60_000); await f.service.scanNow(); await started; f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session).toMatchObject({ phase: "watching", turnId: "native-turn" });
+    expect(f.reconnect).toHaveBeenCalledOnce(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it.each(["codex", "claude"] as const)("%s 재연결 후 실제로 쉬고 있을 때만 별도 유예시간 뒤 이어간다", async (source) => {
+    const f = await selectedRecovery(source); f.advance(60_000); await f.service.scanNow();
+    await f.service.scanNow(); f.advance(29_999); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+    f.advance(1); await f.service.scanNow(); await f.service.scanNow();
+    expect(f.reconnect).toHaveBeenCalledOnce(); expect(f.send).toHaveBeenCalledOnce();
+    expect(f.send.mock.calls[0][1]).toContain("Read the current goal"); expect(f.controlGoal).not.toHaveBeenCalled();
+  });
+  it.each(["paused", "blocked", "limited", "complete"] as const)("복구 전에 %s로 바뀐 Goal은 연결을 열지 않는다", async (state) => {
+    const f = await selectedRecovery(); f.setGoal({ ...f.reading, state }); f.advance(60_000); await f.service.scanNow();
+    expect(f.reconnect).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it.each(["stop", "permission", "unwatch", "unknown", "message"] as const)("재연결 전에 %s가 있으면 자동으로 다시 실행하지 않는다", async (block) => {
+    const f = await selectedRecovery();
+    if (block === "stop") await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
+    if (block === "permission") f.a.pendingPermissions = 1;
+    if (block === "unwatch") await f.service.unwatchGoal("session");
+    if (block === "unknown") f.a.activeTurn = undefined;
+    if (block === "message") f.a.lastUserMessageAt = new Date(epoch + 2_000).toISOString();
+    f.advance(60_000); await f.service.scanNow();
+    expect(f.reconnect).not.toHaveBeenCalled();
+    // Unselecting a goal preserves ordinary daemon-restart recovery.
+    if (block !== "unwatch") expect(f.send).not.toHaveBeenCalled();
+  });
+  it("재연결 응답을 잃으면 다음 스캔이나 재시작에서 자동으로 반복하지 않는다", async () => {
+    const f = await selectedRecovery(); f.reconnect.mockRejectedValueOnce(new Error("Lost acknowledgement"));
+    f.advance(60_000); await f.service.scanNow(); f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("uncertain_send"); expect(f.reconnect).toHaveBeenCalledOnce(); expect(f.send).not.toHaveBeenCalled();
+    await f.restart(); f.advance(60_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("플러그인 관찰 공백 뒤 선택한 Goal만 다시 검사하고 복구한다", async () => {
+    const f = await selectedRecovery();
+    // This fixture's new service is the second boot; reload it without changing boot identity.
+    await f.restart("boot-b"); Object.assign(f.hosts.at(-1)!, { connection: f.connection, reconnectSession: f.reconnect });
+    f.advance(60_000); await f.service.scanNow(); await f.service.scanNow();
+    expect(f.reconnect).toHaveBeenCalledOnce(); expect(f.send).not.toHaveBeenCalled();
+  });
   it("does not scan or resume pre-existing sessions on first install", async () => {
     const f = fixture(); f.idle(); await f.service.configure(f.settings); f.advance(HOUR); await f.service.scanNow();
     expect(f.fetch).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled(); expect(f.saved.records).toEqual({});

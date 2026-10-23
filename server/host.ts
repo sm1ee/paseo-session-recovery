@@ -20,6 +20,7 @@ import { OmpGoals } from "./omp-goals";
 import { OmpNativeGoals, ompNativeDetails, OMP_GOAL_RPC, type OmpNativeOutput } from "./omp-native-goals";
 import { controlSessionGoal } from "./session-goal-controls";
 import { GOAL_PROMPT } from "../shared/contracts";
+import { CONNECTION_RPC, type ConnectionOutput } from "./session-connection";
 
 export interface RecoveryHost {
   bootKey: string;
@@ -33,6 +34,8 @@ export interface RecoveryHost {
   controlGoal?(id: string, revision: string, action: GoalAction, expected: Agent, check: () => void, messageId: string, submitted: () => void): Promise<GoalReading>;
   editGoal?(id: string, revision: string, objective: string, expected: Agent, check: () => void, messageId: string, submitted: () => void): Promise<GoalReading>;
   resumeBlockedGoal?(id: string, key: string, expected: Agent, check: () => void, messageId: string, submitted?: () => void): Promise<GoalReading>;
+  connection?(id: string): Promise<"loaded" | "detached" | "unknown">;
+  reconnectSession?(id: string, expected: Agent, check: () => void): Promise<Agent>;
   shuttingDown(): Promise<boolean>;
   send(id: string, prompt: string, messageId: string, expected: Agent, check: () => void): Promise<void>;
   close(): Promise<void>;
@@ -204,6 +207,22 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
     };
     return {
       bootKey, serverId: lock.serverId, store: new FileStore(directory, lock.serverId), fetch,
+      async connection(id) {
+        await check();
+        const value = await driver.invokePluginRpc("session-recovery", CONNECTION_RPC, { op: "inspect", id }) as ConnectionOutput;
+        await check();
+        return value.protocol === 1 && value.available ? value.state ?? "unknown" : "unknown";
+      },
+      async reconnectSession(id, expected, guard) {
+        await check(); guard();
+        const current = await fetch(id);
+        if (!current || busy(current) || current.activeTurn !== null || current.archivedAt || fingerprint(current) !== fingerprint(expected)) throw new RecoveryError("The session changed before reconnecting.");
+        await check(); guard();
+        const result = await driver.invokePluginRpc("session-recovery", CONNECTION_RPC, { op: "reconnect", id, expected }) as ConnectionOutput;
+        await check(); guard();
+        if (result.protocol !== 1 || !result.available || result.state !== "loaded" || !result.agent) throw new RecoveryError("The session connection could not be restored. Open it and review its state.");
+        return metadata(result.agent);
+      },
       async goal(id, options) {
         await check();
         const agent = (await paseo.agents.ref(id).refresh())?.agent;

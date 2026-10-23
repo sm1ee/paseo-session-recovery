@@ -24,7 +24,7 @@ export const phaseSchema = z.enum(["watching", "waiting", "interrupted", "schedu
 export const reasonSchema = z.enum([
   "active", "input", "daemon_restart", "shutdown", "runtime_closed", "monitor_gap", "unknown_end", "transient_error", "provider_error",
   "attempt_limit", "too_old", "subagent", "parent_unavailable", "workspace_unavailable", "no_history", "unknown_state", "new_activity", "finished",
-  "user_stop", "archived", "missing", "excluded", "disabled", "uncertain_send", "sent", "dismissed",
+  "user_stop", "archived", "missing", "excluded", "disabled", "uncertain_send", "sent", "reconnected", "dismissed",
   "goal_check", "goal_active", "goal_paused", "goal_blocked", "goal_limited", "goal_complete", "goal_cleared", "goal_unknown", "goal_limit", "goal_disabled", "goal_unselected",
 ]);
 export type Phase = z.infer<typeof phaseSchema>;
@@ -40,7 +40,7 @@ export const reasonText: Record<Reason, string> = {
   no_history: "Provider history is unavailable", unknown_state: "The session state could not be verified", new_activity: "The conversation changed after the interruption",
   finished: "The turn finished", user_stop: "The turn was stopped", archived: "The session was archived", missing: "The session is no longer available",
   excluded: "Recovery is excluded for this session", disabled: "Automatic recovery is off", uncertain_send: "Delivery could not be confirmed. Open the session before trying again",
-  sent: "A continuation was sent", dismissed: "Recovery dismissed",
+  sent: "A continuation was sent", reconnected: "The existing session was reconnected", dismissed: "Recovery dismissed",
   goal_check: "Checking the goal recorded in the conversation", goal_active: "The turn ended with an active goal",
   goal_paused: "The goal is paused", goal_blocked: "The goal is blocked and needs review",
   goal_limited: "The goal reached a token or usage limit", goal_complete: "The goal was marked complete",
