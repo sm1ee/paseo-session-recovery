@@ -30,6 +30,9 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
         if (observed?.status === "closed" && expected.state === "active" && expected.nativeAction === "pause") {
           await controller.refresh(id).catch(() => {}); throw new Error("The session changed. Reload its controls.");
         }
+        if (observed?.activeTurn && expected.nativeReconnect) {
+          await controller.refresh(id).catch(() => {}); throw new Error("The session changed. Reload its controls.");
+        }
         const latest = await client.rpc(readGoalRpc, { id });
         if (latest.key !== expected.key || latest.action !== expected.nativeAction || !!latest.nativeStart !== !!expected.nativeStart || !!latest.reconnect !== !!expected.nativeReconnect) {
           await controller.refresh(id).catch(() => {});
@@ -54,8 +57,9 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
         const action = value?.nativeAction;
         if (!action) { if (lastPlayback) playback?.update({ visible: false }); lastPlayback = ""; return; }
         const stalePause = observed?.status === "closed" && value.state === "active" && action === "pause";
-        const shown = stalePause ? "resume" : action;
-        const disabled = value.nativeActionReady === false || stalePause;
+        const staleReconnect = !!observed?.activeTurn && value.nativeReconnect === true;
+        const shown = stalePause ? "resume" : staleReconnect ? "pause" : action;
+        const disabled = value.nativeActionReady === false || stalePause || staleReconnect;
         const signature = JSON.stringify([shown, disabled, value.source, value.nativeStart, value.nativeReconnect]);
         if (signature === lastPlayback) return;
         lastPlayback = signature;

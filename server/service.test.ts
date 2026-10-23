@@ -101,6 +101,18 @@ describe("목표 미리보기와 명시적인 네이티브 제어", () => {
     expect(f.saved.records.session).toMatchObject({ phase: "watching", turnId: "reconnected-turn" });
     expect(f.controlGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
   });
+  it("수동 재연결은 이미 선택한 추가 이어가기를 끄거나 횟수를 초기화하지 않는다", async () => {
+    const f = await controls(); await f.service.watchGoal("session", "original-goal");
+    f.a.status = "closed"; f.a.activeTurn = null; f.connection.mockResolvedValue("detached");
+    const view = await f.service.readGoalEditor("session"); await f.service.actOnGoal({ ticket: view.actionTicket! });
+    expect(f.saved.records.session.goal).toMatchObject({ key: "original-goal", selectedKey: "original-goal", attempts: 0 });
+  });
+  it("동반 모듈이 없으면 멈춘 Goal을 Pause로 표시하지 않고 Resume를 비활성화한다", async () => {
+    const f = await controls(); f.a.status = "closed"; f.a.activeTurn = undefined; f.connection.mockResolvedValue("unknown");
+    expect(await f.service.readGoalEditor("session")).toMatchObject({ action: "resume", reconnect: true, actionTicket: null });
+    expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ nativeAction: "resume", nativeReconnect: true, nativeActionReady: false });
+    expect(f.reconnectSession).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
   it.each(["goal", "permission", "running", "receipt", "budget"] as const)("재연결의 %s 변경이나 불확실성은 재실행으로 우회하지 않는다", async (block) => {
     const f = await controls(); f.a.status = "closed"; f.a.activeTurn = null; f.connection.mockResolvedValue("detached");
     const view = await f.service.readGoalEditor("session");

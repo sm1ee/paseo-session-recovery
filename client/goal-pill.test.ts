@@ -103,6 +103,11 @@ describe("목표 미리보기와 네이티브 재생 제어", () => {
     expect(f.buttons.get("goal-playback")).toMatchObject({ label: "Resume", icon: "Play", disabled: true });
     await expect(f.press()).rejects.toThrow(); expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc)).toBe(false);
   });
+  it("이미 실행을 시작한 메타데이터가 오면 오래된 재연결 Resume를 다시 실행하지 않는다", async () => {
+    const f = await fixture({ nativeAction: "resume", nativeReconnect: true }, { status: "running", activeTurn: { turnId: "native-turn" } });
+    expect(f.buttons.get("goal-playback")).toMatchObject({ label: "Pause", icon: "Pause", disabled: true });
+    await expect(f.press()).rejects.toThrow(); expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc)).toBe(false);
+  });
   it("Resume 문구가 같아도 연결 복원과 네이티브 상태 변경 티켓을 섞지 않는다", async () => {
     const f = await fixture({ nativeAction: "resume", nativeReconnect: true }, { status: "closed", activeTurn: null });
     f.setEditor({ reconnect: false }); await expect(f.press()).rejects.toThrow();

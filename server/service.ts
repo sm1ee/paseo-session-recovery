@@ -531,13 +531,15 @@ export class RecoveryService {
     if (!details.objective) return { ...view, note: source === "opencode" && !details.reading.modeId ? "Select the registered OpenCode Goal mode and set an objective with /goal <objective>." : "There is no current goal. Set one in the conversation with /goal <objective>." };
     if (!details.reading.key || !["active", "paused", "blocked", "limited"].includes(details.reading.state) || details.objective.length > goalLengthLimit(source)) return { ...view, note: "This goal is read-only in its current state. Review it in the conversation." };
     if (nativeOmp && !details.nativeStart && !["active", "paused"].includes(details.reading.state)) return { ...view, note: "OMP cannot resume this goal in its current state. Review its native limits." };
-    const reconnect = !sessionControls && !details.nativeStart && details.reading.state === "active" && a.status === "closed" && a.activeTurn === null;
+    const reconnect = !sessionControls && !details.nativeStart && details.reading.state === "active" && a.status === "closed" && a.activeTurn == null;
     view.reconnect = reconnect;
     if (reconnect) view.action = "resume";
     else if (sessionControls) view.action = busy(a) ? "pause" : "resume";
     else if (source === "codex" || source === "opencode" || nativeOmp) view.action = details.nativeStart ? "resume" : details.reading.state === "active" ? "pause" : "resume";
     const r = this.saved.records[id];
     if (reconnect && (!host.reconnectSession || !host.connection)) return { ...view, note: "Session reconnection is unavailable on this daemon." };
+    if (reconnect && await host.connection!(id) !== "detached") return { ...view, note: "Session reconnection is unavailable or its connection changed. Reload its controls." };
+    this.check(generation);
     if (sessionControls && a.activeTurn === undefined && a.status !== "closed") return { ...view, note: "The session's current turn could not be verified. Reload its goal controls." };
     if (!goalCommandReady(a) || !a.sessionId || r?.humanRequired || r?.phase === "sending" || r?.expectingStart || r?.reason === "uncertain_send") return { ...view, note: "Resolve pending input or uncertain delivery in this session before editing its goal." };
     if (!sessionControls && !controlsWhileBusy && busy(a)) return { ...view, note: details.nativeStart ? "Wait for this turn to finish before starting a native OMP goal." : "Wait for this session's current turn to finish before editing its goal. Saving starts native goal work." };
@@ -710,10 +712,10 @@ export class RecoveryService {
           value.objective = details?.objective ?? null; value.source = reading.source ?? null; value.nativeStart = details?.nativeStart === true;
           value.nativeAction = details?.nativeStart ? "resume" : details?.sessionControls && !!reading.key && ["active", "paused"].includes(reading.state) ? busy(a) ? "pause" : "resume" : (reading.source === "codex" || reading.source === "opencode" || reading.source === "omp" && details?.nativeControls) && !!reading.key
             ? reading.state === "active" ? "pause" : (reading.source === "omp" ? reading.state === "paused" : ["paused", "blocked", "limited"].includes(reading.state)) ? "resume" : null : null;
-          value.nativeReconnect = value.nativeAction === "pause" && !details?.sessionControls && reading.state === "active" && a.status === "closed" && a.activeTurn === null;
+          value.nativeReconnect = value.nativeAction === "pause" && !details?.sessionControls && reading.state === "active" && a.status === "closed" && a.activeTurn == null;
           if (value.nativeReconnect) value.nativeAction = "resume";
           value.nativeActionReady = !this.saved.excluded.includes(id) && !r?.humanRequired && r?.reason !== "uncertain_send" && r?.phase !== "sending" && !r?.expectingStart &&
-            goalCommandReady(a) && (!value.nativeReconnect || !!host.reconnectSession && !!host.connection) && (details?.sessionControls ? (a.activeTurn !== undefined || a.status === "closed") && (!busy(a) || !!a.activeTurn) : reading.source === "codex" || reading.source === "opencode" && !busy(a) || reading.source === "omp" && details?.nativeControls === true && (!details.nativeStart || !busy(a)));
+            goalCommandReady(a) && (!value.nativeReconnect || !!host.reconnectSession && await host.connection?.(id) === "detached") && (details?.sessionControls ? (a.activeTurn !== undefined || a.status === "closed") && (!busy(a) || !!a.activeTurn) : reading.source === "codex" || reading.source === "opencode" && !busy(a) || reading.source === "omp" && details?.nativeControls === true && (!details.nativeStart || !busy(a)));
         }
         const terminal = reading.state === "complete" || reading.state === "cleared";
         const selected = !terminal && !!r?.goal?.selectedKey && (!reading.key || r.goal.selectedKey === reading.key);
