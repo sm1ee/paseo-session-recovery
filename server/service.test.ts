@@ -135,6 +135,12 @@ describe("일시 장애와 데몬 종료 뒤 선택한 Goal 복구", () => {
     f.advance(HOUR); await f.service.scanNow(); await f.restart(); f.advance(HOUR); await f.service.scanNow();
     expect(f.resumeBlockedGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
   });
+  it("연결 확인 실패를 기존 Goal 이어가기 경로로 우회하지 않는다", async () => {
+    const f = await selected(); await failed(f); f.setGoal(active); f.connection.mockResolvedValue("unknown");
+    f.advance(60_000); await f.service.scanNow(); expect(f.saved.records.session.reason).toBe("unknown_state");
+    f.advance(60_000); await f.service.scanNow(); await f.restart(); f.advance(60_000); await f.service.scanNow();
+    expect(f.send).not.toHaveBeenCalled(); expect(f.reconnectSession).not.toHaveBeenCalled(); expect(f.resumeBlockedGoal).not.toHaveBeenCalled();
+  });
   it("반복 장애의 backoff와 횟수는 턴과 데몬 재시작을 넘어 유지된다", async () => {
     const f = await selected({ maxAttempts: 2 }); await failed(f); f.advance(60_000); await f.service.scanNow();
     await f.event({ kind: "start", turnId: "turn-2" } as Omit<RecoveryEvent, "agent">); await failed(f, "turn-2");

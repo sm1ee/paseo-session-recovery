@@ -19,10 +19,10 @@ interface NativeGoalResume { submitted: boolean; starts: number; pauseTurnId?: s
 interface GoalEditTicket { id: string; generation: number; changed: number; revision: string; expected: Agent; expiresAt: number }
 interface GoalActionTicket extends GoalEditTicket { action: GoalAction; source: "codex" | "opencode" | "claude" | "omp"; key: string; sessionControls?: boolean; reconnect?: boolean }
 function suspendedGoal(r: RecordEntry): boolean {
-  return isSelectedGoal(r) && ["review", "stopped"].includes(r.phase) && ["goal_paused", "goal_blocked", "goal_limited", "goal_unknown"].includes(r.reason);
+  return !r.goalInterruption && isSelectedGoal(r) && ["review", "stopped"].includes(r.phase) && ["goal_paused", "goal_blocked", "goal_limited", "goal_unknown"].includes(r.reason);
 }
 function disconnectedGoal(r: RecordEntry): boolean {
-  return isSelectedGoal(r) && r.goal?.state === "active" && !r.humanRequired && !r.expectingStart &&
+  return !r.goalInterruption && isSelectedGoal(r) && r.goal?.state === "active" && !r.humanRequired && !r.expectingStart &&
     ["monitor_gap", "unknown_end", "runtime_closed", "unknown_state"].includes(r.reason);
 }
 function interruptedGoal(r: RecordEntry): boolean {

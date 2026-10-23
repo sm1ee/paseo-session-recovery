@@ -99,7 +99,7 @@ The per-objective limit survives turns, daemon restarts, and cycling the toggle.
 
 ## Recover interrupted goals
 
-Enable **Continue selected goals** and **Recover interrupted goals** in settings, then select the goal under **Details → Extra continuation** in each session. Recover interrupted goals starts off. It does not select goals or switch models.
+Enable **Continue selected goals** and **Recover interrupted goals** in settings, then select the goal under **Details → Extra continuation** in each session. Recover interrupted goals starts off and requires the session connection companion for the verified Paseo 0.12.0 build. It does not select goals or switch models.
 
 - **Temporary provider error:** wait for the recovery delay, then verify the same goal and session. A Codex goal that became blocked after a recognized temporary failure can be resumed through its owning native connection, preserving identity, budget, usage, and the existing selection. A blocker without that observed error stays in review. Active goals can continue in the same session.
 - **Daemon restart:** reconnect selected active goals to their saved sessions, including goals that had no live turn when the daemon stopped. The connection companion is required. The provider gets time to restart its own loop before any fallback is considered.
@@ -108,7 +108,7 @@ The default recovery delay is 60 seconds, doubling after each attempt up to 15 m
 
 Recognized service/connection codes work across providers. Codex's exact “Selected model is at capacity. Please try a different model.” message is also recognized when Paseo omits its code. Raw error text is not saved. Authentication failures, unavailable models, quota/rate limits, user stops, questions, approvals, new messages, and uncertain delivery prevent automatic recovery. Paused and budget-limited goals stay stopped. OpenCode resume starts a new native budget window, so the plugin never issues it automatically. OMP receives no continuation chat message; its native loop owns continuation.
 
-The separate **Retry temporary provider errors** switch applies to ordinary session recovery. Selected-goal recovery uses **Recover interrupted goals** and its session selection instead. A completed turn ends the current recovery incident. Disabling a session's selection cancels its pending goal recovery.
+The separate **Retry temporary provider errors** switch applies to ordinary session recovery. Selected-goal recovery uses **Recover interrupted goals** and its session selection instead. A completed turn ends the current recovery incident. Disabling a session's selection cancels its pending goal recovery. Ordinary recovery of an observed unfinished turn still follows Automatic recovery.
 
 ## Recovery rules
 
