@@ -5,6 +5,7 @@ import { readGoalRpc, editGoalRpc } from "./shared/goal-editor";
 import { actOnGoalRpc } from "./shared/goal-actions";
 import { ompNativeRpc } from "./shared/omp-native-rpc";
 import { sessionConnectionRpc } from "./shared/session-connection-rpc";
+import { normalizeProviderErrorCode } from "./shared/model";
 
 export default function contribute(server: PluginServerContext) {
   const settings = server.registerSettings(preferences);
@@ -13,8 +14,8 @@ export default function contribute(server: PluginServerContext) {
   const unsubscribe = settings.subscribe((state) => state.status === "ready" ? service.configure(state.values) : service.invalidSettings());
   void configure().catch(() => {});
   server.on("agent.turn_started", (e) => service.observe({ kind: "start", agent: e.agent, turnId: e.turnId }));
-  // Keep provider codes, never conversation text or raw error messages.
-  server.on("agent.turn_ended", (e) => service.observe({ kind: "end", agent: e.agent, turnId: e.turnId, outcome: e.outcome.kind === "failed" ? { kind: "failed", error: { code: e.outcome.error.code } } : e.outcome }));
+  // Normalize code-less Codex capacity failures here; never forward raw error messages.
+  server.on("agent.turn_ended", (e) => service.observe({ kind: "end", agent: e.agent, turnId: e.turnId, outcome: e.outcome.kind === "failed" ? { kind: "failed", error: { code: normalizeProviderErrorCode(e.agent.provider, e.outcome.error) } } : e.outcome }));
   server.on("agent.permission_requested", (e) => service.observe({ kind: "permission", agent: e.agent, requestId: e.request.id }));
   server.on("agent.permission_resolved", (e) => service.observe({ kind: "resolution", agent: e.agent, requestId: e.requestId, allowed: e.resolution.behavior === "allow" }));
   server.on("agent.closed", (e) => service.observe({ kind: "closed", agent: e.agent }));

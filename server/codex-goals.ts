@@ -148,12 +148,15 @@ export class CodexGoalConnection {
   }
   private decode(data: Record<string, unknown>, checkUsage = true): GoalReading {
     if (data.goal === null) return { state: "cleared", key: null, evidence: false, source: "codex" };
-    return { ...readGoal([{ type: "tool_call", name: "get_goal", status: "completed", detail: { type: "unknown", input: {}, output: data.goal } }], { checkUsage }), source: "codex" };
+    const goal = record(data.goal), objective = typeof goal.objective === "string" ? goal.objective : null;
+    const identity = createHash("sha256").update(JSON.stringify({ id: goal.id ?? null, objective,
+      createdAt: goal.createdAt ?? goal.created_at ?? null, tokenBudget: goal.tokenBudget ?? null })).digest("hex");
+    return { ...readGoal([{ type: "tool_call", name: "get_goal", status: "completed", detail: { type: "unknown", input: {}, output: data.goal } }], { checkUsage }), source: "codex", identity };
   }
-  async resumeBlocked(threadId: string, key: string, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
+  async resumeBlocked(threadId: string, key: string, check: () => void, send: () => Promise<void>, expectedIdentity?: string): Promise<GoalReading> {
     const data = await this.get(threadId); check();
     const before = this.decode(data), goal = record(data.goal);
-    if (before.state !== "blocked" || before.key !== key) throw new Error("The Codex goal changed. Check it before trying again.");
+    if (before.state !== "blocked" || before.key !== key || expectedIdentity && before.identity !== expectedIdentity) throw new Error("The Codex goal changed. Check it before trying again.");
     if (typeof goal.tokensUsed !== "number" || !Number.isFinite(goal.tokensUsed) || goal.tokensUsed < 0 ||
       goal.tokenBudget !== null && (typeof goal.tokenBudget !== "number" || !Number.isFinite(goal.tokenBudget) || goal.tokenBudget <= 0 || goal.tokensUsed >= goal.tokenBudget)) {
       throw new Error("The Codex goal's usage limit could not be cleared safely. Review its native budget.");
@@ -163,8 +166,10 @@ export class CodexGoalConnection {
     // Never write its database or retry a command whose receipt was lost.
     await send(); check();
     for (let n = 0; n < 20; n++) {
-      const after = await this.read(threadId); check();
-      if (after.key !== key || after.state !== "blocked" && after.state !== "active") break;
+      const latest = await this.get(threadId), after = this.decode(latest), current = record(latest.goal); check();
+      if (after.key !== key || after.identity !== before.identity || current.tokenBudget !== goal.tokenBudget ||
+        typeof current.tokensUsed !== "number" || current.tokensUsed < goal.tokensUsed ||
+        after.state !== "blocked" && after.state !== "active") break;
       if (after.state === "active") return after;
       await new Promise((resolve) => setTimeout(resolve, 250)); check();
     }
@@ -211,10 +216,10 @@ export class CodexGoals {
       return { state: "unknown", key: null, evidence: true };
     }
   }
-  async resumeBlocked(provider: string, threadId: string, key: string, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
+  async resumeBlocked(provider: string, threadId: string, key: string, check: () => void, send: () => Promise<void>, identity?: string): Promise<GoalReading> {
     const reader = await this.reader(provider);
     if (!reader) throw new Error("Only native Codex blocked goals can be resumed from this toggle.");
-    return reader.resumeBlocked(threadId, key, check, send);
+    return reader.resumeBlocked(threadId, key, check, send, identity);
   }
   async details(provider: string, threadId: string): Promise<CodexGoalDetails | null> {
     if (this.closed) throw new Error("Goal reader is closed");

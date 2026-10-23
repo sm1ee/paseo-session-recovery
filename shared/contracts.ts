@@ -10,6 +10,7 @@ export const preferences = defineSettings({
     recoverSubagents: z.boolean().default(false),
     retryTransientErrors: z.boolean().default(false),
     continueGoals: z.boolean().default(false),
+    recoverInterruptedGoals: z.boolean().default(false),
     goalDelaySeconds: z.number().int().min(30).max(900).default(60),
     goalMaxAttempts: z.number().int().min(1).max(100).default(10),
     delaySeconds: z.number().int().min(30).max(900).default(60),
@@ -25,7 +26,7 @@ export const reasonSchema = z.enum([
   "active", "input", "daemon_restart", "shutdown", "runtime_closed", "monitor_gap", "unknown_end", "transient_error", "provider_error",
   "attempt_limit", "too_old", "subagent", "parent_unavailable", "workspace_unavailable", "no_history", "unknown_state", "new_activity", "finished",
   "user_stop", "archived", "missing", "excluded", "disabled", "uncertain_send", "sent", "reconnected", "dismissed",
-  "goal_check", "goal_active", "goal_paused", "goal_blocked", "goal_limited", "goal_complete", "goal_cleared", "goal_unknown", "goal_limit", "goal_disabled", "goal_unselected",
+  "goal_check", "goal_active", "goal_paused", "goal_blocked", "goal_limited", "goal_complete", "goal_cleared", "goal_unknown", "goal_limit", "goal_disabled", "goal_unselected", "goal_recovery_disabled",
 ]);
 export type Phase = z.infer<typeof phaseSchema>;
 export type Reason = z.infer<typeof reasonSchema>;
@@ -47,6 +48,7 @@ export const reasonText: Record<Reason, string> = {
   goal_cleared: "The goal was cleared or dropped", goal_unknown: "The current goal state could not be verified",
   goal_limit: "The goal continuation limit was reached", goal_disabled: "Automatic goal continuation is off",
   goal_unselected: "This goal is not selected for automatic continuation",
+  goal_recovery_disabled: "Automatic recovery of interrupted goals is off",
 };
 export const auditSchema = z.object({ at: z.number(), id: z.string(), action: z.enum(["scheduled", "resume", "review", "completed", "stopped", "dismissed", "excluded"]), reason: reasonSchema, attempt: z.number().int() });
 export const rowSchema = z.object({
