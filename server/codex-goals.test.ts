@@ -30,7 +30,7 @@ describe("Codex goal reader", () => {
     const reader = new CodexGoalConnection({ command: process.execPath, args: ["-e", script], env: {} }, process.cwd());
     try {
       const reading = await reader.read("fixture-thread");
-      expect(reading).toEqual({ state: "active", key: expect.stringMatching(/^[a-f0-9]{64}$/), evidence: true, source: "codex" });
+      expect(reading).toEqual({ state: "active", key: expect.stringMatching(/^[a-f0-9]{64}$/), evidence: true, source: "codex", identity: expect.stringMatching(/^[a-f0-9]{64}$/) });
       expect(await reader.read("fixture-thread")).toEqual(reading);
     } finally { await reader.close(); }
   });
@@ -53,8 +53,26 @@ describe("Codex goal reader", () => {
     const script = `require("node:readline").createInterface({input:process.stdin}).on("line",s=>{const m=JSON.parse(s);if(m.method==="initialized")return;if(!["initialize","thread/goal/get"].includes(m.method))process.exit(2);process.stdout.write(JSON.stringify({id:m.id,result:m.method==="initialize"?{}:{goal:JSON.parse(require("node:fs").readFileSync(process.env.GOAL_FILE,"utf8"))}})+"\\n")});`;
     const reader = new CodexGoalConnection({ command: process.execPath, args: ["-e", script], env: { GOAL_FILE: path } }, process.cwd());
     const send = vi.fn(async () => { await writeFile(path, JSON.stringify({ ...goal, status: "active" })); });
-    return { reader, send, async close() { await reader.close(); await rm(home, { recursive: true, force: true }); } };
+    return { reader, send, path, goal, async close() { await reader.close(); await rm(home, { recursive: true, force: true }); } };
   }
+  it("같은 본문의 새 Goal을 자동 장애 복구로 재개하지 않는다", async () => {
+    const f = await blockedReader();
+    try {
+      const before = await f.reader.read("fixture");
+      await writeFile(f.path, JSON.stringify({ ...f.goal, createdAt: 2 }));
+      await expect(f.reader.resumeBlocked("fixture", before.key!, () => {}, f.send, before.identity)).rejects.toThrow(/changed/);
+      expect(f.send).not.toHaveBeenCalled();
+    } finally { await f.close(); }
+  });
+  it.each([{ tokensUsed: 0 }, { tokenBudget: 40 }, { createdAt: 2 }])("재개 뒤의 예산 또는 식별자 변경 %j을 성공으로 처리하지 않는다", async (patch) => {
+    const f = await blockedReader();
+    try {
+      const before = await f.reader.read("fixture");
+      f.send.mockImplementationOnce(async () => { await writeFile(f.path, JSON.stringify({ ...f.goal, status: "active", ...patch })); });
+      await expect(f.reader.resumeBlocked("fixture", before.key!, () => {}, f.send, before.identity)).rejects.toThrow(/not confirmed/);
+      expect(f.send).toHaveBeenCalledOnce();
+    } finally { await f.close(); }
+  });
   it.each([20, null])("reactivates a blocked goal without replacing its objective or %s budget", async (budget) => {
     const f = await blockedReader("blocked", 3, budget), { reader } = f;
     try {

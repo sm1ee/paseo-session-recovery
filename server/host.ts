@@ -33,7 +33,7 @@ export interface RecoveryHost {
   goalDetails?(id: string, options?: { allowTimeline?: boolean }): Promise<GoalDetails | null>;
   controlGoal?(id: string, revision: string, action: GoalAction, expected: Agent, check: () => void, messageId: string, submitted: () => void): Promise<GoalReading>;
   editGoal?(id: string, revision: string, objective: string, expected: Agent, check: () => void, messageId: string, submitted: () => void): Promise<GoalReading>;
-  resumeBlockedGoal?(id: string, key: string, expected: Agent, check: () => void, messageId: string, submitted?: () => void): Promise<GoalReading>;
+  resumeBlockedGoal?(id: string, key: string, expected: Agent, check: () => void, messageId: string, submitted?: () => void, identity?: string): Promise<GoalReading>;
   connection?(id: string): Promise<"loaded" | "detached" | "unknown">;
   reconnectSession?(id: string, expected: Agent, check: () => void): Promise<Agent>;
   shuttingDown(): Promise<boolean>;
@@ -342,7 +342,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
             : await codexGoals.edit(agent.provider, agent.persistence.sessionId, revision, objective, guard, send);
         } catch (error) { throw new RecoveryError(error instanceof Error ? error.message : "The provider could not confirm the goal edit. Reload before trying again."); }
       },
-      async resumeBlockedGoal(id, key, expected, guard, messageId, submitted) {
+      async resumeBlockedGoal(id, key, expected, guard, messageId, submitted, identity) {
         await check(); guard();
         const agent = (await paseo.agents.ref(id).refresh())?.agent;
         const latest = agent ? metadata(agent) : null;
@@ -361,7 +361,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
             await check(); guard();
             submitted?.();
             await driver.sendAgentMessage(id, "/goal resume", { messageId, activeTurnBehavior: "steer" });
-          });
+          }, identity);
         }
         catch (error) { throw new RecoveryError(error instanceof Error ? error.message : "Codex could not resume this goal. Check its native state."); }
       },

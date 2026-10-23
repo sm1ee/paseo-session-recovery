@@ -10,7 +10,9 @@ export const recordSchema = z.object({
   phase: phaseSchema, reason: reasonSchema, dueAt: timestamp.nullable(), attempts: z.number().int().nonnegative(),
   humanRequired: z.boolean(), pendingIds: z.array(z.string()), messageAt: z.string().nullable(),
   attemptMessageId: z.string().nullable(), expectingStart: z.boolean(), revision: z.number().int().nonnegative(),
-  goal: z.object({ key: z.string().nullable(), state: z.enum(["active", "paused", "blocked", "limited", "complete", "cleared", "unknown"]), attempts: z.number().int().nonnegative(), selectedKey: z.string().nullable().default(null), modeId: z.string().optional() }).optional(),
+  goal: z.object({ key: z.string().nullable(), state: z.enum(["active", "paused", "blocked", "limited", "complete", "cleared", "unknown"]), attempts: z.number().int().nonnegative(), selectedKey: z.string().nullable().default(null), modeId: z.string().optional(), identity: z.string().optional() }).optional(),
+  goalInterruption: z.object({ key: z.string().min(1), cause: z.enum(["transient_error", "daemon_restart"]), at: timestamp,
+    identity: z.string().optional(), sessionId: z.string().nullable().optional() }).optional(),
 });
 export type RecordEntry = z.infer<typeof recordSchema>;
 export const stateSchema = z.object({
@@ -33,13 +35,26 @@ export function goalCommandReady(a: Agent): boolean { return a.persistence && a.
 export function fingerprint(a: Agent): string { return JSON.stringify(a); }
 export function backoff(settings: Preferences, attempts: number): number { return Math.min(900_000, settings.delaySeconds * 1000 * 2 ** Math.min(attempts, 10)); }
 export function isTransient(code: string | undefined): boolean {
-  return /^(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|connection_lost|connection_reset|network_error|service_unavailable|server_overloaded|502|503|504)$/i.test(code ?? "");
+  return /^(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|connection_lost|connection_reset|network_error|service_unavailable|server_overloaded|overloaded_error|model_overloaded|model_capacity_exceeded|502|503|504|529)$/i.test(code ?? "");
+}
+export function normalizeProviderErrorCode(provider: string, error: { code?: string; message: string }): string | undefined {
+  // Paseo's Codex adapter can omit the code for this exact temporary failure.
+  if (error.code === undefined && provider === "codex" && error.message === "Selected model is at capacity. Please try a different model.") return "server_overloaded";
+  return error.code;
 }
 export function isGoalContinuation(r: RecordEntry): boolean { return r.goal?.state === "active" && ["goal_active", "goal_limit", "goal_disabled", "goal_unselected"].includes(r.reason); }
 export function isSelectedGoal(r: RecordEntry): boolean { return !!r.goal?.key && r.goal.selectedKey === r.goal.key; }
 export function automaticBlock(r: RecordEntry, settings: Preferences, now: number): Reason | null {
   if (!settings.enabled) return "disabled";
   if (r.humanRequired) return "input";
+  if (r.goalInterruption) {
+    if (!isSelectedGoal(r) || r.goal!.key !== r.goalInterruption.key) return "goal_unselected";
+    if (!settings.continueGoals) return "goal_disabled";
+    if (!settings.recoverInterruptedGoals) return "goal_recovery_disabled";
+    if ((r.goal?.attempts ?? 0) >= settings.goalMaxAttempts) return "goal_limit";
+    if (r.attempts >= settings.maxAttempts) return "attempt_limit";
+    if (now < r.goalInterruption.at || now - r.goalInterruption.at > settings.maxOfflineHours * HOUR) return "too_old";
+  }
   if (r.reason === "goal_active") {
     if (!isSelectedGoal(r)) return "goal_unselected";
     if (!settings.continueGoals) return "goal_disabled";
@@ -59,7 +74,7 @@ export function snapshotBlock(a: Agent | null, r: RecordEntry, workspace: Worksp
   if (a.pendingPermissions < 0 || a.activeTurn === undefined) return "unknown_state";
   if (busy(a)) return "new_activity";
   if (!a.persistence) return "no_history";
-  if (!isGoalContinuation(r) && a.attentionReason === "finished" && time(a.attentionTimestamp) >= r.startedAt) return "finished";
+  if (!isGoalContinuation(r) && !r.goalInterruption && a.attentionReason === "finished" && time(a.attentionTimestamp) >= r.startedAt) return "finished";
   if (r.messageAt !== null && a.lastUserMessageAt !== r.messageAt) return "new_activity";
   if (r.messageAt === null && time(a.lastUserMessageAt) > r.lastSeenAt) return "new_activity";
   return null;

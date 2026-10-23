@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 export type GoalState = "active" | "paused" | "blocked" | "limited" | "complete" | "cleared" | "unknown";
 export type GoalSource = "codex" | "opencode" | "claude" | "omp";
-export interface GoalReading { state: GoalState; key: string | null; evidence: boolean; modeId?: string; source?: GoalSource | "timeline"; nativeContinuation?: boolean }
+export interface GoalReading { state: GoalState; key: string | null; evidence: boolean; modeId?: string; source?: GoalSource | "timeline"; nativeContinuation?: boolean; identity?: string }
 export interface GoalDetails {
   reading: GoalReading; objective: string | null; revision: string;
   identity?: string;

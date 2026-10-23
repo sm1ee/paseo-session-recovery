@@ -15,6 +15,7 @@ Recover interrupted Paseo sessions after a daemon restart. Preview the current g
 | Automatic subagent recovery | Off |
 | Temporary provider error retries | Off |
 | Goal continuation | Off; each session also needs an explicit selection |
+| Interrupted goal recovery | Off; selected goals only |
 | Goal continuation delay | 60 seconds |
 | Maximum goal continuations | 10 per objective |
 
@@ -38,7 +39,7 @@ Verified Codex goals have a separate **Pause / Resume** button. It changes the n
 
 **Details** in the editor has a separate **Extra continuation · On / Off** setting. Goal sessions also have a toggle on their recovery card. Turning this selection off cancels that goal's pending fallback continuation while keeping interruption recovery available. Native pause or resume clears the fallback selection; choose it again if desired. These controls do not turn off a provider's native loop.
 
-Turning the toggle on explicitly resumes a **blocked Codex goal**, then schedules its next continuation after the configured delay. For a goal already selected before this update, turn it off and on once to resume it. The goal's objective, token budget, usage, and continuation count are preserved. Pending input, an explicit session stop, and exhausted limits still prevent resumption. A later automatic check never clears another blocker.
+Turning the toggle on explicitly resumes a **blocked Codex goal**, then schedules its next continuation after the configured delay. For a goal already selected before this update, turn it off and on once to resume it. The goal's objective, token budget, usage, and continuation count are preserved. Pending input, an explicit session stop, and exhausted limits still prevent resumption. With Recover interrupted goals enabled, an observed temporary provider error can also qualify for automatic Codex resumption. Other blockers still require review.
 
 You can turn it on during a running turn. The native goal command leaves that turn running. When idle, Codex may start its own goal turn immediately after resumption. The plugin waits for that turn to finish and the configured delay to pass before sending a fallback continuation.
 
@@ -90,11 +91,24 @@ Claude previews read the selected composer's native transcript only, bounded to 
 
 Automatic composer discovery reads supported goal state without restoring a conversation. Older OMP requests require **Start goal** in the editor before they can be selected; their native loop owns continuation. For Pi and other providers that expose goals through conversation records, use **Continue this session's goal** in the Command Center to inspect and select one explicitly. Selected goals keep their automatic checks before continuation. Their composer toggle can show the last checked state without loading the conversation. Concurrent background checks for the same session share a result; sessions without a visible goal are checked again after five minutes or a relevant session change.
 
-Paused, blocked, completed, cleared, and limited goals are not automatically resumed. The native controls require an explicit user action. Selecting fallback continuation can also reactivate a blocked Codex goal after its checks. Questions, approvals, direct stops, exclusions, and uncertain delivery also block automatic continuation. The continuation message asks the agent to verify its work before marking the goal complete. The plugin cannot independently prove that a provider's completed goal was actually achieved.
+Paused, completed, cleared, and limited goals are not automatically resumed. Blocked goals require an explicit action unless the Codex temporary-error recovery described below applies. Selecting fallback continuation can also reactivate a blocked Codex goal after its checks. Questions, approvals, direct stops, exclusions, and uncertain delivery also block automatic continuation. The continuation message asks the agent to verify its work before marking the goal complete. The plugin cannot independently prove that a provider's completed goal was actually achieved.
 
 Selection is tied to the current objective in that session. A different objective, completion, or clearing the goal removes the selection. Existing goals from earlier plugin versions start unselected. An unselected goal does not create a cleanup hold just because it remains active.
 
 The per-objective limit survives turns, daemon restarts, and cycling the toggle. A different objective gets a new count. Recreating the same objective retains its count; **Reset continuation count** at the limit explicitly resets it. Turning a session toggle off cancels pending goal continuation, and leaves active turns, uncertain delivery, approvals, and ordinary interruption recovery intact. No provider settings are changed.
+
+## Recover interrupted goals
+
+Enable **Continue selected goals** and **Recover interrupted goals** in settings, then select the goal under **Details → Extra continuation** in each session. Recover interrupted goals starts off. It does not select goals or switch models.
+
+- **Temporary provider error:** wait for the recovery delay, then verify the same goal and session. A Codex goal that became blocked after a recognized temporary failure can be resumed through its owning native connection, preserving identity, budget, usage, and the existing selection. A blocker without that observed error stays in review. Active goals can continue in the same session.
+- **Daemon restart:** reconnect selected active goals to their saved sessions, including goals that had no live turn when the daemon stopped. The connection companion is required. The provider gets time to restart its own loop before any fallback is considered.
+
+The default recovery delay is 60 seconds, doubling after each attempt up to 15 minutes. At most three attempts are made per interruption, also subject to the goal continuation limit and recovery window. Counts survive turns and daemon restarts. Each scan starts at most three due recoveries; it reads tracked sessions only.
+
+Recognized service/connection codes work across providers. Codex's exact “Selected model is at capacity. Please try a different model.” message is also recognized when Paseo omits its code. Raw error text is not saved. Authentication failures, unavailable models, quota/rate limits, user stops, questions, approvals, new messages, and uncertain delivery prevent automatic recovery. Paused and budget-limited goals stay stopped. OpenCode resume starts a new native budget window, so the plugin never issues it automatically. OMP receives no continuation chat message; its native loop owns continuation.
+
+The separate **Retry temporary provider errors** switch applies to ordinary session recovery. Selected-goal recovery uses **Recover interrupted goals** and its session selection instead. A completed turn ends the current recovery incident. Disabling a session's selection cancels its pending goal recovery.
 
 ## Recovery rules
 
@@ -102,7 +116,7 @@ When a native goal is still active but its session is stopped, the playback butt
 
 Explicit stops and completed goals are never automatically resumed. A completed turn is only continued when goal continuation is enabled, the current goal is selected, and that goal is still active. Pending questions and approvals require user input. Archived or missing sessions, unavailable history, and unavailable workspaces are excluded. Subagent recovery checks every parent; an active, archived, missing, or excluded parent blocks it. Provider-internal subagents are outside this plugin's scope.
 
-Unknown interruptions go to review. Temporary provider errors are retried only when enabled and when their code is recognized. Uncertain delivery is not automatically retried, even after another restart. Open the conversation to check the result.
+Unknown interruptions go to review. Temporary provider errors are retried only when enabled and when their code is recognized. Codex's exact "Selected model is at capacity. Please try a different model." error is also recognized when Paseo omits the error code. This uses the same delay and attempt limits and continues the existing session without switching models. Uncertain delivery is not automatically retried, even after another restart. Open the conversation to check the result.
 
 Worker birth times distinguish daemon restarts from plugin reloads, including when the supervisor stays alive. Graceful shutdown detection uses Paseo 0.11.4 and 0.12.0's removal of the local credential before closing sessions. A runtime close without shutdown evidence requires review.
 
@@ -130,7 +144,7 @@ paseo plugin install /absolute/path/to/paseo-session-recovery
 
 Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed. Goal entries retry a failed initial session lookup and rebuild after reconnecting, including on mobile clients. A supported provider entry is registered before any goal-state request. Goal checks run for mounted composers, rather than scanning every saved session on each connected client.
 
-For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.6.9`. The public registry listing requires a separate review.
+For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.6.10`. The public registry listing requires a separate review.
 
 ### Session connection companion
 

@@ -68,6 +68,143 @@ function fixture(options: Record<string, unknown> = {}) {
     row() { return service.status(statusInput.parse({})).rows[0]; },
   };
 }
+describe("일시 장애와 데몬 종료 뒤 선택한 Goal 복구", () => {
+  const active: GoalReading = { state: "active", key: "fixture-goal", identity: "native-identity", evidence: true, source: "codex" };
+  async function selected(options: Record<string, unknown> = {}) {
+    const f = fixture({ continueGoals: true, recoverInterruptedGoals: true, ...options });
+    f.a.sessionId = "fixture-session"; f.setGoal(active);
+    f.setDetails({ reading: active, objective: "Fixture objective", revision: "native", identity: "native-identity", tokenBudget: 100, tokensUsed: 3 });
+    await f.track(); await f.service.watchGoal("session", active.key!); return f;
+  }
+  async function failed(f: Awaited<ReturnType<typeof selected>>, turnId = "turn-1", code = "server_overloaded") {
+    f.idle(); f.setGoal({ ...active, state: "blocked" });
+    await f.event({ kind: "end", turnId, outcome: { kind: "failed", error: { code } } } as Omit<RecoveryEvent, "agent">);
+  }
+  it("일시 장애로 blocked가 된 동일 Goal만 지연 뒤 네이티브 재개한다", async () => {
+    const f = await selected(); await failed(f);
+    expect(f.saved.records.session.goalInterruption).toMatchObject({ key: active.key, cause: "transient_error", identity: active.identity });
+    f.advance(59_999); await f.service.scanNow(); expect(f.resumeBlockedGoal).not.toHaveBeenCalled();
+    f.advance(1); await f.service.scanNow();
+    expect(f.resumeBlockedGoal).toHaveBeenCalledExactlyOnceWith("session", active.key, expect.objectContaining({ sessionId: "fixture-session" }), expect.any(Function), expect.any(String), expect.any(Function), active.identity);
+    expect(f.saved.records.session.goal).toMatchObject({ state: "active", selectedKey: active.key, attempts: 1 });
+    expect(f.send).not.toHaveBeenCalled(); expect(f.controlGoal).not.toHaveBeenCalled();
+  });
+  it.each([{ recoverInterruptedGoals: false }, { continueGoals: false }, { enabled: false }])("설정 %j이면 Goal을 자동 재개하지 않는다", async (options) => {
+    const f = await selected(options); await failed(f); f.advance(HOUR); await f.service.scanNow();
+    expect(f.resumeBlockedGoal).not.toHaveBeenCalled(); expect(f.reconnectSession).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("오류를 관찰한 뒤 설정을 켜도 새 대기 시간을 준다", async () => {
+    const f = await selected({ recoverInterruptedGoals: false }); await failed(f); f.advance(60_000);
+    await f.service.configure({ ...f.settings, recoverInterruptedGoals: true });
+    expect(f.saved.records.session.reason).toBe("transient_error"); expect(f.resumeBlockedGoal).not.toHaveBeenCalled();
+    f.advance(60_000); await f.service.scanNow(); expect(f.resumeBlockedGoal).toHaveBeenCalledOnce();
+  });
+  it("구버전에서 선택한 Goal도 명령 전에 현재 네이티브 식별자를 고정한다", async () => {
+    const f = await selected(), saved = f.saved;
+    delete saved.records.session.goal!.identity; f.setSaved(saved); await f.restart("boot-a");
+    await failed(f); f.advance(60_000); await f.service.scanNow();
+    expect(f.resumeBlockedGoal).toHaveBeenCalledExactlyOnceWith("session", active.key, expect.any(Object), expect.any(Function), expect.any(String), expect.any(Function), active.identity);
+  });
+  it.each(["usage_limit_reached", "authentication_failed", "model_not_found", "429"])("%s 오류는 일시 장애 재개로 우회하지 않는다", async (code) => {
+    const f = await selected(); await failed(f, "turn-1", code); f.advance(HOUR); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("provider_error"); expect(f.resumeBlockedGoal).not.toHaveBeenCalled();
+  });
+  it.each(["paused", "limited", "complete", "cleared", "unknown"] as const)("장애 뒤 %s Goal은 재개하지 않는다", async (state) => {
+    const f = await selected(); await failed(f); f.setGoal({ ...active, state }); f.advance(60_000); await f.service.scanNow();
+    expect(f.resumeBlockedGoal).not.toHaveBeenCalled(); expect(f.reconnectSession).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it.each(["key", "identity"] as const)("같은 세션의 %s 변경을 이전 Goal의 장애로 처리하지 않는다", async (field) => {
+    const f = await selected(); await failed(f); f.setGoal({ ...active, state: "blocked", [field]: "replacement" });
+    f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("new_activity"); expect(f.saved.records.session.goal?.selectedKey).toBeNull(); expect(f.resumeBlockedGoal).not.toHaveBeenCalled();
+  });
+  it.each(["stop", "permission", "message", "unwatch", "exclude", "disable"] as const)("대기 중 %s가 오면 재개하지 않는다", async (action) => {
+    const f = await selected(); await failed(f);
+    if (action === "stop") await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
+    if (action === "permission") await f.event({ kind: "permission", requestId: "approval" } as Omit<RecoveryEvent, "agent">);
+    if (action === "message") f.a.lastUserMessageAt = new Date(epoch + 30_000).toISOString();
+    if (action === "unwatch") await f.service.unwatchGoal("session");
+    if (action === "exclude") await f.service.exclude("session", true);
+    if (action === "disable") await f.service.configure({ ...f.settings, recoverInterruptedGoals: false });
+    f.advance(HOUR); await f.service.scanNow();
+    expect(f.resumeBlockedGoal).not.toHaveBeenCalled(); expect(f.reconnectSession).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("일시 오류 근거 없이 blocked가 된 목표는 새 설정으로도 재개하지 않는다", async () => {
+    const f = await selected(); f.idle(); f.setGoal({ ...active, state: "blocked" });
+    await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "completed" } } as Omit<RecoveryEvent, "agent">);
+    f.advance(HOUR); await f.service.scanNow(); await f.restart(); f.advance(HOUR); await f.service.scanNow();
+    expect(f.resumeBlockedGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("반복 장애의 backoff와 횟수는 턴과 데몬 재시작을 넘어 유지된다", async () => {
+    const f = await selected({ maxAttempts: 2 }); await failed(f); f.advance(60_000); await f.service.scanNow();
+    await f.event({ kind: "start", turnId: "turn-2" } as Omit<RecoveryEvent, "agent">); await failed(f, "turn-2");
+    await f.restart(); f.advance(119_999); await f.service.scanNow(); expect(f.resumeBlockedGoal).toHaveBeenCalledTimes(1);
+    f.advance(1); await f.service.scanNow(); expect(f.resumeBlockedGoal).toHaveBeenCalledTimes(2);
+    await f.event({ kind: "start", turnId: "turn-3" } as Omit<RecoveryEvent, "agent">); await failed(f, "turn-3");
+    f.advance(HOUR); await f.service.scanNow(); expect(f.saved.records.session.reason).toBe("attempt_limit");
+    await f.restart("boot-c"); f.advance(HOUR); await f.service.scanNow(); expect(f.resumeBlockedGoal).toHaveBeenCalledTimes(2);
+    expect(f.saved.records.session.goal?.attempts).toBe(2);
+  });
+  it("수신 확인을 잃은 Goal 재개는 데몬 재시작 후에도 반복하지 않는다", async () => {
+    const f = await selected(); await failed(f);
+    f.resumeBlockedGoal.mockImplementationOnce(async (_id, _key, _expected, check, _messageId, submitted) => { check(); submitted?.(); throw new Error("Receipt lost"); });
+    f.advance(60_000); await f.service.scanNow(); expect(f.saved.records.session.reason).toBe("uncertain_send");
+    await f.restart(); f.advance(HOUR); await f.service.scanNow(); expect(f.resumeBlockedGoal).toHaveBeenCalledOnce(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("데몬이 죽으면 실행 중인 턴이 없던 선택 Goal도 기존 세션에 재연결한다", async () => {
+    const f = await selected(); f.idle(); await f.service.scanNow();
+    f.a.status = "closed"; f.connection.mockResolvedValue("detached");
+    await f.restart(); expect(f.saved.records.session.reason).toBe("daemon_restart");
+    f.advance(60_000); await f.service.scanNow();
+    expect(f.reconnectSession).toHaveBeenCalledOnce(); expect(f.resumeBlockedGoal).not.toHaveBeenCalled(); expect(f.controlGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+    expect(f.saved.records.session.goal).toMatchObject({ selectedKey: active.key, attempts: 1 });
+  });
+  it.each(["codex", "omp", "opencode", "claude"] as const)("데몬 종료 뒤 %s Goal은 예산을 초기화하지 않고 재연결한다", async (source) => {
+    const f = await selected(); const reading = { ...active, source, nativeContinuation: source !== "codex" };
+    f.setGoal(reading); f.setDetails({ reading, objective: "Fixture objective", revision: "native", identity: active.identity, tokenBudget: 100, tokensUsed: 3 });
+    f.a.status = "closed"; f.a.activeTurn = null; f.connection.mockResolvedValue("detached");
+    await f.restart(); f.advance(60_000); await f.service.scanNow();
+    expect(f.reconnectSession).toHaveBeenCalledOnce(); expect(f.controlGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("재연결 중 예산 초기화는 성공으로 처리하지 않고 반복을 차단한다", async () => {
+    const f = await selected(); f.a.status = "closed"; f.a.activeTurn = null; f.connection.mockResolvedValue("detached");
+    f.reconnectSession.mockImplementationOnce(async () => { f.setDetails({ reading: active, objective: "Fixture objective", revision: "native", identity: active.identity, tokenBudget: 100, tokensUsed: 0 }); return structuredClone(f.a); });
+    await f.restart(); f.advance(60_000); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("uncertain_send"); await f.restart("boot-c"); f.advance(HOUR); await f.service.scanNow();
+    expect(f.reconnectSession).toHaveBeenCalledOnce();
+  });
+  it("수동 중지한 Goal은 데몬이 바뀌어도 다시 연결하지 않는다", async () => {
+    const f = await selected(); f.idle(); await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
+    f.a.status = "closed"; f.connection.mockResolvedValue("detached"); await f.restart(); f.advance(HOUR); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("user_stop"); expect(f.reconnectSession).not.toHaveBeenCalled();
+  });
+  it("여러 Goal이 멈춰도 한 번의 스캔에서 복구를 세 개까지만 시작한다", async () => {
+    const f = await selected(); f.a.status = "closed"; f.a.activeTurn = null; f.connection.mockResolvedValue("detached");
+    const saved = f.saved, original = saved.records.session;
+    for (let i = 1; i < 12; i++) {
+      const id = `session-${i}`; saved.records[id] = { ...structuredClone(original), id };
+      f.others.set(id, { ...structuredClone(f.a), id });
+    }
+    f.setSaved(saved); f.reconnectSession.mockImplementation(async (id, _expected, check) => { check(); return structuredClone(id === "session" ? f.a : f.others.get(id)!); });
+    await f.restart(); f.advance(60_000); f.fetch.mockClear(); await f.service.scanNow();
+    expect(f.reconnectSession).toHaveBeenCalledTimes(3);
+    expect(new Set(f.fetch.mock.calls.map(([id]) => id)).size).toBe(3);
+    expect(f.send).not.toHaveBeenCalled();
+  });
+  it("대기 중 네이티브 Pause를 직접 누르면 일반 세션 복구로도 재실행하지 않는다", async () => {
+    const f = await selected(); await failed(f);
+    // 네이티브 Goal은 아직 active인 채 연결 오류로 턴만 끝난 경우.
+    f.setGoal(active); const view = await f.service.readGoalEditor("session");
+    expect(view.action).toBe("pause"); await f.service.actOnGoal({ ticket: view.actionTicket! });
+    f.advance(HOUR); await f.service.scanNow(); await f.restart(); f.advance(HOUR); await f.service.scanNow();
+    expect(f.saved.records.session.reason).toBe("goal_paused"); expect(f.resumeBlockedGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("전체 복구를 다시 켜도 기존 장애에 새 대기 시간을 적용한다", async () => {
+    const f = await selected({ enabled: false }); await failed(f); f.advance(HOUR); await f.service.scanNow();
+    await f.service.configure({ ...f.settings, enabled: true }); expect(f.resumeBlockedGoal).not.toHaveBeenCalled();
+    f.advance(60_000); await f.service.scanNow(); expect(f.resumeBlockedGoal).toHaveBeenCalledOnce();
+  });
+});
 describe("목표 미리보기와 명시적인 네이티브 제어", () => {
   async function controls(source: "codex" | "opencode" | "claude" | "omp" = "codex", state: GoalReading["state"] = "active") {
     const f = fixture({ enabled: false, continueGoals: false }); f.a.provider = source; f.a.sessionId = "native-fixture"; f.idle();
@@ -1206,6 +1343,36 @@ describe("restart recovery", () => {
   });
 });
 describe("bounded attempts and delivery", () => {
+  it("retries a normalized Codex capacity failure with bounded backoff in the same session", async () => {
+    const f = fixture({ retryTransientErrors: true, maxAttempts: 2 }); await f.track(); f.idle();
+    for (const [index, delay] of [60_000, 120_000].entries()) {
+      const turnId = `turn-${index + 1}`;
+      if (index) await f.event({ kind: "start", turnId } as Omit<RecoveryEvent, "agent">);
+      await f.event({ kind: "end", turnId, outcome: { kind: "failed", error: { code: "server_overloaded" } } } as Omit<RecoveryEvent, "agent">);
+      expect(f.row()?.reason).toBe("transient_error");
+      f.advance(delay - 1); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(index);
+      f.advance(1); await f.service.scanNow(); expect(f.send).toHaveBeenCalledTimes(index + 1);
+      expect(f.send.mock.calls[index]![0]).toBe("session");
+      expect(f.send.mock.calls[index]![3].provider).toBe("codex");
+    }
+    await f.event({ kind: "start", turnId: "turn-3" } as Omit<RecoveryEvent, "agent">);
+    await f.event({ kind: "end", turnId: "turn-3", outcome: { kind: "failed", error: { code: "server_overloaded" } } } as Omit<RecoveryEvent, "agent">);
+    f.advance(HOUR); await f.service.scanNow(); expect(f.row()?.reason).toBe("attempt_limit"); expect(f.send).toHaveBeenCalledTimes(2);
+  });
+  it("keeps normalized capacity failures in review until transient retries are enabled", async () => {
+    const f = fixture(); await f.track(); f.idle();
+    await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "failed", error: { code: "server_overloaded" } } } as Omit<RecoveryEvent, "agent">);
+    f.advance(HOUR); await f.service.scanNow(); expect(f.row()?.reason).toBe("provider_error"); expect(f.send).not.toHaveBeenCalled();
+  });
+  it.each(["stop", "permission", "message"] as const)("blocks a scheduled capacity retry after %s", async (action) => {
+    const f = fixture({ retryTransientErrors: true }); await f.track(); f.idle();
+    await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "failed", error: { code: "server_overloaded" } } } as Omit<RecoveryEvent, "agent">);
+    expect(f.row()?.reason).toBe("transient_error");
+    if (action === "stop") await f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">);
+    else if (action === "permission") await f.event({ kind: "permission", requestId: "approval" } as Omit<RecoveryEvent, "agent">);
+    else f.a.lastUserMessageAt = new Date(epoch + 30_000).toISOString();
+    f.advance(HOUR); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+  });
   it("never automatically repeats a submission with an unknown result", async () => {
     const f = fixture(); await f.track(); f.idle(); await f.restart();
     f.send.mockRejectedValueOnce(new Error("response lost")); f.advance(60_000); await f.service.scanNow();

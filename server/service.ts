@@ -25,6 +25,10 @@ function disconnectedGoal(r: RecordEntry): boolean {
   return isSelectedGoal(r) && r.goal?.state === "active" && !r.humanRequired && !r.expectingStart &&
     ["monitor_gap", "unknown_end", "runtime_closed", "unknown_state"].includes(r.reason);
 }
+function interruptedGoal(r: RecordEntry): boolean {
+  return !!r.goalInterruption && ["scheduled", "review"].includes(r.phase) &&
+    ["transient_error", "daemon_restart", "goal_recovery_disabled", "goal_disabled", "disabled"].includes(r.reason);
+}
 export class RecoveryService {
   private host: RecoveryHost | null = null;
   private saved: SavedState = emptyState("");
@@ -92,6 +96,11 @@ export class RecoveryService {
           if (!OPEN_PHASES.has(r.phase)) continue;
           if (r.phase === "sending" || r.expectingStart) this.review(r, "uncertain_send");
           else if (r.humanRequired || r.phase === "waiting") this.review(r, "input");
+          else if (this.settings.recoverInterruptedGoals && isSelectedGoal(r) && r.goal?.state === "active" && !r.goalInterruption &&
+            ["active", "goal_active", "goal_check", "monitor_gap", "unknown_end", "runtime_closed", "shutdown", "daemon_restart"].includes(r.reason)) {
+            r.goalInterruption = { key: r.goal.key!, cause: "daemon_restart", at: r.lastSeenAt, ...(r.goal.identity ? { identity: r.goal.identity } : {}) };
+            this.scheduled(r, "daemon_restart");
+          }
           else if ((r.phase === "watching" || r.phase === "interrupted") && r.turnId) this.scheduled(r, "daemon_restart");
           else if (r.phase === "watching" || r.phase === "interrupted") this.review(r, "unknown_state");
           if (r.phase === "scheduled") r.dueAt = this.now() + (r.reason === "goal_active" ? this.settings.goalDelaySeconds * 1000 : backoff(this.settings, r.attempts));
@@ -121,11 +130,14 @@ export class RecoveryService {
       if (settings.daemonHome !== this.settings.daemonHome && this.host) { await this.host.close(); this.host = null; }
       const enabling = !this.settings.enabled && settings.enabled;
       const enablingGoals = !this.settings.continueGoals && settings.continueGoals;
+      const enablingGoalRecovery = !this.settings.recoverInterruptedGoals && settings.recoverInterruptedGoals;
       this.settings = settings;
       this.validSettings = true;
       this.configuredGeneration = generation;
       if (enabling) for (const r of Object.values(this.saved.records)) if (r.phase === "scheduled") r.dueAt = this.now() + (r.reason === "goal_active" ? settings.goalDelaySeconds * 1000 : backoff(settings, r.attempts));
       for (const r of Object.values(this.saved.records)) {
+        if (r.goalInterruption && isSelectedGoal(r) && settings.continueGoals && settings.recoverInterruptedGoals &&
+          (enabling || enablingGoals || enablingGoalRecovery) && ["goal_recovery_disabled", "goal_disabled", "disabled"].includes(r.reason)) this.scheduled(r, r.goalInterruption.cause);
         if (isSelectedGoal(r) && r.goal?.state === "active" && (enablingGoals && r.reason === "goal_disabled" || settings.continueGoals && r.reason === "goal_limit" && r.goal.attempts < settings.goalMaxAttempts)) this.set(r, "review", "goal_check");
       }
       try { await this.scan(generation); } finally { this.scheduleTimer(); }
@@ -157,12 +169,13 @@ export class RecoveryService {
       const host = await this.ready(); const id = event.agent.id;
       let r = this.saved.records[id];
       if (event.kind === "start") {
-        const continuing = r && OPEN_PHASES.has(r.phase) && (r.expectingStart || ["watching", "waiting"].includes(r.phase));
+        const continuing = r && OPEN_PHASES.has(r.phase) && (r.expectingStart || !!r.goalInterruption || ["watching", "waiting"].includes(r.phase));
         r = { id, title: event.agent.title || `Untitled session (${id.slice(0, 8)})`, provider: event.agent.provider,
           workspaceId: event.agent.workspaceId, parentId: event.agent.parentAgentId, turnId: event.turnId, bootKey: host.bootKey,
           startedAt: at, lastSeenAt: at, phase: "watching", reason: "active", dueAt: null, attempts: continuing ? r!.attempts : 0,
           humanRequired: false, pendingIds: [], messageAt: null, attemptMessageId: continuing ? r!.attemptMessageId : null,
-          expectingStart: false, revision: (r?.revision ?? 0) + 1, ...(r?.goal ? { goal: r.goal } : {}) };
+          expectingStart: false, revision: (r?.revision ?? 0) + 1, ...(r?.goal ? { goal: r.goal } : {}),
+          ...(continuing && r?.goalInterruption ? { goalInterruption: r.goalInterruption } : {}) };
         this.saved.records[id] = r;
         const finished = Object.values(this.saved.records).filter((x) => !OPEN_PHASES.has(x.phase)).sort((a, b) => b.lastSeenAt - a.lastSeenAt);
         for (const old of finished.slice(200)) delete this.saved.records[old.id];
@@ -172,13 +185,14 @@ export class RecoveryService {
         if (event.kind === "end" && event.turnId && r.turnId && event.turnId !== r.turnId) return;
         r.revision++;
         if (event.kind === "permission") {
+          delete r.goalInterruption;
           if (!r.pendingIds.includes(event.requestId)) r.pendingIds.push(event.requestId);
           r.humanRequired = true; this.set(r, "waiting", "input");
         } else if (event.kind === "resolution") {
           const knownRequest = r.pendingIds.includes(event.requestId);
           r.pendingIds = r.pendingIds.filter((x) => x !== event.requestId);
           if (knownRequest && event.allowed && !r.pendingIds.length) { r.humanRequired = false; this.set(r, "watching", "active"); }
-        } else if (event.kind === "archived") { this.set(r, "stopped", "archived"); r.expectingStart = false; }
+        } else if (event.kind === "archived") { delete r.goalInterruption; this.set(r, "stopped", "archived"); r.expectingStart = false; }
         else if (event.kind === "closed") {
           if (["watching", "waiting", "resumed"].includes(r.phase)) {
             if (!r.humanRequired && await host.shuttingDown()) this.set(r, "interrupted", "shutdown");
@@ -187,6 +201,7 @@ export class RecoveryService {
         } else if (event.kind === "end") {
           r.expectingStart = false;
           if (event.outcome.kind === "completed") {
+            delete r.goalInterruption; r.attempts = 0;
             r.lastSeenAt = at;
             if ((this.settings.continueGoals || r.goal?.selectedKey) && r.humanRequired) this.review(r, "input");
             else if (this.settings.continueGoals || r.goal?.selectedKey) this.set(r, "review", "goal_check");
@@ -194,10 +209,16 @@ export class RecoveryService {
           }
           else if (event.outcome.kind === "canceled") {
             if (!r.humanRequired && await host.shuttingDown()) this.set(r, "interrupted", "shutdown");
-            else { this.set(r, "stopped", "user_stop"); this.audit(r, "stopped"); }
+            else { delete r.goalInterruption; this.set(r, "stopped", "user_stop"); this.audit(r, "stopped"); }
           } else if (r.humanRequired) this.review(r, "input");
+          else if (isTransient(event.outcome.error.code) && isSelectedGoal(r) && (r.goal?.state === "active" || r.goalInterruption?.key === r.goal?.key)) {
+            r.goalInterruption = { key: r.goal!.key!, cause: "transient_error", at: r.goalInterruption?.at ?? at,
+              ...(r.goal!.identity ? { identity: r.goal!.identity } : {}) };
+            if (this.settings.recoverInterruptedGoals) this.scheduled(r, "transient_error");
+            else this.review(r, "goal_recovery_disabled");
+          }
           else if (this.settings.retryTransientErrors && isTransient(event.outcome.error.code)) this.scheduled(r, "transient_error");
-          else this.review(r, "provider_error");
+          else { delete r.goalInterruption; this.review(r, "provider_error"); }
         }
       }
       await this.persist();
@@ -225,9 +246,11 @@ export class RecoveryService {
     if (!reading.evidence && !r.goal) { this.set(r, "completed", "finished"); this.audit(r, "completed"); return; }
     const previous = r.goal;
     const state = reading.state === "active" && !reading.key ? "unknown" : reading.state;
-    const selectedKey = state === "complete" || state === "cleared" ? null : previous?.selectedKey && (!reading.key || previous.selectedKey === reading.key) ? previous.selectedKey : null;
+    const selectedKey = state === "complete" || state === "cleared" || previous?.identity && reading.identity && previous.identity !== reading.identity
+      ? null : previous?.selectedKey && (!reading.key || previous.selectedKey === reading.key) ? previous.selectedKey : null;
     r.goal = { key: reading.key ?? previous?.key ?? null, state, selectedKey, attempts: !reading.key || previous?.key === reading.key || previous?.selectedKey === reading.key ? previous?.attempts ?? 0 : 0,
-      ...(reading.modeId ? { modeId: reading.modeId } : {}) };
+      ...(reading.modeId ? { modeId: reading.modeId } : {}), ...(reading.identity ? { identity: reading.identity } : {}) };
+    if (!selectedKey || ["paused", "limited", "complete", "cleared"].includes(state)) delete r.goalInterruption;
     if (state === "active") {
       if (reading.source === "omp" && !reading.nativeContinuation) {
         if (isSelectedGoal(r)) { if (r.phase !== "review" || r.reason !== "goal_unknown") this.review(r, "goal_unknown"); }
@@ -256,7 +279,7 @@ export class RecoveryService {
       this.check(generation); const host = await this.ready();
       const all = Object.values(this.saved.records).filter((r) => (OPEN_PHASES.has(r.phase) || suspendedGoal(r)) && !this.saved.excluded.includes(r.id));
       const due = all.filter((r) => r.phase === "scheduled").sort((a, b) => (a.dueAt ?? 0) - (b.dueAt ?? 0));
-      const watch = all.filter((r) => disconnectedGoal(r) || suspendedGoal(r) || ["watching", "waiting", "resumed"].includes(r.phase) || r.phase === "review" && ["monitor_gap", "unknown_end", "runtime_closed", "goal_check"].includes(r.reason));
+      const watch = all.filter((r) => interruptedGoal(r) && r.phase !== "scheduled" || disconnectedGoal(r) || suspendedGoal(r) || ["watching", "waiting", "resumed"].includes(r.phase) || r.phase === "review" && ["monitor_gap", "unknown_end", "runtime_closed", "goal_check"].includes(r.reason));
       const rotating = watch.slice(this.cursor).concat(watch.slice(0, this.cursor));
       const batch = [...new Set([...due.slice(0, 3), ...rotating.slice(0, 7)])]; this.cursor = watch.length ? (this.cursor + 7) % watch.length : 0;
       // Read tracked sessions only. Old idle sessions are never discovered or resumed.
@@ -265,13 +288,20 @@ export class RecoveryService {
         const a = await host.fetch(r.id); this.check(generation);
         if ((this.changes.get(r.id) ?? 0) !== changed) continue;
         if (!a || a.archivedAt) { this.set(r, "stopped", a ? "archived" : "missing"); continue; }
-        if (a.pendingPermissions > 0) { r.humanRequired = true; this.set(r, "waiting", "input"); r.lastSeenAt = this.now(); continue; }
+        if (a.pendingPermissions > 0) { delete r.goalInterruption; r.humanRequired = true; this.set(r, "waiting", "input"); r.lastSeenAt = this.now(); continue; }
         if (a.activeTurn && a.pendingPermissions === 0) {
           if (r.phase !== "watching") this.set(r, "watching", "active");
           r.turnId = a.activeTurn; r.bootKey = host.bootKey; r.lastSeenAt = this.now(); r.messageAt = a.lastUserMessageAt; r.expectingStart = false; continue;
         }
         if (r.expectingStart) {
           if (this.now() - r.lastSeenAt >= 30_000) this.review(r, "uncertain_send");
+          continue;
+        }
+        if (interruptedGoal(r)) {
+          const block = automaticBlock(r, this.settings, this.now());
+          if (block) { if (r.reason !== block) this.review(r, block); continue; }
+          if (r.phase !== "scheduled") this.scheduled(r, r.goalInterruption!.cause);
+          if ((r.dueAt ?? Infinity) <= this.now()) await this.attempt(r, false, generation);
           continue;
         }
         if (r.reason === "goal_check" || r.reason === "goal_active" || disconnectedGoal(r) || suspendedGoal(r)) {
@@ -314,7 +344,90 @@ export class RecoveryService {
     }
     return { ok: true };
   }
+  private async attemptInterruptedGoal(r: RecordEntry, generation: number): Promise<void> {
+    const host = await this.ready(), interruption = r.goalInterruption!;
+    const changed = this.changes.get(r.id) ?? 0;
+    const native: NativeGoalResume = { submitted: false, starts: 0 };
+    const guard = () => {
+      this.check(generation);
+      if ((this.changes.get(r.id) ?? 0) !== changed + native.starts || this.saved.excluded.includes(r.id)) throw new RecoveryError("The session changed during goal recovery. Review it before trying again.");
+    };
+    guard();
+    const block = automaticBlock(r, this.settings, this.now());
+    if (block) { this.review(r, block); return; }
+    const result = await this.verified(r, host); guard();
+    if (result.reason || !result.agent) { this.review(r, result.reason ?? "unknown_state"); return; }
+    const agent = result.agent;
+    if (interruption.sessionId !== undefined && interruption.sessionId !== agent.sessionId) { this.review(r, "new_activity"); return; }
+    const reading = await host.goal?.(r.id, { allowTimeline: false, inspectOmp: true }); guard();
+    if (!reading?.evidence || !reading.key) { this.review(r, "goal_unknown"); return; }
+    if (reading.key !== interruption.key || interruption.identity && reading.identity !== interruption.identity) {
+      r.goal!.selectedKey = null; delete r.goalInterruption; this.review(r, "new_activity"); return;
+    }
+    // Older journals selected an objective without saving its native identity.
+    // Bind the current matching goal before any command, then require that
+    // identity throughout this incident and inside the provider adapter.
+    if (!interruption.identity && reading.source === "codex" && reading.identity) {
+      interruption.identity = reading.identity; r.goal!.identity = reading.identity;
+    }
+    r.goal!.state = reading.state;
+    if (reading.state !== "active" && !(reading.state === "blocked" && reading.source === "codex" && interruption.cause === "transient_error" && interruption.identity)) {
+      delete r.goalInterruption;
+      await this.inspectGoal(r, host); guard(); return;
+    }
+    const connection = await host.connection?.(r.id) ?? "unknown"; guard();
+    if (connection === "unknown") { this.review(r, "unknown_state"); return; }
+    const reconnect = connection === "detached";
+    if (reconnect && !host.reconnectSession) { this.review(r, "unknown_state"); return; }
+    const before = reconnect ? await host.goalDetails?.(r.id, { allowTimeline: false }) : null; guard();
+    if (reconnect && (!before || before.reading.key !== interruption.key || before.reading.state !== reading.state ||
+      interruption.identity && before.identity !== interruption.identity)) { this.review(r, "goal_unknown"); return; }
+    if (!reconnect && reading.state === "blocked" && (!host.resumeBlockedGoal || !await host.supportsGoalCommand?.(r.id))) { this.review(r, "goal_blocked"); return; }
+    guard();
+    // The native loop owns active OMP/OpenCode continuations. Reconnection is
+    // enough to restore its owner; never add a prompt or renew a budget window.
+    if (!reconnect && reading.nativeContinuation && reading.source !== "claude") {
+      this.set(r, "review", "goal_check"); return;
+    }
+    if (!reconnect && reading.source === "omp") { this.review(r, "goal_unknown"); return; }
+    const messageId = `session-recovery-goal-${randomUUID()}`;
+    interruption.sessionId = agent.sessionId ?? null;
+    this.set(r, "sending", interruption.cause); r.attemptMessageId = messageId;
+    r.attempts++; r.goal!.attempts++; r.lastSeenAt = this.now();
+    await this.persist();
+    this.nativeGoalResumes.set(r.id, native);
+    try {
+      guard();
+      if (reconnect) {
+        native.submitted = true;
+        const current = await host.reconnectSession!(r.id, agent, guard); guard();
+        const after = await host.goalDetails?.(r.id, { allowTimeline: false }); guard();
+        if (!after || after.reading.key !== before!.reading.key || after.reading.source !== before!.reading.source ||
+          after.identity !== before!.identity || after.objective !== before!.objective || after.tokenBudget !== before!.tokenBudget ||
+          before!.tokensUsed !== null && (after.tokensUsed === null || after.tokensUsed < before!.tokensUsed)) throw new RecoveryError("The goal identity or budget changed while reconnecting.");
+        r.goal!.state = after.reading.state; r.messageAt = current.lastUserMessageAt;
+        if (after.reading.state === "blocked" && interruption.cause === "transient_error") this.scheduled(r, "transient_error");
+        else this.set(r, "review", "goal_check");
+        this.audit(r, "resume", "reconnected");
+      } else if (reading.state === "blocked") {
+        const resumed = await host.resumeBlockedGoal!(r.id, interruption.key, agent, guard, messageId, () => { native.submitted = true; }, interruption.identity); guard();
+        if (resumed.state !== "active" || resumed.key !== interruption.key || resumed.identity !== interruption.identity) throw new RecoveryError("The same goal has not confirmed resumption.");
+        const current = await host.fetch(r.id); guard();
+        if (!current || current.archivedAt || current.provider !== agent.provider || current.workspaceId !== agent.workspaceId || current.parentId !== agent.parentId || current.sessionId !== agent.sessionId) throw new RecoveryError("The session changed while its goal resumed.");
+        r.goal!.state = "active"; r.messageAt = current.lastUserMessageAt;
+        this.set(r, "review", "goal_check"); this.audit(r, "resume");
+      } else {
+        native.submitted = true; r.expectingStart = true;
+        await host.send(r.id, GOAL_PROMPT, messageId, agent, guard); guard();
+        this.set(r, "resumed", "sent"); this.audit(r, "resume");
+      }
+    } catch {
+      this.review(r, native.submitted ? "uncertain_send" : "provider_error");
+    } finally { this.nativeGoalResumes.delete(r.id); }
+    await this.persist();
+  }
   private async attempt(r: RecordEntry, manual: boolean, generation: number, ticket?: Ticket): Promise<void> {
+    if (!manual && interruptedGoal(r)) return this.attemptInterruptedGoal(r, generation);
     const host = await this.ready(); const changed = this.changes.get(r.id) ?? 0;
     let reconnecting: NativeGoalResume | undefined;
     const guard = () => { this.check(generation); if ((this.changes.get(r.id) ?? 0) !== changed + (reconnecting?.starts ?? 0) || this.saved.excluded.includes(r.id)) throw new RecoveryError("The session changed during recovery. Open it before trying again."); };
@@ -459,7 +572,7 @@ export class RecoveryService {
       }
       const previous = this.saved.records[id]; const at = this.now();
       const goal = { key: reading.key, state: reading.state, selectedKey: reading.key, attempts: !resetAttempts && previous?.goal?.key === reading.key ? previous.goal.attempts : 0,
-        ...(reading.modeId ? { modeId: reading.modeId } : {}) };
+        ...(reading.modeId ? { modeId: reading.modeId } : {}), ...(reading.identity ? { identity: reading.identity } : {}) };
       // Selecting a goal must not replace an unresolved interruption or approval.
       if (!reactivating && previous && OPEN_PHASES.has(previous.phase) && !previous.reason.startsWith("goal_") && !["watching", "waiting"].includes(previous.phase)) {
         previous.goal = goal; previous.revision++; await this.persist(); return { ok: true };
@@ -482,6 +595,10 @@ export class RecoveryService {
       await this.ready(); const r = this.saved.records[id];
       if (r?.goal) {
         r.goal.selectedKey = null; r.revision++;
+        if (r.goalInterruption) {
+          delete r.goalInterruption;
+          if (["scheduled", "review"].includes(r.phase) && !r.humanRequired && !r.expectingStart && r.reason !== "uncertain_send") this.set(r, "completed", "goal_unselected");
+        }
         if (r.reason.startsWith("goal_") && ["scheduled", "review"].includes(r.phase) && !r.humanRequired && !r.expectingStart) this.set(r, "completed", "goal_unselected");
         await this.persist();
       }
@@ -633,7 +750,8 @@ export class RecoveryService {
           // Native controls clear only fallback goal selection. Preserve an
           // independently tracked interruption, current turn, or user stop.
           this.saved.records[id] = { ...previous, goal: intent.goal, revision: intent.revision + 1 };
-          if (previous.reason.startsWith("goal_")) this.set(this.saved.records[id], "completed", ticket.action === "pause" ? "goal_paused" : "goal_unselected");
+          delete this.saved.records[id].goalInterruption;
+          if (previous.reason.startsWith("goal_") || previous.goalInterruption) this.set(this.saved.records[id], "completed", ticket.action === "pause" ? "goal_paused" : "goal_unselected");
         } else this.set(intent, "completed", ticket.action === "pause" ? "goal_paused" : "goal_unselected");
         await this.persist(); return { ok: true };
       } catch (error) {
@@ -666,8 +784,9 @@ export class RecoveryService {
         const reading = await host.editGoal(id, ticket.revision, objective, ticket.expected, guard, `session-recovery-edit-${randomUUID()}`, () => { submitted = true; nativeEdit.submitted = true; });
         guard();
         if (r?.goal && reading.key !== r.goal.key) {
+          const interrupted = !!r.goalInterruption; delete r.goalInterruption;
           r.goal = { key: reading.key, state: reading.state, selectedKey: null, attempts: 0 }; r.revision++;
-          if (r.reason.startsWith("goal_") && ["scheduled", "review"].includes(r.phase) && !r.humanRequired && !r.expectingStart) this.set(r, "completed", "goal_unselected");
+          if ((r.reason.startsWith("goal_") || interrupted) && ["scheduled", "review"].includes(r.phase) && !r.humanRequired && !r.expectingStart) this.set(r, "completed", "goal_unselected");
           await this.persist();
         }
         return { ok: true };
@@ -729,10 +848,12 @@ export class RecoveryService {
         value.canSelect = value.visible && reading.evidence && !!reading.key && !excluded && !uncertain && !needsNativeOmp;
         value.holdReason = !selected ? null : excluded ? "excluded" : uncertain ? "uncertain_send" : !value.automatic ? "goal_disabled"
           : r?.humanRequired || a.pendingPermissions > 0 ? "input" : value.attempts >= value.maxAttempts ? "goal_limit"
+          : r && interruptedGoal(r) ? r.reason
           : value.state !== "active" ? value.state === "paused" ? "goal_paused" : value.state === "blocked" ? "goal_blocked" : value.state === "limited" ? "goal_limited" : "goal_unknown"
           : r?.reason === "user_stop" || r?.phase === "review" && !r.reason.startsWith("goal_") ? r.reason : null;
         value.note = excluded ? reasonText.excluded : uncertain ? reasonText.uncertain_send : !value.automatic ? "Automatic goal continuation is off in Settings."
           : r?.humanRequired || a.pendingPermissions > 0 ? reasonText.input : value.attempts >= value.maxAttempts ? reasonText.goal_limit
+          : r && interruptedGoal(r) ? reasonText[r.reason]
           : snapshotOnly ? "Showing the last checked goal state. Automatic continuation verifies the current state again before sending."
           : needsNativeOmp ? "Use Start goal to register this request as an OMP native goal. Extra continuation does not start it."
           : reading.source === "opencode" ? value.state === "active" ? reading.nativeContinuation ? "OpenCode is managing continuation. Paseo will not send an extra message while the native continuation or child-session guard is in effect."
@@ -770,7 +891,7 @@ export class RecoveryService {
       await this.attempt(r, true, ticket.generation, ticket); return { ok: true };
     });
   }
-  private canResume(r: RecordEntry): boolean { return ["review", "scheduled", "interrupted"].includes(r.phase) && !r.humanRequired && !this.saved.excluded.includes(r.id) && !["uncertain_send", "new_activity", "finished", "archived", "missing", "input", "goal_check", "goal_unknown", "goal_paused", "goal_blocked", "goal_complete", "goal_cleared", "goal_limited"].includes(r.reason); }
+  private canResume(r: RecordEntry): boolean { return !r.goalInterruption && ["review", "scheduled", "interrupted"].includes(r.phase) && !r.humanRequired && !this.saved.excluded.includes(r.id) && !["uncertain_send", "new_activity", "finished", "archived", "missing", "input", "goal_check", "goal_unknown", "goal_paused", "goal_blocked", "goal_complete", "goal_cleared", "goal_limited"].includes(r.reason); }
   status(input = statusInput.parse({})): RecoveryStatus {
     const rows: RecoveryRow[] = Object.values(this.saved.records).map((r) => ({ id: r.id, title: r.title, provider: r.provider, workspaceId: r.workspaceId, parentId: r.parentId,
       phase: r.phase, reason: this.saved.excluded.includes(r.id) ? "excluded" : !this.settings.enabled && r.phase === "scheduled" ? "disabled" : r.reason,
