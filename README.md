@@ -98,6 +98,8 @@ The per-objective limit survives turns, daemon restarts, and cycling the toggle.
 
 ## Recovery rules
 
+When a native goal is still active but its session is stopped, the playback button shows **Resume** with a play icon. On a daemon with the connection companion, it reconnects the existing session without pausing the goal, resetting its budget, or enabling extra continuation. The editor uses the same action. A stale Pause response is disabled as soon as stopped session metadata arrives.
+
 Explicit stops and completed goals are never automatically resumed. A completed turn is only continued when goal continuation is enabled, the current goal is selected, and that goal is still active. Pending questions and approvals require user input. Archived or missing sessions, unavailable history, and unavailable workspaces are excluded. Subagent recovery checks every parent; an active, archived, missing, or excluded parent blocks it. Provider-internal subagents are outside this plugin's scope.
 
 Unknown interruptions go to review. Temporary provider errors are retried only when enabled and when their code is recognized. Uncertain delivery is not automatically retried, even after another restart. Open the conversation to check the result.
@@ -128,7 +130,7 @@ paseo plugin install /absolute/path/to/paseo-session-recovery
 
 Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed. Goal entries retry a failed initial session lookup and rebuild after reconnecting, including on mobile clients. A supported provider entry is registered before any goal-state request. Goal checks run for mounted composers, rather than scanning every saved session on each connected client.
 
-For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.6.8`. The public registry listing requires a separate review.
+For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.6.9`. The public registry listing requires a separate review.
 
 ### Session connection companion
 

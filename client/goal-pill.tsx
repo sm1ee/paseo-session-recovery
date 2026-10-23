@@ -15,6 +15,7 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
       let current: GoalControl | null = null;
       let observed: PillAgent | undefined;
       let lastLabel = "Goal";
+      let lastPlayback = "";
       let playback: PluginButtonRegistration | undefined;
       const observe = () => controller.mount(id);
       const Icon = (props: PluginButtonIconProps) => <GoalPillIcon {...props} observe={observe} />;
@@ -26,14 +27,20 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
         try {
         const expected = current;
         if (!expected?.key || !expected.nativeAction) throw new Error("Reload the current goal before changing it.");
+        if (observed?.status === "closed" && expected.state === "active" && expected.nativeAction === "pause") {
+          await controller.refresh(id).catch(() => {}); throw new Error("The session changed. Reload its controls.");
+        }
+        if (observed?.activeTurn && expected.nativeReconnect) {
+          await controller.refresh(id).catch(() => {}); throw new Error("The session changed. Reload its controls.");
+        }
         const latest = await client.rpc(readGoalRpc, { id });
-        if (latest.key !== expected.key || latest.action !== expected.nativeAction || !!latest.nativeStart !== !!expected.nativeStart) {
+        if (latest.key !== expected.key || latest.action !== expected.nativeAction || !!latest.nativeStart !== !!expected.nativeStart || !!latest.reconnect !== !!expected.nativeReconnect) {
           await controller.refresh(id).catch(() => {});
           throw new Error("The goal changed. Review it before trying again.");
         }
         if (!latest.actionTicket) throw new Error(latest.note || latest.actionNote || "Native controls are unavailable. Open the goal to review its state.");
         // OpenCode resume needs the sheet's explicit new-budget action.
-        if (latest.source === "opencode" && latest.action === "resume") throw new Error("Open this goal and review the new budget window before resuming.");
+        if (latest.source === "opencode" && latest.action === "resume" && !latest.reconnect) throw new Error("Open this goal and review the new budget window before resuming.");
         try { await client.rpc(actOnGoalRpc, { ticket: latest.actionTicket, confirmBudgetReset: false }); }
         finally { await controller.refresh(id).catch(() => {}); }
         } catch (error) { throw new Error(goalErrorText(error)); }
@@ -45,16 +52,26 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
         if (label === lastLabel) return;
         lastLabel = label; pill.update({ label, title: "Goal" });
       };
-      return { remove: () => { pill.remove(); playback?.remove(); }, observe: (agent) => { observed = agent; updateLabel(); }, update: (value) => {
-        current = value;
-        updateLabel();
+      const updatePlayback = () => {
+        const value = current;
         const action = value?.nativeAction;
-        if (!action) { playback?.update({ visible: false }); return; }
-        const button = { title: value.nativeStart ? "Start goal" : action === "pause" ? "Pause goal" : "Resume goal",
-          icon: action === "pause" ? "Pause" : "Play", label: value.nativeStart ? "Start goal" : action === "pause" ? "Pause" : "Resume", visible: true, disabled: value.nativeActionReady === false,
-          behavior: action === "resume" && value.source === "opencode" ? { kind: "popover" as const, Content: PlaybackContent } : { kind: "action" as const, onPress: act } };
+        if (!action) { if (lastPlayback) playback?.update({ visible: false }); lastPlayback = ""; return; }
+        const stalePause = observed?.status === "closed" && value.state === "active" && action === "pause";
+        const staleReconnect = !!observed?.activeTurn && value.nativeReconnect === true;
+        const shown = stalePause ? "resume" : staleReconnect ? "pause" : action;
+        const disabled = value.nativeActionReady === false || stalePause || staleReconnect;
+        const signature = JSON.stringify([shown, disabled, value.source, value.nativeStart, value.nativeReconnect]);
+        if (signature === lastPlayback) return;
+        lastPlayback = signature;
+        const button = { title: value.nativeStart ? "Start goal" : shown === "pause" ? "Pause goal" : "Resume goal",
+          icon: shown === "pause" ? "Pause" : "Play", label: value.nativeStart ? "Start goal" : shown === "pause" ? "Pause" : "Resume", visible: true, disabled,
+          behavior: action === "resume" && value.source === "opencode" && !value.nativeReconnect ? { kind: "popover" as const, Content: PlaybackContent } : { kind: "action" as const, onPress: act } };
         if (playback) playback.update(button);
         else playback = client.addComposerPill({ id: "goal-playback", agentId: id, workspaceId, button });
+      };
+      return { remove: () => { pill.remove(); playback?.remove(); }, observe: (agent) => { observed = agent; updateLabel(); updatePlayback(); }, update: (value) => {
+        current = value;
+        updateLabel(); updatePlayback();
       } };
     },
   );
