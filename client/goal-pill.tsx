@@ -16,14 +16,16 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
       let playback: PluginButtonRegistration | undefined;
       const observe = () => controller.mount(id);
       const Icon = (props: PluginButtonIconProps) => <GoalPillIcon {...props} observe={observe} />;
-      const Content = (props: PluginButtonContentProps) => <GoalEditorContent {...props} agentId={id}
+      const Content = (props: PluginButtonContentProps) => <GoalEditorContent {...props} agentId={id} showPlayback={false}
+        onChanged={() => { void controller.refresh(id).catch(() => {}); }} />;
+      const PlaybackContent = (props: PluginButtonContentProps) => <GoalEditorContent {...props} agentId={id} showPlayback
         onChanged={() => { void controller.refresh(id).catch(() => {}); }} />;
       const act = async () => {
         try {
         const expected = current;
         if (!expected?.key || !expected.nativeAction) throw new Error("Reload the current goal before changing it.");
         const latest = await client.rpc(readGoalRpc, { id });
-        if (latest.key !== expected.key || latest.action !== expected.nativeAction) {
+        if (latest.key !== expected.key || latest.action !== expected.nativeAction || !!latest.nativeStart !== !!expected.nativeStart) {
           await controller.refresh(id).catch(() => {});
           throw new Error("The goal changed. Review it before trying again.");
         }
@@ -41,9 +43,9 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
         pill.update({ label: goalPreviewLabel(value), title: "Goal" });
         const action = value?.nativeAction;
         if (!action) { playback?.update({ visible: false }); return; }
-        const button = { title: action === "pause" ? "Pause goal" : "Resume goal",
-          icon: action === "pause" ? "Pause" : "Play", label: action === "pause" ? "Pause" : "Resume", visible: true, disabled: value.nativeActionReady === false,
-          behavior: action === "resume" && value.source === "opencode" ? { kind: "popover" as const, Content } : { kind: "action" as const, onPress: act } };
+        const button = { title: value.nativeStart ? "Start goal" : action === "pause" ? "Pause goal" : "Resume goal",
+          icon: action === "pause" ? "Pause" : "Play", label: value.nativeStart ? "Start goal" : action === "pause" ? "Pause" : "Resume", visible: true, disabled: value.nativeActionReady === false,
+          behavior: action === "resume" && value.source === "opencode" ? { kind: "popover" as const, Content: PlaybackContent } : { kind: "action" as const, onPress: act } };
         if (playback) playback.update(button);
         else playback = client.addComposerPill({ id: "goal-playback", agentId: id, workspaceId, button });
       } };

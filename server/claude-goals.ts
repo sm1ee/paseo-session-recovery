@@ -58,7 +58,7 @@ export function readClaudeGoal(text: string, sessionId: string, complete = true)
       const key = createHash("sha256").update(objective).digest("hex");
       return { reading: { state, key, evidence: true, source: "claude", ...(state === "active" ? { nativeContinuation: true } : {}) },
         objective, tokenBudget: null, tokensUsed: typeof goal.tokens === "number" && Number.isFinite(goal.tokens) && goal.tokens >= 0 ? goal.tokens : null,
-        revision: createHash("sha256").update(JSON.stringify({ sessionId, uuid: entry.uuid, objective, state })).digest("hex") };
+        revision: createHash("sha256").update(JSON.stringify({ sessionId, uuid: entry.uuid, objective, state })).digest("hex"), sessionControls: state === "active" };
     }
     head = entry.parentUuid as string | null;
   }
@@ -66,6 +66,9 @@ export function readClaudeGoal(text: string, sessionId: string, complete = true)
 }
 
 export class ClaudeGoals {
+  private paths = new Map<string, string>();
+  private snapshots = new Map<string, { signature: string; value: GoalDetails }>();
+  private pending = new Map<string, Promise<GoalDetails | null>>();
   constructor(private readonly home: string) {}
   private async transcript(agent: PaseoAgent, env: Record<string, string>): Promise<string> {
     const sessionId = agent.persistence?.sessionId;
@@ -87,16 +90,27 @@ export class ClaudeGoals {
     if (!found) throw new Error("Claude history is unavailable");
     return found;
   }
-  async details(agent: PaseoAgent): Promise<GoalDetails | null> {
+  details(agent: PaseoAgent): Promise<GoalDetails | null> {
+    const key = JSON.stringify([agent.id, agent.provider, agent.persistence?.sessionId, agent.cwd]);
+    const pending = this.pending.get(key); if (pending) return pending;
+    const task = this.readDetails(agent); this.pending.set(key, task);
+    void task.then(() => this.pending.delete(key), () => this.pending.delete(key)); return task;
+  }
+  private async readDetails(agent: PaseoAgent): Promise<GoalDetails | null> {
     let config: unknown = {};
     try { config = JSON.parse(await readFile(join(this.home, "config.json"), "utf8")); }
     catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
     const env = claudeEnvironment(config, agent.provider);
     if (!env) return null;
     if (!agent.persistence?.sessionId) return empty({ state: "cleared", key: null, evidence: false, source: "claude" });
+    const key = JSON.stringify([agent.persistence.sessionId, agent.cwd, env.CLAUDE_CONFIG_DIR, process.env.CLAUDE_CONFIG_DIR]);
     try {
-      const path = await this.transcript(agent, env), before = await lstat(path, { bigint: true });
+      const path = this.paths.get(key) ?? await this.transcript(agent, env), before = await lstat(path, { bigint: true });
       if (!before.isFile()) return empty();
+      this.paths.set(key, path);
+      while (this.paths.size > 4) { const oldest = this.paths.keys().next().value!; this.paths.delete(oldest); this.snapshots.delete(oldest); }
+      const signature = [path, before.dev, before.ino, before.size, before.mtimeNs, before.ctimeNs].join(":");
+      const cached = this.snapshots.get(key); if (cached?.signature === signature) return cached.value;
       const file = await open(path, "r");
       try {
         const info = await file.stat({ bigint: true });
@@ -106,9 +120,10 @@ export class ClaudeGoals {
         if (bytesRead !== buffer.length || after.ino !== before.ino || after.dev !== before.dev || after.size !== before.size || after.mtimeNs !== before.mtimeNs) return empty();
         const start = offset ? buffer.indexOf(10) + 1 : 0;
         if (offset && !start) return empty();
-        return readClaudeGoal(buffer.subarray(start).toString("utf8"), agent.persistence.sessionId, offset === 0);
+        const value = readClaudeGoal(buffer.subarray(start).toString("utf8"), agent.persistence.sessionId, offset === 0);
+        this.snapshots.set(key, { signature, value }); return value;
       } finally { await file.close(); }
-    } catch { return empty(); }
+    } catch { this.paths.delete(key); this.snapshots.delete(key); return empty(); }
   }
   async edit(agent: PaseoAgent, revision: string, objective: string, check: () => void, send: () => Promise<void>): Promise<GoalReading> {
     const invalid = goalObjectiveError(objective, "claude"); if (invalid) throw new Error(invalid);

@@ -1,8 +1,9 @@
 import type { PluginHostProps, PluginScreenProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
+import { TextInput } from "@getpaseo/plugin/client/react-native";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
+import { Pressable, ScrollView, Text, View } from "react-native";
 import { goalLengthLimit, editGoalRpc, goalObjectiveError, readGoalRpc, type GoalEditorSnapshot } from "../shared/goal-editor";
 import { goalControlRpc, watchGoalRpc, unwatchGoalRpc } from "../shared/contracts";
 import { actOnGoalRpc } from "../shared/goal-actions";
@@ -15,12 +16,12 @@ export function GoalEditorScreen(props: PluginScreenProps) {
       openSession={props.navigation ? () => props.navigation!.openAgent({ agentId: props.params.agentId, serverId: props.host.id }) : undefined} />
   </ScrollView>;
 }
-interface GoalContentProps extends PluginHostProps { agentId: string; onChanged?: () => void; openSession?: () => void }
+interface GoalContentProps extends PluginHostProps { agentId: string; showPlayback?: boolean; onChanged?: () => void; openSession?: () => void }
 export function GoalEditorContent(props: GoalContentProps) {
   // Host or target changes discard the old draft and its one-use tickets.
   return <GoalEditor key={`${props.host.id}:${props.agentId}`} {...props} />;
 }
-function GoalEditor({ theme, layout, agentId: id, host, onChanged, openSession }: GoalContentProps) {
+function GoalEditor({ theme, layout, agentId: id, host, showPlayback = true, onChanged, openSession }: GoalContentProps) {
   const read = useRpc(readGoalRpc), edit = useRpc(editGoalRpc), act = useRpc(actOnGoalRpc);
   const readControl = useRpc(goalControlRpc), watch = useRpc(watchGoalRpc), unwatch = useRpc(unwatchGoalRpc);
   const cache = useQueryClient();
@@ -38,7 +39,7 @@ function GoalEditor({ theme, layout, agentId: id, host, onChanged, openSession }
     if (!value.action || !value.actionTicket) throw new Error("Reload the current goal before changing it.");
     setNotice(null);
     await act({ ticket: value.actionTicket, confirmBudgetReset: value.source === "opencode" && value.action === "resume" });
-  }, onSuccess: () => { setDraft(null); setNeedsReload(false); setNotice(goal?.action === "pause" ? "Paused." : "Resumed."); refresh(); },
+  }, onSuccess: () => { setDraft(null); setNeedsReload(false); setNotice(goal?.nativeStart ? "Goal started." : goal?.action === "pause" ? "Paused." : "Resumed."); refresh(); },
   onError: (error) => { setNeedsReload(true); setNotice(goalErrorText(error)); onChanged?.(); } });
   const continuation = useMutation({ retry: false, mutationFn: async () => {
     const latest = await readControl({ id, fresh: true, inspect: true });
@@ -71,27 +72,30 @@ function GoalEditor({ theme, layout, agentId: id, host, onChanged, openSession }
     style={{ padding: 12, borderRadius: 8, backgroundColor: primary ? c.accent : c.surface2, opacity: disabled || pending ? 0.5 : 1 }}>
     <Text style={{ color: primary ? c.accentForeground : c.foreground, fontWeight: "600" }}>{label}</Text>
   </Pressable>;
+  const showReload = !!id && (needsReload || result.isError || goal?.state === "unknown" || goal?.objective != null && !goal.ticket);
+  const actions = (showPlayback && goal?.action && !dirty || goal?.ticket && dirty || showReload || dirty) && <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+    {showPlayback && goal?.action && !dirty && button(playback.isPending ? "Updating…" : goal.nativeStart ? "Start goal" : goal.action === "pause" ? "Pause" : "Resume", () => playback.mutate(goal), !goal.actionTicket || needsReload || result.isError)}
+    {goal?.ticket && dirty && button(save.isPending ? "Saving…" : goal.source === "claude" ? "Replace & start" : "Save", () => save.mutate(goal), !!validation || needsReload || result.isError, true)}
+    {showReload && button("Reload", () => dirty ? setConfirmReload(true) : reload())}
+    {dirty && button("Discard", () => setDraft(null))}
+  </View>;
   return <View style={{ gap: 12, width: "100%", maxWidth: 680 }}>
     {(!id || result.isError) && <Text accessibilityRole="alert" style={{ color: c.statusDanger }}>{!id ? "Open from a chat." : goalErrorText(result.error)}</Text>}
     {!!id && result.isPending && <Text style={muted}>Loading…</Text>}
-    {goal && goal.objective == null && <Text style={muted}>No goal</Text>}
+    {goal && goal.objective == null && <Text style={muted}>{goal.state === "unknown" ? "Goal unavailable. Reload." : "No goal"}</Text>}
     {goal?.objective != null && <View style={{ gap: 8 }}>
       <TextInput multiline value={text} onChangeText={(value) => setDraft({ ticket: goal.ticket, text: value })} maxLength={maxLength}
         editable={!!goal.ticket && !needsReload && !result.isError && !pending} accessibilityLabel="Goal objective" placeholderTextColor={c.foregroundMuted}
         style={{ ...normal, minHeight: layout.compact ? 120 : 160, maxHeight: 280, padding: 12, backgroundColor: c.surface1, borderWidth: 1, borderColor: dirty ? c.accent : c.border, borderRadius: 10, textAlignVertical: "top" }} />
-      {!goal.ticket && <Text style={muted}>{goalReadOnlyText(goal)}</Text>}
+      {!goal.ticket && !goal.sessionControls && <Text style={muted}>{goalReadOnlyText(goal)}</Text>}
       {dirty && <Text style={muted}>{text.length.toLocaleString()} / {maxLength.toLocaleString()}</Text>}
       {dirty && validation && <Text accessibilityRole="alert" style={{ color: c.statusDanger }}>{validation}</Text>}
     </View>}
-    {goal?.source === "opencode" && goal.action === "resume" && <Text style={muted}>Resume resets goal budgets.</Text>}
+    {showPlayback && goal?.source === "opencode" && goal.action === "resume" && <Text style={muted}>Resume resets goal budgets.</Text>}
     {goal?.source === "claude" && dirty && <Text style={muted}>Restarts the goal timer and usage.</Text>}
+    {showPlayback && goal?.sessionControls && goal.action && <Text style={muted}>Pause stops this turn. Resume continues the same goal.</Text>}
     {notice && <Text accessibilityRole="alert" style={normal}>{notice}</Text>}
-    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-      {goal?.action && !dirty && button(playback.isPending ? "Updating…" : goal.action === "pause" ? "Pause" : "Resume", () => playback.mutate(goal), !goal.actionTicket || needsReload || result.isError)}
-      {goal?.ticket && dirty && button(save.isPending ? "Saving…" : goal.source === "claude" ? "Replace & start" : "Save", () => save.mutate(goal), !!validation || needsReload || result.isError, true)}
-      {!!id && (needsReload || result.isError || goal?.objective != null && !goal.ticket) && button("Reload", () => dirty ? setConfirmReload(true) : reload())}
-      {dirty && button("Discard", () => setDraft(null))}
-    </View>
+    {actions}
     {confirmReload && <View style={{ gap: 10, padding: 12, backgroundColor: c.surface1, borderRadius: 8 }}>
       <Text style={normal}>Discard changes?</Text>
       <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>{button("Discard & reload", reload)}{button("Cancel", () => setConfirmReload(false))}</View>

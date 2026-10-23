@@ -3,6 +3,7 @@ import { RecoveryService } from "./server/service";
 import { dismissRpc, excludeRpc, preferences, prepareRpc, resumeRpc, scanRpc, statusRpc, watchGoalRpc, unwatchGoalRpc, goalControlRpc } from "./shared/contracts";
 import { readGoalRpc, editGoalRpc } from "./shared/goal-editor";
 import { actOnGoalRpc } from "./shared/goal-actions";
+import { ompNativeRpc } from "./shared/omp-native-rpc";
 
 export default function contribute(server: PluginServerContext) {
   const settings = server.registerSettings(preferences);
@@ -25,6 +26,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(readGoalRpc, ({ id }) => service.readGoalEditor(id));
   server.handle(editGoalRpc, (input) => service.editGoal(input));
   server.handle(actOnGoalRpc, (input) => service.actOnGoal(input));
+  server.handle(ompNativeRpc, () => ({ protocol: 1 as const, available: false }));
   server.handle(excludeRpc, ({ id, excluded }) => service.exclude(id, excluded));
   server.handle(dismissRpc, ({ id }) => service.dismiss(id));
   server.handle(prepareRpc, ({ id }) => service.prepare(id));

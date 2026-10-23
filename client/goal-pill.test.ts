@@ -23,7 +23,7 @@ async function fixture(patch: Partial<GoalControl> = {}) {
   const list = vi.fn(async () => ({ subscription }));
   const rpc = vi.fn(async (contract) => {
     if (contract === goalControlRpc) return { ...goal };
-    if (contract === readGoalRpc) return { key: goal.key, source: goal.source, action: goal.nativeAction, actionTicket: "one-use", ...editor };
+    if (contract === readGoalRpc) return { key: goal.key, source: goal.source, action: goal.nativeAction, nativeStart: goal.nativeStart, actionTicket: "one-use", ...editor };
     if (contract === actOnGoalRpc) { goal = { ...goal, state: goal.nativeAction === "pause" ? "paused" : "active", nativeAction: goal.nativeAction === "pause" ? "resume" : "pause" }; return { ok: true }; }
     throw new Error("Unexpected RPC");
   });
@@ -86,13 +86,24 @@ describe("목표 미리보기와 네이티브 재생 제어", () => {
     expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc)).toBe(false);
   });
   it("확인되지 않은 제어 명령을 자동 재시도하지 않는다", async () => {
-    const f = await fixture(); f.rpc.mockImplementationOnce(async () => ({ key: "current-goal", source: "codex", action: "pause", actionTicket: "one-use" }));
+    const f = await fixture(); f.rpc.mockImplementationOnce(async () => ({ key: "current-goal", source: "codex", action: "pause", nativeStart: false, actionTicket: "one-use" }));
     f.rpc.mockImplementationOnce(async () => { throw new Error("Receipt lost"); });
     await expect(f.press()).rejects.toThrow("Couldn’t confirm. Reload."); expect(f.rpc.mock.calls.filter(([contract]) => contract === actOnGoalRpc)).toHaveLength(1);
   });
   it("OpenCode 재개는 새 예산을 설명하는 편집 시트를 연다", async () => {
     const f = await fixture({ source: "opencode", state: "paused", nativeAction: "resume" });
     expect(f.buttons.get("goal-playback")).toMatchObject({ icon: "Play", label: "Resume", behavior: { kind: "popover" } });
+    expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc)).toBe(false);
+  });
+  it("예전 OMP 요청을 재개로 표시하지 않고 명시적인 Start goal에서만 등록한다", async () => {
+    const f = await fixture({ source: "omp", nativeStart: true, nativeAction: "resume" });
+    expect(f.buttons.get("goal-playback")).toMatchObject({ title: "Start goal", label: "Start goal" });
+    expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc)).toBe(false);
+    await f.press(); expect(f.rpc).toHaveBeenCalledWith(actOnGoalRpc, { ticket: "one-use", confirmBudgetReset: false });
+  });
+  it("OMP 등록 여부가 바뀌면 오래된 Resume 버튼으로 새 목표를 시작하지 않는다", async () => {
+    const f = await fixture({ source: "omp", nativeStart: false, nativeAction: "resume" });
+    f.setEditor({ nativeStart: true }); await expect(f.press()).rejects.toThrow();
     expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc)).toBe(false);
   });
   it("턴 실행 등 일시적인 제한은 제어 버튼을 숨기는 대신 비활성화한다", async () => {
