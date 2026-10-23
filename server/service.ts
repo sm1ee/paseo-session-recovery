@@ -5,6 +5,7 @@ import { openLocalHost, type RecoveryHost } from "./host";
 import { RecoveryError } from "./store";
 import { goalLengthLimit, editGoalInput, type GoalEditorSnapshot } from "../shared/goal-editor";
 import { actOnGoalRpc, type GoalAction } from "../shared/goal-actions";
+import { OmpGoalPreconditionError } from "./omp-native-goals";
 
 interface HookAgent { id: string; title: string | null; provider: string; workspaceId: string | null; parentAgentId: string | null }
 export type RecoveryEvent =
@@ -14,9 +15,9 @@ export type RecoveryEvent =
   | { kind: "resolution"; agent: HookAgent; requestId: string; allowed: boolean }
   | { kind: "closed" | "archived"; agent: HookAgent };
 interface Ticket { id: string; revision: number; generation: number; expiresAt: number; fingerprint: string; prompt: string }
-interface NativeGoalResume { submitted: boolean; starts: number }
+interface NativeGoalResume { submitted: boolean; starts: number; pauseTurnId?: string }
 interface GoalEditTicket { id: string; generation: number; changed: number; revision: string; expected: Agent; expiresAt: number }
-interface GoalActionTicket extends GoalEditTicket { action: GoalAction; source: "codex" | "opencode"; key: string }
+interface GoalActionTicket extends GoalEditTicket { action: GoalAction; source: "codex" | "opencode" | "claude" | "omp"; key: string; sessionControls?: boolean }
 function suspendedGoal(r: RecordEntry): boolean {
   return isSelectedGoal(r) && ["review", "stopped"].includes(r.phase) && ["goal_paused", "goal_blocked", "goal_limited", "goal_unknown"].includes(r.reason);
 }
@@ -144,6 +145,9 @@ export class RecoveryService {
     // Other events and user actions still invalidate the pending operation.
     const resuming = this.nativeGoalResumes.get(event.agent.id);
     if (event.kind === "start" && resuming?.submitted) resuming.starts++;
+    if (event.kind === "end" && event.outcome.kind === "canceled" && resuming?.submitted && resuming.pauseTurnId && event.turnId === resuming.pauseTurnId && /^(interrupted|user_stop|canceled)$/i.test(event.outcome.reason)) {
+      resuming.starts++; delete resuming.pauseTurnId;
+    }
     return this.enqueue(async () => {
       if (this.stopped || this.fatal) return;
       const host = await this.ready(); const id = event.agent.id;
@@ -213,7 +217,7 @@ export class RecoveryService {
     return { agent, reason };
   }
   private async inspectGoal(r: RecordEntry, host: RecoveryHost): Promise<void> {
-    const reading = await host.goal?.(r.id, { allowTimeline: false }) ?? { state: "unknown" as const, key: null, evidence: false };
+    const reading = await host.goal?.(r.id, { allowTimeline: false, ...(r.goal?.selectedKey ? { inspectOmp: true } : {}) }) ?? { state: "unknown" as const, key: null, evidence: false };
     if (!reading.evidence && !r.goal) { this.set(r, "completed", "finished"); this.audit(r, "completed"); return; }
     const previous = r.goal;
     const state = reading.state === "active" && !reading.key ? "unknown" : reading.state;
@@ -221,6 +225,11 @@ export class RecoveryService {
     r.goal = { key: reading.key ?? previous?.key ?? null, state, selectedKey, attempts: !reading.key || previous?.key === reading.key || previous?.selectedKey === reading.key ? previous?.attempts ?? 0 : 0,
       ...(reading.modeId ? { modeId: reading.modeId } : {}) };
     if (state === "active") {
+      if (reading.source === "omp" && !reading.nativeContinuation) {
+        if (isSelectedGoal(r)) { if (r.phase !== "review" || r.reason !== "goal_unknown") this.review(r, "goal_unknown"); }
+        else this.set(r, "completed", "goal_unselected");
+        return;
+      }
       if (!isSelectedGoal(r)) { this.set(r, "completed", "goal_unselected"); this.audit(r, "completed"); return; }
       if (!this.settings.continueGoals) { this.review(r, "goal_disabled"); return; }
       if (r.phase !== "scheduled" || r.reason !== "goal_active" || previous?.key !== reading.key) {
@@ -370,6 +379,7 @@ export class RecoveryService {
       if (resumeBlocked && existing?.reason === "user_stop") throw new RecoveryError("This session was stopped by the user. Continue it in the conversation first.");
       let reading = await host.goal?.(id); guard();
       if (!reading?.evidence) throw new RecoveryError("No supported current goal was found. Set a goal in the provider before selecting it here.");
+      if (reading.source === "omp" && !reading.nativeContinuation) throw new RecoveryError("Use Start goal to register this request as an OMP native goal first.");
       if (!reading.key || reading.state === "complete" || reading.state === "cleared") throw new RecoveryError("The current goal could not be verified or has already ended. Open the session and check its goal.");
       if (expectedKey && expectedKey !== reading.key) throw new RecoveryError("The goal changed. Refresh and select the new goal if you want to continue it.");
       const reactivating = resumeBlocked && reading.state === "blocked" && reading.source === "codex";
@@ -482,16 +492,22 @@ export class RecoveryService {
     const source = details.reading.source;
     Object.assign(view, { objective: details.objective, state: details.reading.state, tokenBudget: details.tokenBudget, tokensUsed: details.tokensUsed, key: details.reading.key });
     if (!source || source === "timeline") return { ...view, note: "This provider exposes goal history for viewing. Editing and native pause/resume are unavailable through this plugin connection." };
-    Object.assign(view, { supported: true, source, actionNote: source === "claude" ? "Claude does not expose a separate native pause/resume command. Replacing its goal starts a new turn and resets its timer and counters." : null });
+    const sessionControls = details.sessionControls === true;
+    const nativeOmp = source === "omp" && details.nativeControls === true;
+    const controlsWhileBusy = source === "codex" || nativeOmp && !details.nativeStart;
+    Object.assign(view, { supported: true, source, sessionControls, nativeStart: details.nativeStart });
     if (details.reading.state === "unknown") return { ...view, note: "The current native goal could not be verified. Check its state in the conversation and reload." };
     if (!details.objective) return { ...view, note: source === "opencode" && !details.reading.modeId ? "Select the registered OpenCode Goal mode and set an objective with /goal <objective>." : "There is no current goal. Set one in the conversation with /goal <objective>." };
     if (!details.reading.key || !["active", "paused", "blocked", "limited"].includes(details.reading.state) || details.objective.length > goalLengthLimit(source)) return { ...view, note: "This goal is read-only in its current state. Review it in the conversation." };
-    if (source === "codex" || source === "opencode") view.action = details.reading.state === "active" ? "pause" : "resume";
+    if (nativeOmp && !details.nativeStart && !["active", "paused"].includes(details.reading.state)) return { ...view, note: "OMP cannot resume this goal in its current state. Review its native limits." };
+    if (sessionControls) view.action = busy(a) ? "pause" : "resume";
+    else if (source === "codex" || source === "opencode" || nativeOmp) view.action = details.nativeStart ? "resume" : details.reading.state === "active" ? "pause" : "resume";
     const r = this.saved.records[id];
+    if (sessionControls && a.activeTurn === undefined && a.status !== "closed") return { ...view, note: "The session's current turn could not be verified. Reload its goal controls." };
     if (!goalCommandReady(a) || !a.sessionId || r?.humanRequired || r?.phase === "sending" || r?.expectingStart || r?.reason === "uncertain_send") return { ...view, note: "Resolve pending input or uncertain delivery in this session before editing its goal." };
-    if (source !== "codex" && busy(a)) return { ...view, note: "Wait for this session's current turn to finish before editing its goal. Saving starts native goal work." };
+    if (!sessionControls && !controlsWhileBusy && busy(a)) return { ...view, note: details.nativeStart ? "Wait for this turn to finish before starting a native OMP goal." : "Wait for this session's current turn to finish before editing its goal. Saving starts native goal work." };
     const workspace = await host.workspace(a.workspaceId); this.check(generation);
-    if (!workspace || workspace.archived || workspace.archiving || !host.editGoal) return { ...view, note: "Native goal commands are unavailable for this session. Reload it when idle." };
+    if (!workspace || workspace.archived || workspace.archiving || (sessionControls ? !host.controlGoal : !host.editGoal)) return { ...view, note: "Native goal commands are unavailable for this session. Reload it when idle." };
     this.check(generation);
     let expected = a, ticketChanged = changed;
     if ((this.changes.get(id) ?? 0) !== changed) {
@@ -504,22 +520,27 @@ export class RecoveryService {
       const stable = ["id", "provider", "workspaceId", "parentId", "sessionId", "modeId", "lastUserMessageAt"] as const;
       if ((this.goalReadBlocks.get(id) ?? -1) > changed || !latest || !stable.every((field) => latest[field] === a[field]) || latest.internal || latest.archivedAt ||
         !goalCommandReady(latest) || current?.humanRequired || current?.reason === "user_stop" || current?.reason === "uncertain_send" ||
-        current?.phase === "sending" || current?.expectingStart || source !== "codex" && busy(latest)) return { ...view, note: "The session changed. Reload to edit or control this goal." };
+        current?.phase === "sending" || current?.expectingStart || !sessionControls && !controlsWhileBusy && busy(latest)) return { ...view, note: "The session changed. Reload to edit or control this goal." };
       expected = latest; ticketChanged = this.changes.get(id) ?? 0;
     }
-    const ticket = randomUUID(), now = this.now();
+    const ticket = source !== "omp" && (source === "codex" || !busy(expected)) ? randomUUID() : null, now = this.now();
     for (const [key, value] of this.goalEditTickets) if (value.expiresAt <= now) this.goalEditTickets.delete(key);
     if (this.goalEditTickets.size >= 100) this.goalEditTickets.delete(this.goalEditTickets.keys().next().value!);
-    this.goalEditTickets.set(ticket, { id, generation, changed: ticketChanged, revision: details.revision, expected, expiresAt: now + 300_000 });
-    if ((source === "codex" || source === "opencode") && host.controlGoal) {
-      const action: GoalAction = details.reading.state === "active" ? "pause" : "resume", actionTicket = randomUUID();
+    if (ticket) this.goalEditTickets.set(ticket, { id, generation, changed: ticketChanged, revision: details.revision, expected, expiresAt: now + 300_000 });
+    if ((source === "codex" || source === "opencode" || nativeOmp || sessionControls) && host.controlGoal && (!sessionControls || !busy(expected) || !!expected.activeTurn)) {
+      const action: GoalAction = details.nativeStart ? "resume" : sessionControls ? busy(expected) ? "pause" : "resume" : details.reading.state === "active" ? "pause" : "resume", actionTicket = randomUUID();
       for (const [key, value] of this.goalActionTickets) if (value.expiresAt <= now) this.goalActionTickets.delete(key);
       if (this.goalActionTickets.size >= 100) this.goalActionTickets.delete(this.goalActionTickets.keys().next().value!);
-      this.goalActionTickets.set(actionTicket, { id, generation, changed: ticketChanged, revision: details.revision, expected, expiresAt: now + 300_000, action, source, key: details.reading.key });
-      Object.assign(view, { action, actionTicket, actionNote: source === "opencode" && action === "resume" ? "OpenCode resume starts a new native turn, token, and time budget window. Review this before resuming."
+      this.goalActionTickets.set(actionTicket, { id, generation, changed: ticketChanged, revision: details.revision, expected, expiresAt: now + 300_000, action, source, key: details.reading.key, sessionControls });
+      Object.assign(view, { action, actionTicket, actionNote: details.nativeStart ? "Start registers this request as an OMP native goal. OMP then manages continuation."
+        : sessionControls ? "Pause stops this turn. Resume continues the same goal."
+        : source === "opencode" && action === "resume" ? "OpenCode resume starts a new native turn, token, and time budget window. Review this before resuming."
         : action === "pause" ? "Pause the native goal's continuation. A current turn may finish before work stops." : "Resume the native goal using its existing limits." });
     }
-    const note = source === "claude" ? "Replacing uses Claude's native /goal command and immediately starts a turn. Claude resets its goal timer, evaluated turn count, and token-spend baseline. Existing session limits are unchanged."
+    const note = source === "omp" ? sessionControls ? "Paseo tracks the explicit /goal request in this conversation. OMP did not register it as a native goal. Pause and Resume control this session; editing is unavailable."
+      : nativeOmp ? "OMP's native Goal RPC controls this goal. Pause and Resume preserve its objective, budget, and usage. OMP does not support editing an existing goal."
+      : "This OMP native goal is read-only. Its owning provider connection does not expose native goal commands."
+      : source === "claude" ? "Replacing uses Claude's native /goal command and immediately starts a turn. Claude resets its goal timer, evaluated turn count, and token-spend baseline. Existing session limits are unchanged."
       : source === "opencode" ? "Saving uses OpenCode's native /goal edit command and preserves turn/token/time budgets and history. OpenCode decides whether the edited goal can continue."
       : "Saving uses Codex's native /goal command and makes the edited goal active. Goal continuation must be selected again for the new objective.";
     return { ...view, ticket, note };
@@ -532,7 +553,7 @@ export class RecoveryService {
       if (!ticket || ticket.expiresAt <= this.now()) throw new RecoveryError("These goal controls expired. Reload before trying again.");
       if (ticket.source === "opencode" && ticket.action === "resume" && !parsed.confirmBudgetReset) throw new RecoveryError("Review and confirm OpenCode's new native budget window before resuming.");
       const { id, generation, changed } = ticket;
-      const native: NativeGoalResume = { submitted: false, starts: 0 };
+      const native: NativeGoalResume = { submitted: false, starts: 0, ...(ticket.sessionControls && ticket.action === "pause" && ticket.expected.activeTurn ? { pauseTurnId: ticket.expected.activeTurn } : {}) };
       const guard = () => { this.check(generation); if ((this.changes.get(id) ?? 0) !== changed + native.starts) throw new RecoveryError("The session changed. Reload its goal controls."); };
       guard(); const host = await this.ready(); guard();
       const previous = this.saved.records[id];
@@ -550,9 +571,10 @@ export class RecoveryService {
       this.nativeGoalResumes.set(id, native);
       try {
         const reading = await host.controlGoal(id, ticket.revision, ticket.action, a, guard, messageId, () => { native.submitted = true; }); guard();
-        if (reading.key !== ticket.key || reading.state !== (ticket.action === "pause" ? "paused" : "active")) throw new RecoveryError("The native goal action could not be confirmed. Reload and review its state.");
+        if (reading.key !== ticket.key || (ticket.sessionControls ? !["active", "paused"].includes(reading.state) : reading.state !== (ticket.action === "pause" ? "paused" : "active"))) throw new RecoveryError("The native goal action could not be confirmed. Reload and review its state.");
         intent.goal!.state = reading.state;
-        if (previous) {
+        if (ticket.sessionControls) this.set(intent, ticket.action === "pause" ? "stopped" : "completed", ticket.action === "pause" ? "user_stop" : "goal_unselected");
+        else if (previous) {
           // Native controls clear only fallback goal selection. Preserve an
           // independently tracked interruption, current turn, or user stop.
           this.saved.records[id] = { ...previous, goal: intent.goal, revision: intent.revision + 1 };
@@ -560,6 +582,7 @@ export class RecoveryService {
         } else this.set(intent, "completed", ticket.action === "pause" ? "goal_paused" : "goal_unselected");
         await this.persist(); return { ok: true };
       } catch (error) {
+        if (error instanceof OmpGoalPreconditionError) native.submitted = false;
         if (native.submitted || (this.changes.get(id) ?? 0) !== changed) this.review(intent, native.submitted ? "uncertain_send" : "goal_check");
         else if (previous) this.saved.records[id] = previous;
         else delete this.saved.records[id];
@@ -631,11 +654,11 @@ export class RecoveryService {
         // Inspection never opts a session in, schedules a turn, or writes a recovery record.
         if ((this.changes.get(id) ?? 0) !== changed) { value.note = "The session changed while checking its goal. Try again."; return value; }
         if (preview) {
-          value.objective = details?.objective ?? null; value.source = reading.source ?? null;
-          value.nativeAction = (reading.source === "codex" || reading.source === "opencode") && !!reading.key
-            ? reading.state === "active" ? "pause" : ["paused", "blocked", "limited"].includes(reading.state) ? "resume" : null : null;
+          value.objective = details?.objective ?? null; value.source = reading.source ?? null; value.nativeStart = details?.nativeStart === true;
+          value.nativeAction = details?.nativeStart ? "resume" : details?.sessionControls && !!reading.key && ["active", "paused"].includes(reading.state) ? busy(a) ? "pause" : "resume" : (reading.source === "codex" || reading.source === "opencode" || reading.source === "omp" && details?.nativeControls) && !!reading.key
+            ? reading.state === "active" ? "pause" : (reading.source === "omp" ? reading.state === "paused" : ["paused", "blocked", "limited"].includes(reading.state)) ? "resume" : null : null;
           value.nativeActionReady = !this.saved.excluded.includes(id) && !r?.humanRequired && r?.reason !== "uncertain_send" && r?.phase !== "sending" && !r?.expectingStart &&
-            goalCommandReady(a) && (reading.source === "codex" || reading.source === "opencode" && !busy(a));
+            goalCommandReady(a) && (details?.sessionControls ? (a.activeTurn !== undefined || a.status === "closed") && (!busy(a) || !!a.activeTurn) : reading.source === "codex" || reading.source === "opencode" && !busy(a) || reading.source === "omp" && details?.nativeControls === true && (!details.nativeStart || !busy(a)));
         }
         const terminal = reading.state === "complete" || reading.state === "cleared";
         const selected = !terminal && !!r?.goal?.selectedKey && (!reading.key || r.goal.selectedKey === reading.key);
@@ -645,7 +668,8 @@ export class RecoveryService {
         value.attempts = r?.goal?.key === value.key ? r?.goal?.attempts ?? 0 : 0;
         const excluded = this.saved.excluded.includes(id);
         const uncertain = r?.reason === "uncertain_send" || r?.phase === "sending" || r?.expectingStart;
-        value.canSelect = value.visible && reading.evidence && !!reading.key && !excluded && !uncertain;
+        const needsNativeOmp = reading.source === "omp" && !reading.nativeContinuation;
+        value.canSelect = value.visible && reading.evidence && !!reading.key && !excluded && !uncertain && !needsNativeOmp;
         value.holdReason = !selected ? null : excluded ? "excluded" : uncertain ? "uncertain_send" : !value.automatic ? "goal_disabled"
           : r?.humanRequired || a.pendingPermissions > 0 ? "input" : value.attempts >= value.maxAttempts ? "goal_limit"
           : value.state !== "active" ? value.state === "paused" ? "goal_paused" : value.state === "blocked" ? "goal_blocked" : value.state === "limited" ? "goal_limited" : "goal_unknown"
@@ -653,6 +677,7 @@ export class RecoveryService {
         value.note = excluded ? reasonText.excluded : uncertain ? reasonText.uncertain_send : !value.automatic ? "Automatic goal continuation is off in Settings."
           : r?.humanRequired || a.pendingPermissions > 0 ? reasonText.input : value.attempts >= value.maxAttempts ? reasonText.goal_limit
           : snapshotOnly ? "Showing the last checked goal state. Automatic continuation verifies the current state again before sending."
+          : needsNativeOmp ? "Use Start goal to register this request as an OMP native goal. Extra continuation does not start it."
           : reading.source === "opencode" ? value.state === "active" ? reading.nativeContinuation ? "OpenCode is managing continuation. Paseo will not send an extra message while the native continuation or child-session guard is in effect."
             : "OpenCode also runs its own goal loop. This toggle controls Paseo's fallback continuation."
             : value.state === "unknown" ? "OpenCode's current goal state could not be verified. Automatic continuation is paused."

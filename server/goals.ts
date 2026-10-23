@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto";
 
 export type GoalState = "active" | "paused" | "blocked" | "limited" | "complete" | "cleared" | "unknown";
-export type GoalSource = "codex" | "opencode" | "claude";
+export type GoalSource = "codex" | "opencode" | "claude" | "omp";
 export interface GoalReading { state: GoalState; key: string | null; evidence: boolean; modeId?: string; source?: GoalSource | "timeline"; nativeContinuation?: boolean }
 export interface GoalDetails {
   reading: GoalReading; objective: string | null; revision: string;
   identity?: string;
+  sessionControls?: boolean;
+  nativeControls?: boolean;
+  nativeStart?: boolean;
+  nativeRevision?: string;
   tokenBudget: number | null; tokensUsed: number | null;
 }
 export interface GoalItem { type: string; [key: string]: unknown }

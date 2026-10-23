@@ -6,6 +6,7 @@ import { RecoveryService, type RecoveryEvent } from "./service";
 import { RecoveryError } from "./store";
 import type { GoalReading } from "./goals";
 import type { CodexGoalDetails } from "./codex-goals";
+import { OmpGoalPreconditionError } from "./omp-native-goals";
 
 const epoch = Date.parse("2026-10-20T00:00:00Z");
 const hook = { id: "session", title: "Test session", provider: "codex", workspaceId: "workspace", parentAgentId: null as string | null };
@@ -66,12 +67,48 @@ function fixture(options: Record<string, unknown> = {}) {
   };
 }
 describe("목표 미리보기와 명시적인 네이티브 제어", () => {
-  async function controls(source: "codex" | "opencode" | "claude" = "codex", state: GoalReading["state"] = "active") {
+  async function controls(source: "codex" | "opencode" | "claude" | "omp" = "codex", state: GoalReading["state"] = "active") {
     const f = fixture({ enabled: false, continueGoals: false }); f.a.provider = source; f.a.sessionId = "native-fixture"; f.idle();
     const reading: GoalReading = { state, key: "original-goal", evidence: true, source };
     f.setGoal(reading); f.setDetails({ reading, objective: "Private fixture objective", revision: "native-revision", tokenBudget: 100, tokensUsed: 3 });
     await f.service.configure(f.settings); return f;
   }
+  it("OMP 네이티브 Goal은 실행 중에도 API 일시정지 티켓을 내고 대화 메시지를 보내지 않는다", async () => {
+    const f = await controls("omp");
+    f.setDetails({ reading: { state: "active", key: "original-goal", evidence: true, source: "omp", nativeContinuation: true }, objective: "Fixture", revision: "native", tokenBudget: 100, tokensUsed: 4, nativeControls: true });
+    f.a.status = "running"; f.a.activeTurn = "turn-1";
+    const view = await f.service.readGoalEditor("session");
+    expect(view).toMatchObject({ source: "omp", sessionControls: false, action: "pause", actionTicket: expect.any(String), ticket: null });
+    expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ nativeAction: "pause", nativeActionReady: true });
+    await f.service.actOnGoal({ ticket: view.actionTicket! }); expect(f.controlGoal).toHaveBeenCalledOnce(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("네이티브 요청 전 모델 복원이 실패하면 전송 불명 상태로 잠그지 않는다", async () => {
+    const f = await controls("omp");
+    f.setDetails({ reading: { state: "paused", key: "original-goal", evidence: true, source: "omp" }, objective: "Fixture", revision: "native", tokenBudget: null, tokensUsed: null, nativeControls: true });
+    f.controlGoal.mockImplementationOnce(async () => { throw new OmpGoalPreconditionError("The saved OMP model is unavailable."); });
+    const view = await f.service.readGoalEditor("session");
+    await expect(f.service.actOnGoal({ ticket: view.actionTicket! })).rejects.toThrow(/model is unavailable/);
+    expect(f.saved.records.session).toBeUndefined(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it("예전 OMP 목표 요청은 조회로 실행하지 않고 명시적인 Start 티켓만 낸다", async () => {
+    const f = await controls("omp");
+    f.setDetails({ reading: { state: "active", key: "original-goal", evidence: true, source: "omp" }, objective: "Fixture", revision: "native", tokenBudget: null, tokensUsed: null, nativeControls: true, nativeStart: true });
+    expect(await f.service.readGoalEditor("session")).toMatchObject({ nativeStart: true, action: "resume", actionTicket: expect.any(String), ticket: null });
+    expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ nativeAction: "resume", nativeActionReady: true, nativeStart: true });
+    expect(f.controlGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+    f.a.status = "running"; f.a.activeTurn = "turn-1";
+    expect((await f.service.readGoalEditor("session")).actionTicket).toBeNull();
+    expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ nativeActionReady: false });
+  });
+  it("이전 버전에서 선택한 비네이티브 OMP 목표에도 일반 이어가기 메시지를 보내지 않는다", async () => {
+    const f = fixture({ continueGoals: true, goalDelaySeconds: 30 }); f.a.provider = "omp"; f.a.sessionId = "native-fixture"; f.idle();
+    const reading: GoalReading = { state: "active", key: "request", evidence: true };
+    f.setGoal(reading); await f.service.configure(f.settings); await f.service.watchGoal("session", "request");
+    f.setGoal({ ...reading, source: "omp" }); f.advance(40_000); await f.service.scanNow();
+    expect(f.saved.records.session).toMatchObject({ phase: "review", reason: "goal_unknown" });
+    expect(f.send).not.toHaveBeenCalled();
+    await expect(f.service.watchGoal("session", "request")).rejects.toThrow(/Start goal/);
+  });
   it("느린 네이티브 상태 변경 중에도 Goal 본문과 미리보기를 읽고 중복 제어는 잠근다", async () => {
     const f = await controls(), view = await f.service.readGoalEditor("session");
     const original = f.controlGoal.getMockImplementation()!;
@@ -164,6 +201,38 @@ describe("목표 미리보기와 명시적인 네이티브 제어", () => {
     const view = await f.service.readGoalEditor("session"); expect(view.objective).toBe("Fixture"); expect(view.actionTicket).toBeNull();
     if (source === "timeline") expect(view.ticket).toBeNull();
     expect(f.controlGoal).not.toHaveBeenCalled();
+  });
+  it.each(["claude", "omp"] as const)("%s 목표의 Pause와 Resume은 실행 상태를 따르고 읽기만으로 작업을 시작하지 않는다", async (source) => {
+    const f = await controls(); f.a.provider = source;
+    f.setDetails({ reading: { state: "active", key: "original-goal", evidence: true, source }, objective: "Fixture", revision: "native", tokenBudget: null, tokensUsed: null, sessionControls: true });
+    let view = await f.service.readGoalEditor("session");
+    expect(view).toMatchObject({ source, sessionControls: true, action: "resume", actionTicket: expect.any(String) });
+    expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ source, nativeAction: "resume", nativeActionReady: true });
+    f.a.status = "running"; f.a.activeTurn = "current";
+    view = await f.service.readGoalEditor("session");
+    expect(view).toMatchObject({ action: "pause", actionTicket: expect.any(String), ticket: null });
+    expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ nativeAction: "pause", nativeActionReady: true });
+    expect(f.controlGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled(); expect(f.saved.records).toEqual({});
+  });
+  it("Claude의 실제 중지 이벤트를 확인하고 자동 복구나 추가 이어가기로 다시 켜지 않는다", async () => {
+    const f = await controls("claude"); f.a.status = "running"; f.a.activeTurn = "current";
+    const reading: GoalReading = { state: "active", key: "original-goal", evidence: true, source: "claude", nativeContinuation: true };
+    f.setDetails({ reading, objective: "Fixture", revision: "native", tokenBudget: null, tokensUsed: null, sessionControls: true });
+    const view = await f.service.readGoalEditor("session"); let canceled: Promise<void> | undefined;
+    f.controlGoal.mockImplementationOnce(async (_id, _revision, _action, _expected, check, _messageId, submitted) => {
+      check(); submitted(); f.idle(); canceled = f.event({ kind: "end", turnId: "current", outcome: { kind: "canceled", reason: "Interrupted" } } as Omit<RecoveryEvent, "agent">); check(); return reading;
+    });
+    await f.service.actOnGoal({ ticket: view.actionTicket! }); await canceled;
+    expect(f.saved.records.session).toMatchObject({ phase: "stopped", reason: "user_stop", goal: { selectedKey: null } });
+    f.advance(120_000); await f.service.scanNow(); expect(f.send).not.toHaveBeenCalled();
+    expect((await f.service.readGoalEditor("session")).action).toBe("resume");
+  });
+  it("휴면 Claude 세션은 읽기 중 복원하지 않고 명시적인 Resume 제어만 제공한다", async () => {
+    const f = await controls("claude"); f.a.status = "closed"; f.a.activeTurn = undefined;
+    f.setDetails({ reading: { state: "active", key: "original-goal", evidence: true, source: "claude" }, objective: "Fixture", revision: "native", tokenBudget: null, tokensUsed: null, sessionControls: true });
+    expect(await f.service.readGoalEditor("session")).toMatchObject({ action: "resume", actionTicket: expect.any(String) });
+    expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ nativeAction: "resume", nativeActionReady: true });
+    expect(f.controlGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled(); expect(f.supportsGoalCommand).not.toHaveBeenCalled();
   });
   it("새 턴, 만료, 설정 변경 또는 대기 중 승인이 이전 제어를 막는다", async () => {
     for (const mode of ["start", "expire", "settings", "permission"]) {
@@ -358,7 +427,7 @@ describe("goal composer inspection", () => {
     expect(await f.service.goalControl("session")).toMatchObject({ visible: true, state: "active", selected: true, canSelect: false, note: expect.stringContaining("last checked") });
     f.goal.mockClear(); f.advance(60_000); await f.service.scanNow();
     expect(f.send).not.toHaveBeenCalled();
-    expect(f.goal).toHaveBeenCalledWith("session", { allowTimeline: false });
+    expect(f.goal).toHaveBeenCalledWith("session", { allowTimeline: false, inspectOmp: true });
     expect(f.saved.records.session.goal?.selectedKey).toBe(active.key);
     expect(f.saved.records.session.reason).toBe("goal_unknown");
   });

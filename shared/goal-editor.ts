@@ -2,16 +2,18 @@ import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 
 export const MAX_GOAL_LENGTH = 16_000;
-export type GoalEditorSource = "codex" | "opencode" | "claude";
+export type GoalEditorSource = "codex" | "opencode" | "claude" | "omp";
 export function goalLengthLimit(source: GoalEditorSource | null): number { return source === "opencode" || source === "claude" ? 4000 : MAX_GOAL_LENGTH; }
 export const goalEditorSchema = z.object({
   id: z.string(), title: z.string(), provider: z.string(), supported: z.boolean(),
-  source: z.enum(["codex", "opencode", "claude"]).nullable().default(null),
+  source: z.enum(["codex", "opencode", "claude", "omp"]).nullable().default(null),
   objective: z.string().nullable(), state: z.enum(["active", "paused", "blocked", "limited", "complete", "cleared", "unknown"]),
   tokenBudget: z.number().finite().nonnegative().nullable(), tokensUsed: z.number().finite().nonnegative().nullable(),
   ticket: z.string().nullable(), note: z.string().nullable(),
   action: z.enum(["pause", "resume"]).nullable().optional(), actionTicket: z.string().nullable().optional(),
   actionNote: z.string().nullable().optional(), key: z.string().nullable().optional(),
+  sessionControls: z.boolean().optional(),
+  nativeStart: z.boolean().optional(),
 });
 export type GoalEditorSnapshot = z.infer<typeof goalEditorSchema>;
 export const readGoalRpc = defineRpc({ name: "recovery.goal.read", input: z.object({ id: z.string().min(1) }), output: goalEditorSchema });

@@ -16,6 +16,10 @@ import type { GoalAction } from "../shared/goal-actions";
 import { CodexGoals } from "./codex-goals";
 import { OpenCodeGoals } from "./opencode-goals";
 import { ClaudeGoals } from "./claude-goals";
+import { OmpGoals } from "./omp-goals";
+import { OmpNativeGoals, ompNativeDetails, OMP_GOAL_RPC, type OmpNativeOutput } from "./omp-native-goals";
+import { controlSessionGoal } from "./session-goal-controls";
+import { GOAL_PROMPT } from "../shared/contracts";
 
 export interface RecoveryHost {
   bootKey: string;
@@ -23,7 +27,7 @@ export interface RecoveryHost {
   store: StateStore;
   fetch(id: string): Promise<Agent | null>;
   workspace(id: string): Promise<Workspace | null>;
-  goal?(id: string, options?: { allowTimeline?: boolean }): Promise<GoalReading>;
+  goal?(id: string, options?: { allowTimeline?: boolean; inspectOmp?: boolean }): Promise<GoalReading>;
   supportsGoalCommand?(id: string, source?: GoalSource): Promise<boolean>;
   goalDetails?(id: string, options?: { allowTimeline?: boolean }): Promise<GoalDetails | null>;
   controlGoal?(id: string, revision: string, action: GoalAction, expected: Agent, check: () => void, messageId: string, submitted: () => void): Promise<GoalReading>;
@@ -50,6 +54,7 @@ export function nativeGoalCommand(commands: readonly { name: string; kind?: stri
     codex: ["Set, pause, resume, or clear the agent's goal"],
     opencode: ["Set a session-scoped goal and auto-continue until complete."],
     claude: ["Set a goal — keep working until the condition is met"],
+    omp: [],
   };
   return commands.some((command) => command.name === "goal" && command.kind === (source === "claude" ? "skill" : "command") && descriptions[source].includes(command.description));
 }
@@ -153,6 +158,20 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
   const codexGoals = new CodexGoals(home);
   const openCodeGoals = new OpenCodeGoals(home);
   const claudeGoals = new ClaudeGoals(home);
+  const ompGoals = new OmpGoals();
+  const ompNativeGoals = new OmpNativeGoals(async (input) => await driver.invokePluginRpc("session-recovery", OMP_GOAL_RPC, input) as OmpNativeOutput);
+  const ompDetails = async (agent: PaseoAgent): Promise<GoalDetails | null> => {
+    if (agent.provider !== "omp") return null;
+    const native = await ompNativeGoals.details(agent);
+    if (native?.objective) return native;
+    const previous = await ompGoals.details(agent), supported = await ompNativeGoals.supported();
+    const cleared = native ?? (agent.persistence?.sessionId ? ompNativeDetails(agent.persistence.sessionId, { goal: null, state: null }) : null);
+    if (supported && cleared && previous?.sessionControls && previous.objective && ["active", "paused"].includes(previous.reading.state)) return {
+      ...previous, sessionControls: false, nativeControls: true, nativeStart: true, nativeRevision: cleared.revision,
+      revision: createHash("sha256").update(JSON.stringify([previous.revision, cleared.revision])).digest("hex"),
+    };
+    return native ?? (previous ? { ...previous, sessionControls: false, ...(supported && previous.reading.nativeContinuation ? { nativeControls: true } : {}) } : null);
+  };
   const close = async () => { if (closed) return; closed = true; await codexGoals.close(); await driver.close().finally(release); };
   const check = async () => {
     await identity();
@@ -199,6 +218,8 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
           await check();
           if (native) return native;
         }
+        const omp = options?.allowTimeline === false && !options.inspectOmp ? ompGoals.cached(agent) : await ompDetails(agent);
+        if (omp) return omp.reading;
         // 화면의 자동 발견 조회는 휴면 대화를 복원하지 않는다.
         // 사용자의 명시적인 선택과 선택된 Goal의 실행 전 검사는 기존 경로를 쓴다.
         if (options?.allowTimeline === false) return { state: "unknown", key: null, evidence: false, source: "timeline" };
@@ -221,7 +242,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         await check();
         const agent = (await paseo.agents.ref(id).refresh())?.agent;
         if (!agent) return null;
-        const details = await openCodeGoals.details(agent) ?? await claudeGoals.details(agent) ?? (agent.persistence?.sessionId ? await codexGoals.details(agent.provider, agent.persistence.sessionId) : null);
+        const details = await ompDetails(agent) ?? await openCodeGoals.details(agent) ?? await claudeGoals.details(agent) ?? (agent.persistence?.sessionId ? await codexGoals.details(agent.provider, agent.persistence.sessionId) : null);
         await check();
         return details ?? (options?.allowTimeline === false ? null : await timelineDetails(id));
       },
@@ -230,8 +251,27 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         const agent = (await paseo.agents.ref(id).refresh())?.agent;
         checkGoalSession(agent ? metadata(agent) : null, expected, "initial");
         if (!agent?.persistence?.sessionId) throw new RecoveryError("The session's saved history is unavailable.");
-        const details = await openCodeGoals.details(agent) ?? await claudeGoals.details(agent) ?? await codexGoals.details(agent.provider, agent.persistence.sessionId);
+        const details = await ompDetails(agent) ?? await openCodeGoals.details(agent) ?? await claudeGoals.details(agent) ?? await codexGoals.details(agent.provider, agent.persistence.sessionId);
         const source = details?.reading.source;
+        if (details && source === "omp" && details.nativeControls) {
+          if (details.revision !== revision || !details.objective) throw new RecoveryError("The OMP goal changed. Reload its goal controls.");
+          const workspace = expected.workspaceId ? await paseo.workspaces.ref(expected.workspaceId).refresh() : null;
+          if (!workspace || workspace.archivingAt) throw new RecoveryError("This workspace is unavailable.");
+          await check(); guard(); checkGoalSession(await fetch(id), expected, "final");
+          if (details.nativeStart) {
+            if (action !== "resume" || busy(expected)) throw new RecoveryError("Wait for this turn to finish before starting a native OMP goal.");
+            return ompNativeGoals.start(agent, details.nativeRevision!, details.objective, expected, guard, messageId, submitted);
+          }
+          return ompNativeGoals.control(agent, revision, action, expected, guard, messageId, submitted);
+        }
+        if (details?.sessionControls && source === "claude") {
+          const workspace = expected.workspaceId ? await paseo.workspaces.ref(expected.workspaceId).refresh() : null;
+          if (!workspace || workspace.archivingAt) throw new RecoveryError("This workspace is unavailable.");
+          if (action === "resume" && driver.getLastServerInfoMessage()?.features?.agentRequestReceipts !== true) throw new RecoveryError("This daemon does not advertise durable message receipts.");
+          return controlSessionGoal({ expected, revision, action, guard, submitted,
+            fetch: () => fetch(id), details: () => claudeGoals.details(agent),
+            pause: () => driver.cancelAgent(id), resume: () => driver.sendAgentMessage(id, GOAL_PROMPT, { messageId, activeTurnBehavior: "steer" }) });
+        }
         if (source !== "codex" && source !== "opencode") throw new RecoveryError("This provider does not expose native pause and resume controls.");
         const idleOnly = source === "opencode";
         checkGoalSession(metadata(agent), expected, "initial", idleOnly);
@@ -257,7 +297,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         if (!agent?.persistence?.sessionId) throw new RecoveryError("The session's saved history is unavailable.");
         const details = await openCodeGoals.details(agent) ?? await claudeGoals.details(agent) ?? await codexGoals.details(agent.provider, agent.persistence.sessionId);
         const source = details?.reading.source;
-        if (!source || source === "timeline") throw new RecoveryError("This provider's native goal editor is unavailable.");
+        if (!source || source === "timeline" || source === "omp") throw new RecoveryError("This provider's native goal editor is unavailable.");
         const idleOnly = source !== "codex";
         checkGoalSession(metadata(agent), expected, "initial", idleOnly);
         const workspace = agent.workspaceId ? await paseo.workspaces.ref(agent.workspaceId).refresh() : null;
