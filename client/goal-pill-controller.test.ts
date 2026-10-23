@@ -15,6 +15,21 @@ function fixture() {
   return { read, add, registrations, controller, advance: (ms: number) => { now += ms; }, set: (patch: Partial<GoalControl>) => { value = control(patch); } };
 }
 describe("goal composer pill lifecycle", () => {
+  it("Goal 조회 없이 현재 세션 상태를 표시하고 새 턴만 관찰 갱신으로 취급한다", async () => {
+    const read = vi.fn(async () => control({ visible: true, state: "active", objective: "Keep working" }));
+    const observe = vi.fn(), update = vi.fn();
+    const controller = createGoalPillController(read, () => ({ observe, update, remove: vi.fn() }));
+    const closed = { ...agent, provider: "codex", status: "closed", activeTurn: null };
+    controller.upsert(closed);
+    expect(observe).toHaveBeenLastCalledWith(closed);
+    await controller.poll(); expect(read).not.toHaveBeenCalled();
+    const running = { ...closed, status: "running", activeTurn: { turnId: "turn-1" } };
+    controller.upsert(running); expect(observe).toHaveBeenLastCalledWith(running);
+    await controller.refresh(agent.id); expect(observe).toHaveBeenLastCalledWith(running);
+    const stopped = { ...running, status: "closed", activeTurn: null };
+    controller.upsert(stopped); expect(observe).toHaveBeenLastCalledWith(stopped);
+    expect(read).toHaveBeenCalledOnce(); controller.stop();
+  });
   it("수천 개의 제공자 대화에는 조회 버튼만 등록하고 현재 보이는 composer만 읽는다", async () => {
     const f = fixture();
     f.controller.snapshot(Array.from({ length: 2200 }, (_, i) => ({ ...agent, id: `native-${i}`, provider: ["omp", "claude", "opencode", "codex"][i % 4] })));

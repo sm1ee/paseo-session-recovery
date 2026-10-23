@@ -2,7 +2,7 @@ import type { PluginButtonContentProps, PluginButtonIconProps, PluginButtonRegis
 import { goalControlRpc, type GoalControl } from "../shared/contracts";
 import { readGoalRpc } from "../shared/goal-editor";
 import { actOnGoalRpc } from "../shared/goal-actions";
-import { createGoalPillController, type GoalPillController } from "./goal-pill-controller";
+import { createGoalPillController, type GoalPillController, type PillAgent } from "./goal-pill-controller";
 import { GoalPillIcon } from "./goal-pill-icon";
 import { GoalEditorContent } from "./goal-editor";
 import { goalErrorText, goalPreviewLabel } from "./goal-presentation";
@@ -13,6 +13,8 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
     (id, fresh) => client.rpc(goalControlRpc, { id, fresh, preview: true }),
     (id, workspaceId) => {
       let current: GoalControl | null = null;
+      let observed: PillAgent | undefined;
+      let lastLabel = "Goal";
       let playback: PluginButtonRegistration | undefined;
       const observe = () => controller.mount(id);
       const Icon = (props: PluginButtonIconProps) => <GoalPillIcon {...props} observe={observe} />;
@@ -38,9 +40,14 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
       };
       const pill = client.addComposerPill({ id: "goal-continuation", agentId: id, workspaceId,
         button: { title: "Goal", icon: Icon, label: "Goal", behavior: { kind: "popover", Content } } });
-      return { remove: () => { pill.remove(); playback?.remove(); }, update: (value) => {
+      const updateLabel = () => {
+        const label = goalPreviewLabel(current, observed);
+        if (label === lastLabel) return;
+        lastLabel = label; pill.update({ label, title: "Goal" });
+      };
+      return { remove: () => { pill.remove(); playback?.remove(); }, observe: (agent) => { observed = agent; updateLabel(); }, update: (value) => {
         current = value;
-        pill.update({ label: goalPreviewLabel(value), title: "Goal" });
+        updateLabel();
         const action = value?.nativeAction;
         if (!action) { playback?.update({ visible: false }); return; }
         const button = { title: value.nativeStart ? "Start goal" : action === "pause" ? "Pause goal" : "Resume goal",

@@ -4,13 +4,14 @@ export interface PillAgent {
   id: string; workspaceId?: string | null; archivedAt?: string | null; status: string;
   provider?: string; currentModeId?: string | null; lastUserMessageAt?: string | null;
   runtimeInfo?: { modeId?: string | null; provider?: string }; persistence?: { sessionId: string } | null;
+  activeTurn?: { turnId: string } | null;
 }
-export interface PillRegistration { update(value: GoalControl | null): void; remove(): void }
+export interface PillRegistration { update(value: GoalControl | null): void; observe?(agent: PillAgent): void; remove(): void }
 interface Target { agent: PillAgent; nextCheck: number; fresh: boolean; revision: number; observed: string; mounts: number; pill?: PillRegistration }
 const goalProviders = new Set(["codex", "omp", "pi", "claude", "opencode"]);
 function hasGoalEntry(agent: PillAgent): boolean { return goalProviders.has(agent.provider ?? "") || goalProviders.has(agent.runtimeInfo?.provider ?? ""); }
 function observation(agent: PillAgent): string {
-  return JSON.stringify([agent.status, agent.provider, agent.currentModeId === undefined ? agent.runtimeInfo?.modeId : agent.currentModeId, agent.lastUserMessageAt, agent.persistence?.sessionId]);
+  return JSON.stringify([agent.status, agent.activeTurn?.turnId, agent.provider, agent.currentModeId === undefined ? agent.runtimeInfo?.modeId : agent.currentModeId, agent.lastUserMessageAt, agent.persistence?.sessionId]);
 }
 
 export interface GoalPillController {
@@ -48,6 +49,7 @@ export function createGoalPillController(read: (id: string, fresh: boolean) => P
     // A supported provider's inspection entry must not depend on a goal RPC or
     // a scan of every saved conversation. The mounted composer checks its goal.
     if (hasGoalEntry(agent) && !target.pill) { target.pill = add(agent.id, agent.workspaceId); target.pill.update(null); }
+    target.pill?.observe?.(agent);
   }
   function snapshot(agents: PillAgent[]): void {
     // A reconnect can invalidate host-owned registrations. Rebuild the snapshot.
@@ -65,9 +67,11 @@ export function createGoalPillController(read: (id: string, fresh: boolean) => P
     if (stopped || !target || targets.get(id) !== target || target.revision !== revision) return value;
     if ((value.visible || value.objective) && value.workspaceId === target.agent.workspaceId) {
       if (!target.pill) target.pill = add(id, value.workspaceId!);
+      target.pill.observe?.(target.agent);
       target.pill.update(value);
     } else if (hasGoalEntry(target.agent) && value.workspaceId === target.agent.workspaceId) {
       if (!target.pill) target.pill = add(id, target.agent.workspaceId!);
+      target.pill.observe?.(target.agent);
       target.pill.update(null);
     }
     else { target.pill?.remove(); target.pill = undefined; }

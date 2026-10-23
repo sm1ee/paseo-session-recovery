@@ -1,11 +1,15 @@
 import type { GoalControl } from "../shared/contracts";
 import type { GoalEditorSnapshot } from "../shared/goal-editor";
+import type { PillAgent } from "./goal-pill-controller";
 
-export function goalPreviewLabel(goal: GoalControl | null): string {
+export function goalPreviewLabel(goal: GoalControl | null, agent?: PillAgent): string {
   const text = goal?.objective?.replace(/\s+/g, " ").trim();
   if (!text) return "Goal";
   const chars = [...text];
-  return `${chars.slice(0, 48).join("")}${chars.length > 48 ? "…" : ""}`;
+  const state = goal?.state === "active" && agent ? agent.status === "closed" ? "Stopped" : agent.status === "error" ? "Error" : agent.activeTurn === null ? "Idle" : null : null;
+  const prefix = state ? `${state} · ` : "";
+  const limit = 48 - [...prefix].length;
+  return `${prefix}${chars.slice(0, limit).join("")}${chars.length > limit ? "…" : ""}`;
 }
 export function goalErrorText(error: unknown): string {
   const raw = error instanceof Error ? error.message : "";

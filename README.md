@@ -86,7 +86,7 @@ OpenCode state is read from `<session cwd>/.opencode/goals/state.json.sessions/<
 
 OMP reads native goal state from its existing RPC connection when available. Offline previews inspect the known saved session file, with bounded reads and incremental updates. A native goal takes precedence over an older explicit `/goal` request on the current branch. Pi inspection reads structured `goal`, `create_goal`, `get_goal`, and `update_goal` tool results in at most the most recent 2,000 canonical timeline entries. Ordinary chat text, plans, and to-do lists are not treated as goals. An unverifiable state requires review.
 
-Claude previews read the selected composer's native transcript only, bounded to its last 8 MiB. The editor and Command Center can inspect that same session explicitly. Claude's own goal loop owns continuation, so a selected active Claude goal never receives an additional Paseo fallback message.
+Claude previews read the selected composer's native transcript only, bounded to its last 8 MiB. The editor and Command Center can inspect that same session explicitly. A selected Claude goal receives a fallback only when no turn is running and the configured delay has passed. A recorded user stop still prevents automatic continuation.
 
 Automatic composer discovery reads supported goal state without restoring a conversation. Older OMP requests require **Start goal** in the editor before they can be selected; their native loop owns continuation. For Pi and other providers that expose goals through conversation records, use **Continue this session's goal** in the Command Center to inspect and select one explicitly. Selected goals keep their automatic checks before continuation. Their composer toggle can show the last checked state without loading the conversation. Concurrent background checks for the same session share a result; sessions without a visible goal are checked again after five minutes or a relevant session change.
 
@@ -103,6 +103,8 @@ Explicit stops and completed goals are never automatically resumed. A completed 
 Unknown interruptions go to review. Temporary provider errors are retried only when enabled and when their code is recognized. Uncertain delivery is not automatically retried, even after another restart. Open the conversation to check the result.
 
 Worker birth times distinguish daemon restarts from plugin reloads, including when the supervisor stays alive. Graceful shutdown detection uses Paseo 0.11.4 and 0.12.0's removal of the local credential before closing sessions. A runtime close without shutdown evidence requires review.
+
+An active goal is saved intent, not proof of a running turn. With the session connection companion installed, selected active goals can reconnect their existing provider after a daemon restart or an observation gap. The plugin opens the same saved session through Paseo's shared loader, then waits for the provider's native turn before considering a fallback message. It does not cycle Pause/Resume, create a replacement goal, or reset its budget. Reconnection counts toward the selected goal's continuation limit. User stops, pending input, changed conversations, exclusions, and uncertain delivery still block recovery. Goals that are not selected keep the ordinary interruption rules.
 
 Lifecycle hooks are live and best effort. Missed events can leave an interruption unclassified. The plugin checks the latest completion, activity, permissions, archive state, and conversation timestamp before recovery. Paseo 0.11 and 0.12 have no atomic send-if-idle request, so a concurrent user action can still race submission. The request uses steering if a turn starts concurrently; providers may fall back to replacing a turn. Exclude sessions where this tradeoff is unacceptable.
 
@@ -126,7 +128,15 @@ paseo plugin install /absolute/path/to/paseo-session-recovery
 
 Reload changes with `paseo plugin reload session-recovery`. A daemon restart is not needed. Goal entries retry a failed initial session lookup and rebuild after reconnecting, including on mobile clients. A supported provider entry is registered before any goal-state request. Goal checks run for mounted composers, rather than scanning every saved session on each connected client.
 
-For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.6.7`. The public registry listing requires a separate review.
+For a direct Git installation, use `paseo plugin add git:sm1ee/paseo-session-recovery --ref v0.6.8`. The public registry listing requires a separate review.
+
+### Session connection companion
+
+Paseo 0.12.0 does not expose a plugin API to reconnect an unloaded session without sending a message. `scripts/build-session-connection-companion.mjs` generates a version checked daemon adapter from an absolute output directory and an optional server source directory. Its `preload.cjs` exports `install()`, which the daemon operator loads from the existing bootstrap before session modules load. Packaged macOS builds need an Electron Node runner to read `app.asar`. An optional fourth argument supplies an existing lightweight workspace status adapter; its hash is checked too. The adapter preserves the existing workspace update queue.
+
+The companion treats a stored `running` value as historical state and reports that session as stopped until its live connection returns. Persisted native child records do not count as current workspace activity when their owning connection is absent. These are display projections; native history and saved lifecycle records are left intact. Goal previews show **Stopped**, **Idle**, or **Error** when the observed session is not running, even if the native goal remains active. Reading a preview never opens a provider.
+
+Without this companion, automatic recovery keeps the existing metadata checks and may require review for unloaded sessions. The adapter accepts only the verified Paseo 0.12.0 sources; a Paseo update requires another compatibility check.
 
 ## OMP native controls
 
@@ -136,7 +146,7 @@ Paseo 0.12.0 does not expose OMP Goal RPCs to plugins. Native OMP controls requi
 
 OMP must allow native RPC continuation. Keep the desired existing modes and include `rpc` in `goal.continuationModes`, for example `["interactive", "rpc"]`. OMP still stops for its own blockers, explicit pauses, completed goals, limits, and host aborts. Extra Paseo continuation never supplies additional OMP goal messages.
 
-Native controls do not edit, drop, or recreate an existing goal. Starting an older request creates a new native goal only after **Start goal** is pressed. OMP currently has no RPC for editing an existing objective. A dormant session is reopened through Paseo's shared loader only for an explicit action. Preview reads never reopen it. A missing saved model is reported for the user to replace in Paseo; the plugin does not switch models or retry the goal action automatically.
+Native controls do not edit, drop, or recreate an existing goal. Starting an older request creates a new native goal only after **Start goal** is pressed. OMP currently has no RPC for editing an existing objective. A dormant session is reopened through Paseo's shared loader for an explicit action or a verified, selected-goal recovery. Preview reads never reopen it. A missing saved model is reported for the user to replace in Paseo; the plugin does not switch models or retry an uncertain operation automatically.
 
 ## Local data
 
