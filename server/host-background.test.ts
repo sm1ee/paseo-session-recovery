@@ -7,6 +7,9 @@ import { openLocalHost, type RecoveryHost } from "./host";
 import { OpenCodeGoals } from "./opencode-goals";
 import { CodexGoals } from "./codex-goals";
 import { ClaudeGoals } from "./claude-goals";
+import { OmpGoals } from "./omp-goals";
+import { OmpNativeGoals, ompNativeDetails } from "./omp-native-goals";
+import type { GoalDetails } from "./goals";
 
 type Info = NonNullable<ReturnType<DaemonClient["getLastServerInfoMessage"]>>;
 let home: string;
@@ -31,6 +34,50 @@ beforeEach(async () => {
   });
 });
 
+describe("OMP 연결 중단과 Goal 생성 구분", () => {
+  function ompFixture() {
+    vi.spyOn(DaemonClient.prototype, "fetchAgent").mockResolvedValue({ agent: {
+      id: "fixture", provider: "omp", labels: {}, persistence: { sessionId: "native-fixture", nativeHandle: "/fixture/native-fixture.jsonl" },
+    } } as NonNullable<Awaited<ReturnType<DaemonClient["fetchAgent"]>>>);
+    vi.spyOn(OpenCodeGoals.prototype, "read").mockResolvedValue(null);
+    vi.spyOn(CodexGoals.prototype, "read").mockResolvedValue(null);
+    const native = vi.spyOn(OmpNativeGoals.prototype, "details").mockResolvedValue(null);
+    vi.spyOn(OmpNativeGoals.prototype, "supported").mockResolvedValue(true);
+    const previous: GoalDetails = { objective: "Existing fixture objective", revision: "request-revision", tokenBudget: null, tokensUsed: null,
+      reading: { source: "omp", state: "active", key: "fixture-goal", evidence: true }, sessionControls: true };
+    const saved = vi.spyOn(OmpGoals.prototype, "details").mockResolvedValue(previous);
+    const timeline = vi.spyOn(DaemonClient.prototype, "fetchAgentTimeline").mockRejectedValue(new Error("대화 복원 금지"));
+    return { native, previous, saved, timeline };
+  }
+  it("RPC 연결 없음은 Goal 없음으로 바꾸거나 Start goal을 제공하지 않는다", async () => {
+    const f = ompFixture(); host = await openLocalHost(home, process.pid);
+    const details = await host.goalDetails!("fixture", { allowTimeline: false });
+    expect(details).toMatchObject({ objective: f.previous.objective, reading: { state: "unknown", key: "fixture-goal" }, sessionControls: false, nativeControls: true });
+    expect(details?.nativeStart).not.toBe(true); expect(details?.nativeRevision).toBeUndefined();
+    expect(await host.goal!("fixture", { allowTimeline: false, inspectOmp: true })).toMatchObject({ state: "unknown" });
+    expect(f.timeline).not.toHaveBeenCalled();
+  });
+  it("소유 연결이 네이티브 Goal 없음을 확인한 경우에만 Start goal을 제공한다", async () => {
+    const f = ompFixture(), empty = ompNativeDetails("native-fixture", { goal: null, state: null });
+    f.native.mockResolvedValue(empty); host = await openLocalHost(home, process.pid);
+    expect(await host.goalDetails!("fixture", { allowTimeline: false })).toMatchObject({ objective: f.previous.objective, nativeStart: true, nativeRevision: empty.revision });
+    expect(f.timeline).not.toHaveBeenCalled();
+  });
+  it("연결이 끊겨도 저장된 네이티브 Goal은 재생성 후보로 낮추지 않는다", async () => {
+    const f = ompFixture(); f.saved.mockResolvedValue({ ...f.previous, sessionControls: false, identity: "native-id",
+      reading: { ...f.previous.reading, nativeContinuation: true } });
+    host = await openLocalHost(home, process.pid);
+    const details = await host.goalDetails!("fixture", { allowTimeline: false });
+    expect(details).toMatchObject({ identity: "native-id", reading: { state: "active", nativeContinuation: true }, nativeControls: true });
+    expect(details?.nativeStart).not.toBe(true); expect(f.timeline).not.toHaveBeenCalled();
+  });
+  it("불완전한 네이티브 상태도 빈 Goal로 추정하지 않는다", async () => {
+    const f = ompFixture(); f.native.mockResolvedValue({ ...f.previous, objective: null, reading: { source: "omp", state: "unknown", key: null, evidence: true }, sessionControls: false });
+    host = await openLocalHost(home, process.pid);
+    expect(await host.goalDetails!("fixture", { allowTimeline: false })).toMatchObject({ objective: null, reading: { state: "unknown" } });
+    expect((await host.goalDetails!("fixture", { allowTimeline: false }))?.nativeStart).not.toBe(true);
+  });
+});
 describe("다중 제공자의 네이티브 Goal 편집", () => {
   for (const source of ["opencode", "claude"] as const) {
     function providerFixture() {

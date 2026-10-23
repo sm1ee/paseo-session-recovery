@@ -17,7 +17,7 @@ import { CodexGoals } from "./codex-goals";
 import { OpenCodeGoals } from "./opencode-goals";
 import { ClaudeGoals } from "./claude-goals";
 import { OmpGoals } from "./omp-goals";
-import { OmpNativeGoals, ompNativeDetails, OMP_GOAL_RPC, type OmpNativeOutput } from "./omp-native-goals";
+import { OmpNativeGoals, OMP_GOAL_RPC, type OmpNativeOutput } from "./omp-native-goals";
 import { controlSessionGoal } from "./session-goal-controls";
 import { GOAL_PROMPT } from "../shared/contracts";
 import { CONNECTION_RPC, type ConnectionOutput } from "./session-connection";
@@ -168,11 +168,15 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
     const native = await ompNativeGoals.details(agent);
     if (native?.objective) return native;
     const previous = await ompGoals.details(agent), supported = await ompNativeGoals.supported();
-    const cleared = native ?? (agent.persistence?.sessionId ? ompNativeDetails(agent.persistence.sessionId, { goal: null, state: null }) : null);
-    if (supported && cleared && previous?.sessionControls && previous.objective && ["active", "paused"].includes(previous.reading.state)) return {
-      ...previous, sessionControls: false, nativeControls: true, nativeStart: true, nativeRevision: cleared.revision,
-      revision: createHash("sha256").update(JSON.stringify([previous.revision, cleared.revision])).digest("hex"),
-    };
+    if (supported && previous?.sessionControls && previous.objective && ["active", "paused"].includes(previous.reading.state)) {
+      // An unavailable RPC connection does not prove that no native goal exists.
+      // Offer creation only after the owning transport confirms an empty goal.
+      if (!native) return { ...previous, reading: { ...previous.reading, state: "unknown" }, sessionControls: false, nativeControls: true };
+      if (native.reading.state === "cleared" && native.objective === null) return {
+        ...previous, sessionControls: false, nativeControls: true, nativeStart: true, nativeRevision: native.revision,
+        revision: createHash("sha256").update(JSON.stringify([previous.revision, native.revision])).digest("hex"),
+      };
+    }
     return native ?? (previous ? { ...previous, sessionControls: false, ...(supported && previous.reading.nativeContinuation ? { nativeControls: true } : {}) } : null);
   };
   const close = async () => { if (closed) return; closed = true; await codexGoals.close(); await driver.close().finally(release); };
