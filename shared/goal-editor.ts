@@ -14,6 +14,7 @@ export const goalEditorSchema = z.object({
   actionNote: z.string().nullable().optional(), key: z.string().nullable().optional(),
   sessionControls: z.boolean().optional(),
   nativeStart: z.boolean().optional(),
+  reconnect: z.boolean().optional(),
 });
 export type GoalEditorSnapshot = z.infer<typeof goalEditorSchema>;
 export const readGoalRpc = defineRpc({ name: "recovery.goal.read", input: z.object({ id: z.string().min(1) }), output: goalEditorSchema });

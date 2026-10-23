@@ -6,24 +6,26 @@ import { actOnGoalRpc } from "../shared/goal-actions";
 import { readGoalRpc } from "../shared/goal-editor";
 import { contributeGoalPills } from "./goal-pill";
 import { goalErrorText, goalPreviewLabel } from "./goal-presentation";
+import type { PillAgent } from "./goal-pill-controller";
 vi.mock("./goal-pill-icon", () => ({ GoalPillIcon: () => null }));
 vi.mock("./goal-editor", () => ({ GoalEditorContent: () => null }));
 
 const agent = { id: "session", workspaceId: "workspace", status: "idle", provider: "codex" };
 let cleanup: (() => void) | undefined;
 afterEach(() => { cleanup?.(); cleanup = undefined; vi.useRealTimers(); vi.restoreAllMocks(); });
-async function fixture(patch: Partial<GoalControl> = {}) {
+async function fixture(patch: Partial<GoalControl> = {}, agentPatch: Partial<PillAgent> = {}) {
+  const observed = { ...agent, ...agentPatch };
   let goal: GoalControl = { id: agent.id, workspaceId: agent.workspaceId, visible: true, state: "active", key: "current-goal", selected: false, canSelect: true,
     automatic: false, attempts: 0, maxAttempts: 10, delaySeconds: 60, note: null, objective: "Finish the fixture", source: "codex", nativeAction: "pause", ...patch };
   let editor: Record<string, unknown> = {};
   const buttons = new Map<string, PluginButton>();
   const update = vi.fn(), remove = vi.fn();
-  let snapshot!: (value: { entries: Array<{ agent: typeof agent }> }) => void;
+  let snapshot!: (value: { entries: Array<{ agent: PillAgent }> }) => void;
   const subscription = { subscribe: vi.fn((handlers) => { snapshot = handlers.snapshot; }) };
   const list = vi.fn(async () => ({ subscription }));
   const rpc = vi.fn(async (contract) => {
     if (contract === goalControlRpc) return { ...goal };
-    if (contract === readGoalRpc) return { key: goal.key, source: goal.source, action: goal.nativeAction, nativeStart: goal.nativeStart, actionTicket: "one-use", ...editor };
+    if (contract === readGoalRpc) return { key: goal.key, source: goal.source, action: goal.nativeAction, nativeStart: goal.nativeStart, reconnect: goal.nativeReconnect, actionTicket: "one-use", ...editor };
     if (contract === actOnGoalRpc) { goal = { ...goal, state: goal.nativeAction === "pause" ? "paused" : "active", nativeAction: goal.nativeAction === "pause" ? "resume" : "pause" }; return { ok: true }; }
     throw new Error("Unexpected RPC");
   });
@@ -34,13 +36,13 @@ async function fixture(patch: Partial<GoalControl> = {}) {
   const client = { rpc, addComposerPill, paseo: { agents: { list } } } as unknown as PluginClientContext;
   cleanup = contributeGoalPills(client);
   await vi.waitFor(() => expect(snapshot).toBeTypeOf("function"));
-  snapshot({ entries: [{ agent }] });
+  snapshot({ entries: [{ agent: observed }] });
   expect(rpc).not.toHaveBeenCalled();
   const icon = buttons.get("goal-continuation")!.icon;
   if (typeof icon !== "function") throw new Error("Goal mount observer missing");
   ((icon as FunctionComponent<PluginButtonIconProps>)({} as PluginButtonIconProps) as ReactElement<{ observe(): () => void }>).props.observe();
   await vi.waitFor(() => expect(rpc).toHaveBeenCalled());
-  await vi.waitFor(() => expect(buttons.get("goal-continuation")?.label).toBe(goalPreviewLabel(goal)));
+  await vi.waitFor(() => expect(buttons.get("goal-continuation")?.label).toBe(goalPreviewLabel(goal, observed)));
   const press = async () => {
     const behavior = buttons.get("goal-playback")?.behavior;
     if (behavior?.kind !== "action") throw new Error("Native playback action missing");
@@ -90,12 +92,28 @@ describe("목표 미리보기와 네이티브 재생 제어", () => {
     expect(f.rpc.mock.calls.filter(([contract]) => contract === actOnGoalRpc)).toHaveLength(1);
     expect(f.buttons.get("goal-playback")).toMatchObject({ icon: "Play", label: "Resume" });
   });
+  it.each(["codex", "omp", "opencode"] as const)("Stopped %s 미리보기 옆에는 연결 복원 Resume와 Play를 표시한다", async (source) => {
+    const f = await fixture({ source, nativeAction: "resume", nativeReconnect: true, nativeActionReady: true }, { status: "closed", activeTurn: null });
+    expect(f.buttons.get("goal-continuation")?.label).toMatch(/^Stopped/);
+    expect(f.buttons.get("goal-playback")).toMatchObject({ label: "Resume", icon: "Play", disabled: false, behavior: { kind: "action" } });
+    await f.press(); expect(f.rpc).toHaveBeenCalledWith(actOnGoalRpc, { ticket: "one-use", confirmBudgetReset: false });
+  });
+  it("Stopped 메타데이터와 오래된 Pause 응답이 섞여도 Pause를 표시하거나 전송하지 않는다", async () => {
+    const f = await fixture({ nativeAction: "pause" }, { status: "closed", activeTurn: null });
+    expect(f.buttons.get("goal-playback")).toMatchObject({ label: "Resume", icon: "Play", disabled: true });
+    await expect(f.press()).rejects.toThrow(); expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc)).toBe(false);
+  });
+  it("Resume 문구가 같아도 연결 복원과 네이티브 상태 변경 티켓을 섞지 않는다", async () => {
+    const f = await fixture({ nativeAction: "resume", nativeReconnect: true }, { status: "closed", activeTurn: null });
+    f.setEditor({ reconnect: false }); await expect(f.press()).rejects.toThrow();
+    expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc)).toBe(false);
+  });
   it.each([{ key: "replacement-goal" }, { action: "resume" }, { actionTicket: null, note: "Waiting for approval" }])("오래되거나 막힌 제어 %j는 다른 목표에 전송하지 않는다", async (editor) => {
     const f = await fixture(); f.setEditor(editor); await expect(f.press()).rejects.toThrow();
     expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc)).toBe(false);
   });
   it("확인되지 않은 제어 명령을 자동 재시도하지 않는다", async () => {
-    const f = await fixture(); f.rpc.mockImplementationOnce(async () => ({ key: "current-goal", source: "codex", action: "pause", nativeStart: false, actionTicket: "one-use" }));
+    const f = await fixture(); f.rpc.mockImplementationOnce(async () => ({ key: "current-goal", source: "codex", action: "pause", nativeStart: false, reconnect: false, actionTicket: "one-use" }));
     f.rpc.mockImplementationOnce(async () => { throw new Error("Receipt lost"); });
     await expect(f.press()).rejects.toThrow("Couldn’t confirm. Reload."); expect(f.rpc.mock.calls.filter(([contract]) => contract === actOnGoalRpc)).toHaveLength(1);
   });

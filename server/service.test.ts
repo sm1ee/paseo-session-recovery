@@ -43,17 +43,19 @@ function fixture(options: Record<string, unknown> = {}) {
     goalReading = { ...goalReading, state: "active" }; return structuredClone(goalReading);
   });
   const send = vi.fn(async (_id: string, _prompt: string, _messageId: string, _expected: Agent, check: () => void) => { check(); });
+  const connection = vi.fn(async () => "loaded" as "loaded" | "detached" | "unknown");
+  const reconnectSession = vi.fn(async (_id: string, _expected: Agent, check: () => void) => { check(); return structuredClone(a); });
   const settings = preferences.schema.parse(options);
   const hosts: RecoveryHost[] = [];
   const create = (bootKey: string) => {
     const host: RecoveryHost = { bootKey, serverId: "host", store, fetch, workspace: getWorkspace,
-      shuttingDown: vi.fn(async () => shuttingDown), goal, goalDetails, editGoal, controlGoal, supportsGoalCommand, resumeBlockedGoal, send, close: vi.fn(async () => {}) };
+      shuttingDown: vi.fn(async () => shuttingDown), goal, goalDetails, editGoal, controlGoal, supportsGoalCommand, resumeBlockedGoal, connection, reconnectSession, send, close: vi.fn(async () => {}) };
     hosts.push(host); service = new RecoveryService(async () => host, () => clock, false); return service;
   };
   create("boot-a");
   const event = (value: Omit<RecoveryEvent, "agent">) => service.observe({ ...value, agent: { ...hook, parentAgentId: a.parentId } } as RecoveryEvent);
   return {
-    a, others, workspace, settings, store, fetch, getWorkspace, goal, goalDetails, editGoal, controlGoal, supportsGoalCommand, resumeBlockedGoal, send, hosts,
+    a, others, workspace, settings, store, fetch, getWorkspace, goal, goalDetails, editGoal, controlGoal, supportsGoalCommand, resumeBlockedGoal, connection, reconnectSession, send, hosts,
     setDetails: (value: CodexGoalDetails | null) => { details = value; },
     setGoal: (reading: GoalReading) => { goalReading = reading; },
     get service() { return service; },
@@ -73,6 +75,45 @@ describe("목표 미리보기와 명시적인 네이티브 제어", () => {
     f.setGoal(reading); f.setDetails({ reading, objective: "Private fixture objective", revision: "native-revision", tokenBudget: 100, tokensUsed: 3 });
     await f.service.configure(f.settings); return f;
   }
+  it.each(["codex", "opencode", "omp"] as const)("멈춘 %s 세션의 active Goal은 Pause 대신 연결 복원용 Resume를 제공한다", async (source) => {
+    const f = await controls(source); f.a.status = "closed"; f.a.activeTurn = null; f.connection.mockResolvedValue("detached");
+    if (source === "omp") f.setDetails({ reading: { state: "active", key: "original-goal", evidence: true, source: "omp", nativeContinuation: true },
+      objective: "Fixture", revision: "native", tokenBudget: 100, tokensUsed: 4, nativeControls: true });
+    const view = await f.service.readGoalEditor("session");
+    expect(view).toMatchObject({ action: "resume", reconnect: true, actionTicket: expect.any(String) });
+    expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ nativeAction: "resume", nativeReconnect: true, nativeActionReady: true });
+    expect(f.reconnectSession).not.toHaveBeenCalled(); expect(f.saved.records).toEqual({});
+    await f.service.actOnGoal({ ticket: view.actionTicket! });
+    expect(f.reconnectSession).toHaveBeenCalledExactlyOnceWith("session", expect.objectContaining({ status: "closed", sessionId: "native-fixture" }), expect.any(Function));
+    expect(f.controlGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+    expect(f.saved.history.at(-1)).toMatchObject({ action: "resume", reason: "reconnected" });
+    expect(f.saved.records.session.goal).toMatchObject({ state: "active", selectedKey: null });
+    await expect(f.service.actOnGoal({ ticket: view.actionTicket! })).rejects.toThrow(/expired/);
+  });
+  it("재연결 중 시작된 네이티브 턴을 같은 세션에서 관찰하며 Goal 명령은 보내지 않는다", async () => {
+    const f = await controls(); f.a.status = "closed"; f.a.activeTurn = null; f.connection.mockResolvedValue("detached");
+    const view = await f.service.readGoalEditor("session"); let start: Promise<void> | undefined;
+    f.reconnectSession.mockImplementationOnce(async (_id, _expected, check) => {
+      expect(f.saved.records.session.phase).toBe("sending"); f.a.status = "running"; f.a.activeTurn = "reconnected-turn";
+      start = f.event({ kind: "start", turnId: "reconnected-turn" } as Omit<RecoveryEvent, "agent">); check(); return structuredClone(f.a);
+    });
+    await f.service.actOnGoal({ ticket: view.actionTicket! }); await start;
+    expect(f.saved.records.session).toMatchObject({ phase: "watching", turnId: "reconnected-turn" });
+    expect(f.controlGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it.each(["goal", "permission", "running", "receipt", "budget"] as const)("재연결의 %s 변경이나 불확실성은 재실행으로 우회하지 않는다", async (block) => {
+    const f = await controls(); f.a.status = "closed"; f.a.activeTurn = null; f.connection.mockResolvedValue("detached");
+    const view = await f.service.readGoalEditor("session");
+    if (block === "goal") f.setDetails({ reading: { state: "paused", key: "original-goal", evidence: true, source: "codex" }, objective: "Private fixture objective", revision: "changed", tokenBudget: 100, tokensUsed: 3 });
+    if (block === "permission") await f.event({ kind: "permission", requestId: "approval" } as Omit<RecoveryEvent, "agent">);
+    if (block === "running") f.connection.mockResolvedValue("loaded");
+    if (block === "receipt") f.reconnectSession.mockRejectedValueOnce(new Error("Lost acknowledgement"));
+    if (block === "budget") f.reconnectSession.mockImplementationOnce(async () => { f.setDetails({ reading: { state: "active", key: "original-goal", evidence: true, source: "codex" }, objective: "Private fixture objective", revision: "native-revision", tokenBudget: 200, tokensUsed: 0 }); return structuredClone(f.a); });
+    await expect(f.service.actOnGoal({ ticket: view.actionTicket! })).rejects.toThrow();
+    if (["receipt", "budget"].includes(block)) expect(f.saved.records.session.reason).toBe("uncertain_send");
+    else expect(f.reconnectSession).not.toHaveBeenCalled();
+    expect(f.controlGoal).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled();
+  });
   it("OMP 네이티브 Goal은 실행 중에도 API 일시정지 티켓을 내고 대화 메시지를 보내지 않는다", async () => {
     const f = await controls("omp");
     f.setDetails({ reading: { state: "active", key: "original-goal", evidence: true, source: "omp", nativeContinuation: true }, objective: "Fixture", revision: "native", tokenBudget: 100, tokensUsed: 4, nativeControls: true });

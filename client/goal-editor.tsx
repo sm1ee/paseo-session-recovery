@@ -38,7 +38,7 @@ function GoalEditor({ theme, layout, agentId: id, host, showPlayback = true, onC
   const playback = useMutation({ retry: false, mutationFn: async (value: GoalEditorSnapshot) => {
     if (!value.action || !value.actionTicket) throw new Error("Reload the current goal before changing it.");
     setNotice(null);
-    await act({ ticket: value.actionTicket, confirmBudgetReset: value.source === "opencode" && value.action === "resume" });
+    await act({ ticket: value.actionTicket, confirmBudgetReset: value.source === "opencode" && value.action === "resume" && !value.reconnect });
   }, onSuccess: () => { setDraft(null); setNeedsReload(false); setNotice(goal?.nativeStart ? "Goal started." : goal?.action === "pause" ? "Paused." : "Resumed."); refresh(); },
   onError: (error) => { setNeedsReload(true); setNotice(goalErrorText(error)); onChanged?.(); } });
   const continuation = useMutation({ retry: false, mutationFn: async () => {
@@ -91,7 +91,7 @@ function GoalEditor({ theme, layout, agentId: id, host, showPlayback = true, onC
       {dirty && <Text style={muted}>{text.length.toLocaleString()} / {maxLength.toLocaleString()}</Text>}
       {dirty && validation && <Text accessibilityRole="alert" style={{ color: c.statusDanger }}>{validation}</Text>}
     </View>}
-    {showPlayback && goal?.source === "opencode" && goal.action === "resume" && <Text style={muted}>Resume resets goal budgets.</Text>}
+    {showPlayback && goal?.source === "opencode" && goal.action === "resume" && !goal.reconnect && <Text style={muted}>Resume resets goal budgets.</Text>}
     {goal?.source === "claude" && dirty && <Text style={muted}>Restarts the goal timer and usage.</Text>}
     {showPlayback && goal?.sessionControls && goal.action && <Text style={muted}>Pause stops this turn. Resume continues the same goal.</Text>}
     {notice && <Text accessibilityRole="alert" style={normal}>{notice}</Text>}

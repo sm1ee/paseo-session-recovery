@@ -1,7 +1,7 @@
 {
   "name": "session-recovery",
   "private": true,
-  "version": "0.6.8",
+  "version": "0.6.9",
   "description": "Recover interrupted Paseo sessions and continue selected goals.",
   "license": "MIT",
   "author": "sm1ee",
