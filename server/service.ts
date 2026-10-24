@@ -835,6 +835,15 @@ export class RecoveryService {
           if (value.nativeReconnect) value.nativeAction = "resume";
           value.nativeActionReady = !this.saved.excluded.includes(id) && !r?.humanRequired && r?.reason !== "uncertain_send" && r?.phase !== "sending" && !r?.expectingStart &&
             goalCommandReady(a) && (!value.nativeReconnect || !!host.reconnectSession && await host.connection?.(id) === "detached") && (details?.sessionControls ? (a.activeTurn !== undefined || a.status === "closed") && (!busy(a) || !!a.activeTurn) : reading.source === "codex" || reading.source === "opencode" && !busy(a) || reading.source === "omp" && details?.nativeControls === true && (!details.nativeStart || !busy(a)));
+          value.nativeActionNote = value.nativeActionReady ? null
+            : this.saved.excluded.includes(id) ? "This session is excluded from recovery."
+            : r?.reason === "uncertain_send" ? "Previous command unconfirmed. Check the conversation."
+            : r?.phase === "sending" || r?.expectingStart ? "Waiting for the previous goal command."
+            : r?.humanRequired || a.pendingPermissions > 0 ? "Waiting for your input."
+            : !goalCommandReady(a) ? "Session unavailable. Reload its controls."
+            : value.nativeReconnect ? "Session connection unavailable. Reload its controls."
+            : busy(a) ? "Turn running. Wait for it to finish."
+            : "Native goal controls unavailable. Reload.";
         }
         const terminal = reading.state === "complete" || reading.state === "cleared";
         const selected = !terminal && !!r?.goal?.selectedKey && (!reading.key || r.goal.selectedKey === reading.key);
