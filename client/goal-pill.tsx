@@ -60,10 +60,14 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
         const staleReconnect = !!observed?.activeTurn && value.nativeReconnect === true;
         const shown = stalePause ? "resume" : staleReconnect ? "pause" : action;
         const disabled = value.nativeActionReady === false || stalePause || staleReconnect;
-        const signature = JSON.stringify([shown, disabled, value.source, value.nativeStart, value.nativeReconnect]);
+        const actionTitle = value.nativeStart ? "Start goal" : shown === "pause" ? "Pause goal" : "Resume goal";
+        const blockedNote = stalePause || staleReconnect ? "Session changed. Checking goal controls."
+          : value.nativeActionNote || "Controls unavailable. Open Goal to check.";
+        const title = disabled ? `${actionTitle}: ${blockedNote}` : actionTitle;
+        const signature = JSON.stringify([shown, disabled, value.source, value.nativeStart, value.nativeReconnect, title]);
         if (signature === lastPlayback) return;
         lastPlayback = signature;
-        const button = { title: value.nativeStart ? "Start goal" : shown === "pause" ? "Pause goal" : "Resume goal",
+        const button = { title,
           icon: shown === "pause" ? "Pause" : "Play", label: value.nativeStart ? "Start goal" : shown === "pause" ? "Pause" : "Resume", visible: true, disabled,
           behavior: action === "resume" && value.source === "opencode" && !value.nativeReconnect ? { kind: "popover" as const, Content: PlaybackContent } : { kind: "action" as const, onPress: act } };
         if (playback) playback.update(button);

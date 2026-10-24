@@ -80,6 +80,7 @@ export const goalControlSchema = z.object({
   objective: z.string().nullable().optional(), source: z.enum(["codex", "opencode", "claude", "omp", "timeline"]).nullable().optional(),
   nativeAction: z.enum(["pause", "resume"]).nullable().optional(),
   nativeActionReady: z.boolean().optional(),
+  nativeActionNote: z.string().nullable().optional(),
   nativeStart: z.boolean().optional(),
   nativeReconnect: z.boolean().optional(),
 });

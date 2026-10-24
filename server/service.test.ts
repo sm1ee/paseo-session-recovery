@@ -318,7 +318,7 @@ describe("목표 미리보기와 명시적인 네이티브 제어", () => {
       const reads = Promise.all([f.service.readGoalEditor("session"), f.service.goalControl("session", true, false, true)]);
       const [editor, preview] = await Promise.race([reads, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("조회가 상태 변경 대기열에서 기다림")), 300); })]);
       expect(editor).toMatchObject({ objective: "Private fixture objective", ticket: null, actionTicket: null });
-      expect(preview).toMatchObject({ objective: "Private fixture objective", nativeActionReady: false });
+      expect(preview).toMatchObject({ objective: "Private fixture objective", nativeActionReady: false, nativeActionNote: "Waiting for the previous goal command." });
       expect(f.controlGoal).toHaveBeenCalledOnce();
     } finally { clearTimeout(timeout); release(); await action; }
   });
@@ -447,6 +447,7 @@ describe("목표 미리보기와 명시적인 네이티브 제어", () => {
     });
     await expect(f.service.actOnGoal({ ticket: view.actionTicket! })).rejects.toThrow("Receipt lost");
     expect(f.saved.records.session.reason).toBe("uncertain_send"); await f.restart(); f.advance(60_000); await f.service.scanNow();
+    expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ nativeActionReady: false, nativeActionNote: "Previous command unconfirmed. Check the conversation." });
     expect((await f.service.readGoalEditor("session")).actionTicket).toBeNull(); expect(f.controlGoal).toHaveBeenCalledOnce(); expect(f.send).not.toHaveBeenCalled();
   });
   it("제출 전 거부된 제어는 기존 기록을 복원한다", async () => {

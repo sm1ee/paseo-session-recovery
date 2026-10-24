@@ -143,6 +143,24 @@ describe("목표 미리보기와 네이티브 재생 제어", () => {
     expect(f.buttons.get("goal-playback")).toMatchObject({ label: "Pause", disabled: true, visible: true });
     expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc)).toBe(false);
   });
+  it("비활성화 이유가 바뀌면 툴팁도 갱신하고 해제되면 기본 제목으로 돌아온다", async () => {
+    vi.useFakeTimers();
+    const f = await fixture({ source: "omp", state: "paused", nativeAction: "resume", nativeActionReady: false,
+      nativeActionNote: "Previous command unconfirmed. Check the conversation." });
+    expect(f.buttons.get("goal-playback")).toMatchObject({ label: "Resume", disabled: true,
+      title: "Resume goal: Previous command unconfirmed. Check the conversation." });
+    f.set({ nativeActionNote: "Waiting for your input." });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(f.buttons.get("goal-playback")?.title).toBe("Resume goal: Waiting for your input.");
+    f.set({ nativeActionReady: true, nativeActionNote: null });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(f.buttons.get("goal-playback")).toMatchObject({ title: "Resume goal", disabled: false });
+    expect(f.rpc.mock.calls.some(([contract]) => contract === actOnGoalRpc || contract === watchGoalRpc)).toBe(false);
+  });
+  it("구버전 서버에 비활성화 이유가 없으면 Goal 확인 안내를 표시한다", async () => {
+    const f = await fixture({ nativeActionReady: false });
+    expect(f.buttons.get("goal-playback")?.title).toBe("Pause goal: Controls unavailable. Open Goal to check.");
+  });
   it.each(["claude", "timeline"] as const)("%s의 미지원 제어를 재생이나 일시정지로 표시하지 않는다", async (source) => {
     const f = await fixture({ source, nativeAction: null }); expect(f.buttons.has("goal-playback")).toBe(false);
   });
