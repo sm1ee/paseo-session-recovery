@@ -7,7 +7,13 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        sdk: ["0.11.4", "0.12.0"]
+        include:
+          - sdk: "0.11.4"
+            client: "0.12.0"
+          - sdk: "0.12.0"
+            client: "0.12.0"
+          - sdk: "0.13.0"
+            client: "0.13.0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -16,7 +22,7 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - if: matrix.sdk != '0.12.0'
-        run: npm install --ignore-scripts --no-save --package-lock=false --legacy-peer-deps @getpaseo/plugin@${{ matrix.sdk }} @getpaseo/client@0.12.0
+        run: npm install --ignore-scripts --no-save --package-lock=false --legacy-peer-deps @getpaseo/plugin@${{ matrix.sdk }} @getpaseo/client@${{ matrix.client }}
       - run: npm run typecheck
       - run: npm run test:mobile
       - run: npm test

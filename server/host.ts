@@ -293,7 +293,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
           if (action === "resume" && driver.getLastServerInfoMessage()?.features?.agentRequestReceipts !== true) throw new RecoveryError("This daemon does not advertise durable message receipts.");
           return controlSessionGoal({ expected, revision, action, guard, submitted,
             fetch: () => fetch(id), details: () => claudeGoals.details(agent),
-            pause: () => driver.cancelAgent(id), resume: () => driver.sendAgentMessage(id, GOAL_PROMPT, { messageId, activeTurnBehavior: "steer" }) });
+            pause: () => driver.cancelAgent(id), resume: async () => { await driver.sendAgentMessage(id, GOAL_PROMPT, { messageId, activeTurnBehavior: "steer" }); } });
         }
         if (source !== "codex" && source !== "opencode") throw new RecoveryError("This provider does not expose native pause and resume controls.");
         const idleOnly = source === "opencode";

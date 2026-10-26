@@ -1,4 +1,4 @@
-import type { PluginButton, PluginButtonIconProps, PluginClientContext } from "@getpaseo/plugin/client";
+import type { PluginButtonIconProps, PluginClientContext } from "@getpaseo/plugin/client";
 import type { FunctionComponent, ReactElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { goalControlRpc, unwatchGoalRpc, watchGoalRpc, type GoalControl } from "../shared/contracts";
@@ -11,6 +11,7 @@ vi.mock("./goal-pill-icon", () => ({ GoalPillIcon: () => null }));
 vi.mock("./goal-editor", () => ({ GoalEditorContent: () => null }));
 
 const agent = { id: "session", workspaceId: "workspace", status: "idle", provider: "codex" };
+type PillButton = Parameters<PluginClientContext["addComposerPill"]>[0]["button"];
 let cleanup: (() => void) | undefined;
 afterEach(() => { cleanup?.(); cleanup = undefined; vi.useRealTimers(); vi.restoreAllMocks(); });
 async function fixture(patch: Partial<GoalControl> = {}, agentPatch: Partial<PillAgent> = {}) {
@@ -18,7 +19,7 @@ async function fixture(patch: Partial<GoalControl> = {}, agentPatch: Partial<Pil
   let goal: GoalControl = { id: agent.id, workspaceId: agent.workspaceId, visible: true, state: "active", key: "current-goal", selected: false, canSelect: true,
     automatic: false, attempts: 0, maxAttempts: 10, delaySeconds: 60, note: null, objective: "Finish the fixture", source: "codex", nativeAction: "pause", ...patch };
   let editor: Record<string, unknown> = {};
-  const buttons = new Map<string, PluginButton>();
+  const buttons = new Map<string, PillButton>();
   const update = vi.fn(), remove = vi.fn();
   let snapshot!: (value: { entries: Array<{ agent: PillAgent }> }) => void;
   const subscription = { subscribe: vi.fn((handlers) => { snapshot = handlers.snapshot; }) };
@@ -31,7 +32,7 @@ async function fixture(patch: Partial<GoalControl> = {}, agentPatch: Partial<Pil
   });
   const addComposerPill = vi.fn((pill: Parameters<PluginClientContext["addComposerPill"]>[0]) => {
     buttons.set(pill.id, pill.button);
-    return { update: (value: Partial<PluginButton>) => { update(value); buttons.set(pill.id, { ...buttons.get(pill.id)!, ...value }); }, remove };
+    return { update: (value: Partial<PillButton>) => { update(value); buttons.set(pill.id, { ...buttons.get(pill.id)!, ...value }); }, remove };
   });
   const client = { rpc, addComposerPill, paseo: { agents: { list } } } as unknown as PluginClientContext;
   cleanup = contributeGoalPills(client);
