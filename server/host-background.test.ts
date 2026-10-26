@@ -12,6 +12,8 @@ import { OmpNativeGoals, ompNativeDetails } from "./omp-native-goals";
 import type { GoalDetails } from "./goals";
 
 type Info = NonNullable<ReturnType<DaemonClient["getLastServerInfoMessage"]>>;
+// SDK 0.13 returns delivery metadata; earlier SDKs return void.
+const messageReceipt = {} as unknown as Awaited<ReturnType<DaemonClient["sendAgentMessage"]>>;
 let home: string;
 let host: RecoveryHost | undefined;
 let version: unknown;
@@ -93,7 +95,7 @@ describe("다중 제공자의 네이티브 Goal 편집", () => {
       vi.spyOn(ClaudeGoals.prototype, "details").mockResolvedValue(source === "claude" ? details : null);
       const edit = source === "opencode" ? vi.spyOn(OpenCodeGoals.prototype, "edit") : vi.spyOn(ClaudeGoals.prototype, "edit");
       edit.mockImplementation(async (_agent, _revision, _objective, guard, submit) => { guard(); await submit(); return { state: "active", key: "edited", evidence: true, source }; });
-      const send = vi.spyOn(DaemonClient.prototype, "sendAgentMessage").mockResolvedValue(undefined);
+      const send = vi.spyOn(DaemonClient.prototype, "sendAgentMessage").mockResolvedValue(messageReceipt);
       return { agent, commands, edit, send };
     }
     it(`${source}의 저장은 소유 연결에서 한 번 전송하고 따옴표와 줄바꿈을 보존한다`, async () => {
@@ -125,7 +127,7 @@ describe("네이티브 Goal 일시정지와 재개 전달", () => {
     vi.spyOn(OpenCodeGoals.prototype, "details").mockResolvedValue(source === "opencode" ? details : null);
     vi.spyOn(ClaudeGoals.prototype, "details").mockResolvedValue(source === "claude" ? details : null);
     vi.spyOn(CodexGoals.prototype, "details").mockResolvedValue(details);
-    const send = vi.spyOn(DaemonClient.prototype, "sendAgentMessage").mockResolvedValue(undefined);
+    const send = vi.spyOn(DaemonClient.prototype, "sendAgentMessage").mockResolvedValue(messageReceipt);
     return { agent, send };
   }
   it.each(["codex", "opencode"] as const)("%s는 Goal 제어를 소유 연결로 한 번 전송한다", async (source) => {
@@ -148,7 +150,8 @@ describe("네이티브 Goal 일시정지와 재개 전달", () => {
 afterEach(async () => { await host?.close(); host = undefined; vi.restoreAllMocks(); await rm(home, { recursive: true, force: true }); });
 
 describe("recovery host compatibility", () => {
-  it("resolves an observed session's background workspace through the real SDK ref", async () => {
+  it.each(["0.12.0", "0.13.0"])("resolves an observed session's background workspace through the real SDK ref on %s", async (value) => {
+    version = value;
     host = await openLocalHost(home, process.pid);
     expect(await host.workspace("background-space")).toEqual({ id: "background-space", archived: false, archiving: false });
   });
@@ -157,13 +160,15 @@ describe("recovery host compatibility", () => {
     host = await openLocalHost(home, process.pid);
     expect(await host.workspace("public-space")).toEqual({ id: "public-space", archived: false, archiving: false });
   });
-  it("preserves graceful shutdown detection on supported 0.12 hosts", async () => {
+  it.each(["0.12.0", "0.13.0"])("preserves graceful shutdown detection on %s", async (value) => {
+    version = value;
     host = await openLocalHost(home, process.pid);
     expect(await host.shuttingDown()).toBe(false);
     await unlink(join(home, "local-credential"));
     expect(await host.shuttingDown()).toBe(true);
   });
-  it("rejects a 0.12 host that cannot expose background workspaces", async () => {
+  it.each(["0.12.0", "0.13.0"])("rejects a %s host that cannot expose background workspaces", async (value) => {
+    version = value;
     background = false;
     await expect(openLocalHost(home, process.pid)).rejects.toThrow(/background workspace/);
     expect(DaemonClient.prototype.fetchWorkspaces).not.toHaveBeenCalled();
@@ -179,7 +184,7 @@ describe("native Codex goal commands", () => {
       pendingPermissions: [] as unknown[], archivedAt: null as string | null, lastUserMessageAt: null as string | null,
       attentionReason: null as string | null, attentionTimestamp: null as string | null, internal: false };
     vi.spyOn(DaemonClient.prototype, "fetchAgent").mockImplementation(async () => ({ agent: structuredClone(agent), project: null }) as unknown as NonNullable<Awaited<ReturnType<DaemonClient["fetchAgent"]>>>);
-    const send = vi.spyOn(DaemonClient.prototype, "sendAgentMessage").mockResolvedValue(undefined);
+    const send = vi.spyOn(DaemonClient.prototype, "sendAgentMessage").mockResolvedValue(messageReceipt);
     const commands = vi.spyOn(DaemonClient.prototype, "listCommands").mockResolvedValue({ agentId: "fixture", commands: [{ name: "goal", kind: "command", description: "Set, pause, resume, or clear the agent's goal", argumentHint: "[<objective>|pause|resume|clear]" }], error: null, requestId: "fixture" });
     vi.spyOn(CodexGoals.prototype, "resumeBlocked").mockImplementation(async (_provider, _thread, key, guard, submit) => { guard(); await submit(); return { state: "active", key, evidence: true, source: "codex" }; });
     vi.spyOn(CodexGoals.prototype, "details").mockResolvedValue({ reading: { state: "active", key: "original-goal", evidence: true, source: "codex" }, objective: "Original fixture", revision: "revision", tokenBudget: 100, tokensUsed: 1 });
@@ -222,7 +227,7 @@ describe("native Codex goal commands", () => {
     vi.mocked(DaemonClient.prototype.getLastServerInfoMessage).mockReturnValue({ serverId: "scope-test", version, features: { backgroundWorkspaces: background, agentRequestReceipts: true } } as Info);
     vi.spyOn(DaemonClient.prototype, "fetchAgent").mockResolvedValue({ agent: { id: "fixture", title: "Fixture", provider: "codex", labels: {},
       workspaceId: "background-space", persistence: { sessionId: "native-fixture" }, status: "running", activeTurn: hasTurn ? { turnId: "current-turn" } : undefined, pendingPermissions: [], lastUserMessageAt: null }, project: null } as unknown as NonNullable<Awaited<ReturnType<DaemonClient["fetchAgent"]>>>);
-    const send = vi.spyOn(DaemonClient.prototype, "sendAgentMessage").mockResolvedValue(undefined);
+    const send = vi.spyOn(DaemonClient.prototype, "sendAgentMessage").mockResolvedValue(messageReceipt);
     vi.spyOn(DaemonClient.prototype, "listCommands").mockResolvedValue({ agentId: "fixture", commands: [{ name: "goal", kind: "command", description: "Set, pause, resume, or clear the agent's goal", argumentHint: "[<objective>|pause|resume|clear]" }], error: null, requestId: "fixture" });
     vi.spyOn(CodexGoals.prototype, "resumeBlocked").mockImplementation(async (_provider, _thread, key, guard, submit) => { guard(); await submit(); return { state: "active", key, evidence: true, source: "codex" }; });
     host = await openLocalHost(home, process.pid); const agent = await host.fetch("fixture");

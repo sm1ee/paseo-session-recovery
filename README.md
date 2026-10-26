@@ -134,7 +134,7 @@ Other cleanup scripts do not read this list. Their configuration is not changed.
 
 ## Install locally
 
-Requires a macOS or Linux daemon running **stable Paseo >=0.11.4 <0.13.0** and a provider with persistent history. The UI supports compact clients.
+Requires a macOS or Linux daemon running **stable Paseo >=0.11.4** and a provider with persistent history. The UI supports compact clients.
 
 ```sh
 npm ci --ignore-scripts
@@ -170,9 +170,11 @@ Session IDs, titles, providers, turn IDs, timestamps, attempt counts, exclusions
 
 Composer visibility checks, goal continuation, and explicit goal selection inspect supported goal state and conversation records in memory. Connected clients observe the metadata directory of unarchived sessions in active workspaces to register Goal entries. Only mounted supported-provider composers query current goal state, with up to four concurrent requests. Verified goals are checked about every 15 seconds; an unavailable goal state is checked again after five minutes or a relevant session change. Opening the goal screen explicitly inspects that one session, including supported OMP/Pi conversation records and Claude native state. Other providers may discover compatible goals through their existing metadata checks. The daemon briefly caches these read-only results. Discovery does not select, schedule, or resume sessions, and still works when the automatic continuation setting is off. Conversation bodies, goal objectives, raw provider errors, API tokens, and credentials are not stored in the journal. The local credential is read in memory to authenticate to the owning daemon's loopback listener or Unix socket. Continuations go through the session's existing provider. No separate model or external review service is used.
 
-The startup connection uses a version-pinned adapter because Paseo does not provide an SDK context at plugin entry startup. Stable 0.11.4 through 0.12.x are supported. On 0.12, workspace lookups include background workspaces. Unknown versions and prereleases pause recovery until compatibility has been checked.
+The startup connection uses a version-pinned adapter because Paseo does not provide an SDK context at plugin entry startup. Stable Paseo 0.11.4 or later is accepted when the required daemon capabilities are present. On 0.12 and later, workspace lookups include background workspaces. Prereleases, malformed versions, and missing capabilities pause recovery.
 
-A Paseo update does not normally require a plugin update. This plugin checks its daemon adapter more closely because it relies on the daemon's credential and process lifecycle. CI checks both the 0.11.4 and 0.12.0 plugin SDKs.
+A Paseo update does not normally require a plugin update. This plugin checks its daemon adapter more closely because it relies on the daemon's credential and process lifecycle. CI checks the 0.11.4, 0.12.0, and 0.13.0 plugin SDKs.
+
+The manifest declares only `>=0.11.4`, without a minor-version upper bound. Compatibility is checked with Paseo 0.11.4, 0.12.0, and 0.13.0. Newer stable daemons are accepted when the required capabilities are present; a future breaking API change may still need a plugin update. SDK and runtime dependencies remain pinned for reproducible builds.
 
 ## Development
 
@@ -185,7 +187,7 @@ npm test
 
 Tests simulate restarts, stops, approvals, lost responses, retry limits, concurrent user actions, and storage failures. They do not restart the real daemon or resume user sessions.
 
-The mobile check compiles the client module graph with React Native's Hermes compiler without running plugin code. CI runs it with both supported Paseo SDK versions.
+The mobile check compiles the client module graph with React Native's Hermes compiler without running plugin code. CI runs it with all supported Paseo SDK versions.
 
 ### Lightweight goal inspection
 

@@ -1,7 +1,7 @@
 {
   "name": "session-recovery",
   "private": true,
-  "version": "0.6.12",
+  "version": "0.6.13",
   "description": "Recover interrupted Paseo sessions and continue selected goals.",
   "license": "MIT",
   "author": "sm1ee",
@@ -31,7 +31,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test:mobile": "node scripts/check-mobile-syntax.mjs",
-    "test": "vitest run"
+    "test": "vitest run --maxWorkers=2"
   },
   "devDependencies": {
     "@getpaseo/plugin": "0.12.0",
