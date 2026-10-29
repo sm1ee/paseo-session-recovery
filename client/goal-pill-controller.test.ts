@@ -15,6 +15,18 @@ function fixture() {
   return { read, add, registrations, controller, advance: (ms: number) => { now += ms; }, set: (patch: Partial<GoalControl>) => { value = control(patch); } };
 }
 describe("goal composer pill lifecycle", () => {
+  it("등록된 커스텀 제공자만 조회 진입을 만들고 마운트한 세션만 읽는다", async () => {
+    const f = fixture();
+    f.controller.snapshot(Array.from({ length: 2200 }, (_, i) => ({ ...agent, id: `alias-${i}`, provider: i % 2 ? "claude-codex" : "devin" })));
+    expect(f.add).not.toHaveBeenCalled();
+    f.controller.providers(["claude-codex", "devin"]);
+    expect(f.add).toHaveBeenCalledTimes(2200);
+    await f.controller.poll(); expect(f.read).not.toHaveBeenCalled();
+    const unmount = f.controller.mount("alias-2199");
+    await vi.waitFor(() => expect(f.read).toHaveBeenCalledExactlyOnceWith("alias-2199", true));
+    f.controller.providers([]); expect(f.registrations.every(r => r.remove.mock.calls.length === 1)).toBe(true);
+    unmount(); f.controller.stop(); f.controller.providers(["claude-codex"]); expect(f.add).toHaveBeenCalledTimes(2200);
+  });
   it("Goal 조회 없이 현재 세션 상태를 표시하고 새 턴만 관찰 갱신으로 취급한다", async () => {
     const read = vi.fn(async () => control({ visible: true, state: "active", objective: "Keep working" }));
     const observe = vi.fn(), update = vi.fn();

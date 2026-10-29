@@ -53,6 +53,20 @@ async function fixture(patch: Partial<GoalControl> = {}, agentPatch: Partial<Pil
 }
 
 describe("목표 미리보기와 네이티브 재생 제어", () => {
+  it("별칭과 ACP 제공자는 캐시된 provider 목록으로 진입을 등록하고 Goal은 마운트 후에만 조회한다", async () => {
+    let snapshot!: (value: { entries: Array<{ agent: PillAgent }> }) => void;
+    const rpc = vi.fn(), remove = vi.fn(), addComposerPill = vi.fn(() => ({ update: vi.fn(), remove: vi.fn() }));
+    const providers = { snapshot: vi.fn(async () => ({ entries: [
+      { provider: "claude-codex", source: "custom", enabled: true }, { provider: "devin", source: "custom", enabled: true },
+      { provider: "disabled", source: "custom", enabled: false },
+    ] })), subscribe: vi.fn(() => remove) };
+    cleanup = contributeGoalPills({ rpc, addComposerPill, paseo: { providers, agents: { list: vi.fn(async () => ({ subscription: { subscribe: (handlers: { snapshot: typeof snapshot }) => { snapshot = handlers.snapshot; } } })) } } } as unknown as PluginClientContext);
+    await vi.waitFor(() => expect(snapshot).toBeTypeOf("function"));
+    snapshot({ entries: ["claude-codex", "devin", "disabled"].map(provider => ({ agent: { ...agent, id: provider, provider } })) });
+    await vi.waitFor(() => expect(addComposerPill).toHaveBeenCalledTimes(2));
+    expect(rpc).not.toHaveBeenCalled();
+    cleanup(); cleanup = undefined; expect(remove).toHaveBeenCalledOnce();
+  });
   it("본문을 정규화해 줄이고 상태는 추가 이어가기 선택과 독립적으로 표시한다", () => {
     const base = { state: "active", objective: "한글🙂\n".repeat(40), selected: false, automatic: false } as GoalControl;
     const label = goalPreviewLabel(base);

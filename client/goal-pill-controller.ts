@@ -9,12 +9,12 @@ export interface PillAgent {
 export interface PillRegistration { update(value: GoalControl | null): void; observe?(agent: PillAgent): void; remove(): void }
 interface Target { agent: PillAgent; nextCheck: number; fresh: boolean; revision: number; observed: string; mounts: number; pill?: PillRegistration }
 const goalProviders = new Set(["codex", "omp", "pi", "claude", "opencode"]);
-function hasGoalEntry(agent: PillAgent): boolean { return goalProviders.has(agent.provider ?? "") || goalProviders.has(agent.runtimeInfo?.provider ?? ""); }
 function observation(agent: PillAgent): string {
   return JSON.stringify([agent.status, agent.activeTurn?.turnId, agent.provider, agent.currentModeId === undefined ? agent.runtimeInfo?.modeId : agent.currentModeId, agent.lastUserMessageAt, agent.persistence?.sessionId]);
 }
 
 export interface GoalPillController {
+  providers(ids: readonly string[]): void;
   upsert(agent: PillAgent): void;
   snapshot(agents: PillAgent[]): void;
   remove(id: string): void;
@@ -28,6 +28,9 @@ export interface GoalPillController {
 export function createGoalPillController(read: (id: string, fresh: boolean) => Promise<GoalControl>,
   add: (id: string, workspaceId: string) => PillRegistration, now = Date.now): GoalPillController {
   const targets = new Map<string, Target>();
+  let customProviders = new Set<string>();
+  const hasGoalEntry = (agent: PillAgent) => [agent.provider, agent.runtimeInfo?.provider]
+    .some(id => !!id && (goalProviders.has(id) || customProviders.has(id)));
   const priority = new Set<string>();
   let stopped = false, polling = false;
   let pollPromise = Promise.resolve(), wakePoll: (() => void) | undefined;
@@ -132,5 +135,13 @@ export function createGoalPillController(read: (id: string, fresh: boolean) => P
   }
 
   function stop(): void { stopped = true; for (const id of targets.keys()) remove(id); }
-  return { upsert, snapshot, remove, refresh, mount, poll, stop };
+  function providers(ids: readonly string[]): void {
+    if (stopped) return;
+    customProviders = new Set(ids);
+    for (const target of targets.values()) {
+      if (hasGoalEntry(target.agent)) upsert(target.agent);
+      else if (target.pill) { target.pill.remove(); target.pill = undefined; }
+    }
+  }
+  return { providers, upsert, snapshot, remove, refresh, mount, poll, stop };
 }
