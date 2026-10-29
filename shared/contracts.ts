@@ -77,7 +77,7 @@ export const goalControlSchema = z.object({
   state: rowSchema.shape.goalState, key: z.string().nullable(), selected: z.boolean(), canSelect: z.boolean(),
   automatic: z.boolean(), attempts: z.number().int().nonnegative(), maxAttempts: z.number().int().positive(), delaySeconds: z.number().int().positive(),
   note: z.string().nullable(), holdReason: reasonSchema.nullable().optional(),
-  objective: z.string().nullable().optional(), source: z.enum(["codex", "opencode", "claude", "omp", "timeline"]).nullable().optional(),
+  objective: z.string().nullable().optional(), source: z.enum(["codex", "opencode", "claude", "omp", "devin", "timeline"]).nullable().optional(),
   nativeAction: z.enum(["pause", "resume"]).nullable().optional(),
   nativeActionReady: z.boolean().optional(),
   nativeActionNote: z.string().nullable().optional(),
