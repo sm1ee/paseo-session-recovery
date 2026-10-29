@@ -79,6 +79,17 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
       } };
     },
   );
+  let providerRead: Promise<void> | undefined;
+  const readProviders = (): Promise<void> => providerRead ??= (async () => {
+    try {
+      // Cached directory metadata only: never refresh models or inspect sessions.
+      const snapshot = await client.paseo.providers?.snapshot();
+      if (!lifetime.signal.aborted && snapshot) controller.providers(snapshot.entries
+        .filter(entry => entry.source === "custom" && entry.enabled !== false).map(entry => entry.provider));
+    } catch { /* Built-in entries remain available if provider discovery is unavailable. */ }
+  })().finally(() => { providerRead = undefined; });
+  const removeProviders = client.paseo.providers?.subscribe(() => { void readProviders(); });
+  void readProviders();
   let observing = false, starting = false;
   const observe = () => {
     if (lifetime.signal.aborted || observing || starting) return;
@@ -93,7 +104,7 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
         const { subscription } = await client.paseo.agents.list({ scope: "active", sync: {}, subscribe: {}, signal: attempt.signal });
         if (lifetime.signal.aborted) return;
         subscription.subscribe({
-          snapshot: ({ entries }) => { controller.snapshot(entries.map(({ agent }) => agent)); void controller.poll(); },
+          snapshot: ({ entries }) => { controller.snapshot(entries.map(({ agent }) => agent)); void readProviders(); void controller.poll(); },
           update: (message) => {
             if (message.type !== "agent_update") return;
             if (message.payload.kind === "remove") controller.remove(message.payload.agentId);
@@ -113,5 +124,5 @@ export function contributeGoalPills(client: PluginClientContext): () => void {
   };
   const timer = setInterval(() => { observe(); void controller.poll(); }, 5000);
   observe();
-  return () => { lifetime.abort(); clearInterval(timer); controller.stop(); };
+  return () => { lifetime.abort(); clearInterval(timer); removeProviders?.(); controller.stop(); };
 }
