@@ -63,6 +63,11 @@ describe("기존 ACP 연결의 읽기 전용 전달", () => {
     const f = fixture(); expect(await invokeDevinNative(f.session, f.input)).toMatchObject({ available: true, details: { reading: { source: "devin", state: "active" } } });
     expect(f.raw.connection.extMethod).toHaveBeenCalledExactlyOnceWith("_cognition.ai/goal/get", { sessionId: "native" });
   });
+  it("실제 Paseo처럼 새 snapshot 복사본을 반환해도 동일 연결이면 읽는다", async () => {
+    const f = fixture(); f.manager.getAgent.mockImplementation(() => ({ ...f.live }));
+    expect(await invokeDevinNative(f.session, f.input)).toMatchObject({ available: true, details: { reading: { state: "active" } } });
+    expect(f.raw.connection.extMethod).toHaveBeenCalledOnce();
+  });
   it("동시 조회를 합치며 조회 시 세션 생성이나 복원을 하지 않는다", async () => {
     const f = fixture(); await Promise.all(Array.from({ length: 100 }, () => invokeDevinNative(f.session, f.input)));
     expect(f.raw.connection.extMethod).toHaveBeenCalledOnce(); f.manager.getAgent.mockReturnValue(null);

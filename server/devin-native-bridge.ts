@@ -103,7 +103,7 @@ export async function invokeDevinNative(session: BridgeSession, input: DevinNati
       const value = await Promise.race([raw.connection!.extMethod("_cognition.ai/goal/get", { sessionId }),
         new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Devin goal lookup timed out.")), 4000); })]);
       const current = session.agentManager.getAgent(id);
-      if (current !== live || current?.session !== owner || current.provider !== provider || current.archivedAt || current.internal || connection(current.session, sessionId) !== raw)
+      if (!current || current.session !== owner || current.provider !== provider || current.archivedAt || current.internal || connection(current.session, sessionId) !== raw)
         throw new Error("The Devin connection changed. Reload its goal controls.");
       return { protocol: 1, available: true, details: devinNativeDetails(sessionId, value) };
     } finally { clearTimeout(timer); }
