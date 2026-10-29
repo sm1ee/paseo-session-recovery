@@ -15,9 +15,9 @@ export type RecoveryEvent =
   | { kind: "resolution"; agent: HookAgent; requestId: string; allowed: boolean }
   | { kind: "closed" | "archived"; agent: HookAgent };
 interface Ticket { id: string; revision: number; generation: number; expiresAt: number; fingerprint: string; prompt: string }
-interface NativeGoalResume { submitted: boolean; starts: number; pauseTurnId?: string }
+interface NativeGoalResume { submitted: boolean; starts: number; pauseTurnId?: string; trackCompletion?: boolean; completedTurnId?: string }
 interface GoalEditTicket { id: string; generation: number; changed: number; revision: string; expected: Agent; expiresAt: number }
-interface GoalActionTicket extends GoalEditTicket { action: GoalAction; source: "codex" | "opencode" | "claude" | "omp"; key: string; sessionControls?: boolean; reconnect?: boolean }
+interface GoalActionTicket extends GoalEditTicket { action: GoalAction; source: "codex" | "opencode" | "claude" | "omp" | "devin"; key: string; sessionControls?: boolean; reconnect?: boolean }
 function suspendedGoal(r: RecordEntry): boolean {
   return !r.goalInterruption && isSelectedGoal(r) && ["review", "stopped"].includes(r.phase) && ["goal_paused", "goal_blocked", "goal_limited", "goal_unknown"].includes(r.reason);
 }
@@ -160,7 +160,13 @@ export class RecoveryService {
     // Providers can start goal work as the native resume/edit command is handled.
     // Other events and user actions still invalidate the pending operation.
     const resuming = this.nativeGoalResumes.get(event.agent.id);
-    if (event.kind === "start" && resuming?.submitted) resuming.starts++;
+    if (event.kind === "start" && resuming?.submitted) {
+      resuming.starts++;
+      if (resuming.trackCompletion && event.turnId) resuming.completedTurnId = event.turnId;
+    }
+    if (event.kind === "end" && event.outcome.kind === "completed" && resuming?.submitted && resuming.completedTurnId === event.turnId) {
+      resuming.starts++; delete resuming.completedTurnId;
+    }
     if (event.kind === "end" && event.outcome.kind === "canceled" && resuming?.submitted && resuming.pauseTurnId && event.turnId === resuming.pauseTurnId && /^(interrupted|user_stop|canceled)$/i.test(event.outcome.reason)) {
       resuming.starts++; delete resuming.pauseTurnId;
     }
@@ -642,7 +648,8 @@ export class RecoveryService {
     if (!source || source === "timeline") return { ...view, note: "This provider exposes goal history for viewing. Editing and native pause/resume are unavailable through this plugin connection." };
     const sessionControls = details.sessionControls === true;
     const nativeOmp = source === "omp" && details.nativeControls === true;
-    const controlsWhileBusy = source === "codex" || nativeOmp && !details.nativeStart;
+    const nativeDevin = source === "devin" && details.nativeControls === true;
+    const controlsWhileBusy = source === "codex" || nativeOmp && !details.nativeStart || nativeDevin;
     Object.assign(view, { supported: true, source, sessionControls, nativeStart: details.nativeStart });
     if (details.reading.state === "unknown") return { ...view, note: "The current native goal could not be verified. Check its state in the conversation and reload." };
     if (!details.objective) return { ...view, note: source === "opencode" && !details.reading.modeId ? "Select the registered OpenCode Goal mode and set an objective with /goal <objective>." : "There is no current goal. Set one in the conversation with /goal <objective>." };
@@ -651,6 +658,7 @@ export class RecoveryService {
     const reconnect = !sessionControls && !details.nativeStart && details.reading.state === "active" && a.status === "closed" && a.activeTurn == null;
     view.reconnect = reconnect;
     if (reconnect) view.action = "resume";
+    else if (nativeDevin) view.action = details.reading.state === "active" ? busy(a) && a.activeTurn ? "pause" : null : ["paused", "blocked"].includes(details.reading.state) ? "resume" : null;
     else if (sessionControls) view.action = busy(a) ? "pause" : "resume";
     else if (source === "codex" || source === "opencode" || nativeOmp) view.action = details.nativeStart ? "resume" : details.reading.state === "active" ? "pause" : "resume";
     const r = this.saved.records[id];
@@ -676,13 +684,14 @@ export class RecoveryService {
         !goalCommandReady(latest) || current?.humanRequired || current?.reason === "user_stop" || current?.reason === "uncertain_send" ||
         current?.phase === "sending" || current?.expectingStart || !sessionControls && !controlsWhileBusy && busy(latest)) return { ...view, note: "The session changed. Reload to edit or control this goal." };
       expected = latest; ticketChanged = this.changes.get(id) ?? 0;
+      if (nativeDevin) view.action = details.reading.state === "active" ? busy(latest) && latest.activeTurn ? "pause" : null : ["paused", "blocked"].includes(details.reading.state) && !busy(latest) ? "resume" : null;
     }
-    const ticket = source !== "omp" && (source === "codex" || !busy(expected)) ? randomUUID() : null, now = this.now();
+    const ticket = source !== "omp" && source !== "devin" && (source === "codex" || !busy(expected)) ? randomUUID() : null, now = this.now();
     for (const [key, value] of this.goalEditTickets) if (value.expiresAt <= now) this.goalEditTickets.delete(key);
     if (this.goalEditTickets.size >= 100) this.goalEditTickets.delete(this.goalEditTickets.keys().next().value!);
     if (ticket) this.goalEditTickets.set(ticket, { id, generation, changed: ticketChanged, revision: details.revision, expected, expiresAt: now + 300_000 });
-    if ((source === "codex" || source === "opencode" || nativeOmp || sessionControls) && host.controlGoal && (!sessionControls || !busy(expected) || !!expected.activeTurn)) {
-      const action: GoalAction = reconnect || details.nativeStart ? "resume" : sessionControls ? busy(expected) ? "pause" : "resume" : details.reading.state === "active" ? "pause" : "resume", actionTicket = randomUUID();
+    if ((!nativeDevin || view.action !== null && (view.action === "pause" || !busy(expected))) && (source === "codex" || source === "opencode" || nativeOmp || nativeDevin || sessionControls) && host.controlGoal && (!sessionControls || !busy(expected) || !!expected.activeTurn)) {
+      const action: GoalAction = nativeDevin ? view.action! : reconnect || details.nativeStart ? "resume" : sessionControls ? busy(expected) ? "pause" : "resume" : details.reading.state === "active" ? "pause" : "resume", actionTicket = randomUUID();
       for (const [key, value] of this.goalActionTickets) if (value.expiresAt <= now) this.goalActionTickets.delete(key);
       if (this.goalActionTickets.size >= 100) this.goalActionTickets.delete(this.goalActionTickets.keys().next().value!);
       this.goalActionTickets.set(actionTicket, { id, generation, changed: ticketChanged, revision: details.revision, expected, expiresAt: now + 300_000, action, source, key: details.reading.key, sessionControls, reconnect });
@@ -692,7 +701,7 @@ export class RecoveryService {
         : source === "opencode" && action === "resume" ? "OpenCode resume starts a new native turn, token, and time budget window. Review this before resuming."
         : action === "pause" ? "Pause the native goal's continuation. A current turn may finish before work stops." : "Resume the native goal using its existing limits." });
     }
-    const note = source === "omp" ? sessionControls ? "Paseo tracks the explicit /goal request in this conversation. OMP did not register it as a native goal. Pause and Resume control this session; editing is unavailable."
+    const note = source === "devin" ? "Devin manages native continuation. Pause interrupts its current turn; Resume uses its native /goal resume command. Existing goal text cannot be edited." : source === "omp" ? sessionControls ? "Paseo tracks the explicit /goal request in this conversation. OMP did not register it as a native goal. Pause and Resume control this session; editing is unavailable."
       : nativeOmp ? "OMP's native Goal RPC controls this goal. Pause and Resume preserve its objective, budget, and usage. OMP does not support editing an existing goal."
       : "This OMP native goal is read-only. Its owning provider connection does not expose native goal commands."
       : source === "claude" ? "Replacing uses Claude's native /goal command and immediately starts a turn. Claude resets its goal timer, evaluated turn count, and token-spend baseline. Existing session limits are unchanged."
@@ -708,7 +717,7 @@ export class RecoveryService {
       if (!ticket || ticket.expiresAt <= this.now()) throw new RecoveryError("These goal controls expired. Reload before trying again.");
       if (ticket.source === "opencode" && ticket.action === "resume" && !ticket.reconnect && !parsed.confirmBudgetReset) throw new RecoveryError("Review and confirm OpenCode's new native budget window before resuming.");
       const { id, generation, changed } = ticket;
-      const native: NativeGoalResume = { submitted: false, starts: 0, ...(ticket.sessionControls && ticket.action === "pause" && ticket.expected.activeTurn ? { pauseTurnId: ticket.expected.activeTurn } : {}) };
+      const native: NativeGoalResume = { submitted: false, starts: 0, ...(ticket.source === "devin" ? { trackCompletion: true, ...(ticket.action === "pause" && ticket.expected.activeTurn ? { completedTurnId: ticket.expected.activeTurn } : {}) } : {}), ...(ticket.sessionControls && ticket.action === "pause" && ticket.expected.activeTurn ? { pauseTurnId: ticket.expected.activeTurn } : {}) };
       const guard = () => { this.check(generation); if ((this.changes.get(id) ?? 0) !== changed + native.starts) throw new RecoveryError("The session changed. Reload its goal controls."); };
       guard(); const host = await this.ready(); guard();
       const previous = this.saved.records[id];
@@ -743,7 +752,7 @@ export class RecoveryService {
           this.audit(intent, "resume", "reconnected"); await this.persist(); return { ok: true };
         }
         const reading = await host.controlGoal!(id, ticket.revision, ticket.action, a, guard, messageId, () => { native.submitted = true; }); guard();
-        if (reading.key !== ticket.key || (ticket.sessionControls ? !["active", "paused"].includes(reading.state) : reading.state !== (ticket.action === "pause" ? "paused" : "active"))) throw new RecoveryError("The native goal action could not be confirmed. Reload and review its state.");
+        if (reading.key !== ticket.key || (ticket.source === "devin" ? !["active", "paused", "blocked", "complete"].includes(reading.state) : ticket.sessionControls ? !["active", "paused"].includes(reading.state) : reading.state !== (ticket.action === "pause" ? "paused" : "active"))) throw new RecoveryError("The native goal action could not be confirmed. Reload and review its state.");
         intent.goal!.state = reading.state;
         if (ticket.sessionControls) this.set(intent, ticket.action === "pause" ? "stopped" : "completed", ticket.action === "pause" ? "user_stop" : "goal_unselected");
         else if (previous) {
@@ -829,12 +838,12 @@ export class RecoveryService {
         if ((this.changes.get(id) ?? 0) !== changed) { value.note = "The session changed while checking its goal. Try again."; return value; }
         if (preview) {
           value.objective = details?.objective ?? null; value.source = reading.source ?? null; value.nativeStart = details?.nativeStart === true;
-          value.nativeAction = details?.nativeStart ? "resume" : details?.sessionControls && !!reading.key && ["active", "paused"].includes(reading.state) ? busy(a) ? "pause" : "resume" : (reading.source === "codex" || reading.source === "opencode" || reading.source === "omp" && details?.nativeControls) && !!reading.key
+          value.nativeAction = reading.source === "devin" ? details?.nativeControls && reading.key ? reading.state === "active" ? busy(a) && a.activeTurn ? "pause" : null : ["paused", "blocked"].includes(reading.state) ? "resume" : null : null : details?.nativeStart ? "resume" : details?.sessionControls && !!reading.key && ["active", "paused"].includes(reading.state) ? busy(a) ? "pause" : "resume" : (reading.source === "codex" || reading.source === "opencode" || reading.source === "omp" && details?.nativeControls) && !!reading.key
             ? reading.state === "active" ? "pause" : (reading.source === "omp" ? reading.state === "paused" : ["paused", "blocked", "limited"].includes(reading.state)) ? "resume" : null : null;
           value.nativeReconnect = value.nativeAction === "pause" && !details?.sessionControls && reading.state === "active" && a.status === "closed" && a.activeTurn == null;
           if (value.nativeReconnect) value.nativeAction = "resume";
           value.nativeActionReady = !this.saved.excluded.includes(id) && !r?.humanRequired && r?.reason !== "uncertain_send" && r?.phase !== "sending" && !r?.expectingStart &&
-            goalCommandReady(a) && (!value.nativeReconnect || !!host.reconnectSession && await host.connection?.(id) === "detached") && (details?.sessionControls ? (a.activeTurn !== undefined || a.status === "closed") && (!busy(a) || !!a.activeTurn) : reading.source === "codex" || reading.source === "opencode" && !busy(a) || reading.source === "omp" && details?.nativeControls === true && (!details.nativeStart || !busy(a)));
+            goalCommandReady(a) && (!value.nativeReconnect || !!host.reconnectSession && await host.connection?.(id) === "detached") && (reading.source === "devin" ? details?.nativeControls === true && (reading.state === "active" ? busy(a) && !!a.activeTurn : ["paused", "blocked"].includes(reading.state) && !busy(a)) : details?.sessionControls ? (a.activeTurn !== undefined || a.status === "closed") && (!busy(a) || !!a.activeTurn) : reading.source === "codex" || reading.source === "opencode" && !busy(a) || reading.source === "omp" && details?.nativeControls === true && (!details.nativeStart || !busy(a)));
           value.nativeActionNote = value.nativeActionReady ? null
             : this.saved.excluded.includes(id) ? "This session is excluded from recovery."
             : r?.reason === "uncertain_send" ? "Previous command unconfirmed. Check the conversation."
@@ -865,6 +874,7 @@ export class RecoveryService {
           : r && interruptedGoal(r) ? reasonText[r.reason]
           : snapshotOnly ? "Showing the last checked goal state. Automatic continuation verifies the current state again before sending."
           : needsNativeOmp ? "Use Start goal to register this request as an OMP native goal. Extra continuation does not start it."
+          : reading.source === "devin" ? "Devin manages native goal continuation. Paused or blocked goals require an explicit Resume; this toggle never sends an extra continuation prompt."
           : reading.source === "opencode" ? value.state === "active" ? reading.nativeContinuation ? "OpenCode is managing continuation. Paseo will not send an extra message while the native continuation or child-session guard is in effect."
             : "OpenCode also runs its own goal loop. This toggle controls Paseo's fallback continuation."
             : value.state === "unknown" ? "OpenCode's current goal state could not be verified. Automatic continuation is paused."

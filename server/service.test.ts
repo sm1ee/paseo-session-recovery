@@ -212,7 +212,7 @@ describe("일시 장애와 데몬 종료 뒤 선택한 Goal 복구", () => {
   });
 });
 describe("목표 미리보기와 명시적인 네이티브 제어", () => {
-  async function controls(source: "codex" | "opencode" | "claude" | "omp" = "codex", state: GoalReading["state"] = "active") {
+  async function controls(source: "codex" | "opencode" | "claude" | "omp" | "devin" = "codex", state: GoalReading["state"] = "active") {
     const f = fixture({ enabled: false, continueGoals: false }); f.a.provider = source; f.a.sessionId = "native-fixture"; f.idle();
     const reading: GoalReading = { state, key: "original-goal", evidence: true, source };
     f.setGoal(reading); f.setDetails({ reading, objective: "Private fixture objective", revision: "native-revision", tokenBudget: 100, tokensUsed: 3 });
@@ -277,6 +277,51 @@ describe("목표 미리보기와 명시적인 네이티브 제어", () => {
     expect(view).toMatchObject({ source: "omp", sessionControls: false, action: "pause", actionTicket: expect.any(String), ticket: null });
     expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ nativeAction: "pause", nativeActionReady: true });
     await f.service.actOnGoal({ ticket: view.actionTicket! }); expect(f.controlGoal).toHaveBeenCalledOnce(); expect(f.send).not.toHaveBeenCalled();
+  });
+  async function devin(state: GoalReading["state"] = "active", running = true) {
+    const f = await controls("devin", state);
+    const reading: GoalReading = { state, key: "original-goal", evidence: true, source: "devin", nativeContinuation: true };
+    f.setGoal(reading); f.setDetails({ reading, objective: "Fixture", revision: "native", tokenBudget: null, tokensUsed: null, nativeControls: true, sessionControls: true });
+    if (running) { f.a.status = "running"; f.a.activeTurn = "turn-1"; }
+    return f;
+  }
+  it.each(["paused", "blocked"] as const)("Devin %s는 같은 Goal UI에서 Resume를 제공하며 편집 티켓은 만들지 않는다", async state => {
+    const f = await devin(state, false), view = await f.service.readGoalEditor("session");
+    expect(view).toMatchObject({ source: "devin", action: "resume", actionTicket: expect.any(String), ticket: null });
+    expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ source: "devin", nativeAction: "resume", nativeActionReady: true });
+    await f.service.actOnGoal({ ticket: view.actionTicket! }); expect(f.controlGoal).toHaveBeenCalledOnce(); expect(f.send).not.toHaveBeenCalled(); expect(f.editGoal).not.toHaveBeenCalled();
+  });
+  it("Devin 실행 중에는 Pause를 제공하고 실제 취소 이벤트를 자신의 작업으로 확인한다", async () => {
+    const f = await devin(), view = await f.service.readGoalEditor("session");
+    expect(view).toMatchObject({ action: "pause", actionTicket: expect.any(String), ticket: null });
+    expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ nativeAction: "pause", nativeActionReady: true });
+    let end: Promise<void> | undefined;
+    f.controlGoal.mockImplementationOnce(async (_id, _revision, _action, _expected, guard, _messageId, submitted) => {
+      submitted(); f.idle(); end = f.event({ kind: "end", turnId: "turn-1", outcome: { kind: "canceled", reason: "interrupted" } } as Omit<RecoveryEvent, "agent">); guard();
+      return { state: "paused", source: "devin", key: "original-goal", evidence: true };
+    });
+    await f.service.actOnGoal({ ticket: view.actionTicket! }); await end; expect(f.send).not.toHaveBeenCalled();
+  });
+  it("Devin 재개 턴이 즉시 끝나 blocked가 되어도 일치한 완료 이벤트만 수락한다", async () => {
+    const f = await devin("paused", false), view = await f.service.readGoalEditor("session");
+    const events: Promise<void>[] = [];
+    f.controlGoal.mockImplementationOnce(async (_id, _revision, _action, _expected, guard, _messageId, submitted) => {
+      submitted(); events.push(f.event({ kind: "start", turnId: "native-resume" } as Omit<RecoveryEvent, "agent">));
+      events.push(f.event({ kind: "end", turnId: "native-resume", outcome: { kind: "completed" } } as Omit<RecoveryEvent, "agent">)); guard();
+      return { state: "blocked", source: "devin", key: "original-goal", evidence: true };
+    });
+    await f.service.actOnGoal({ ticket: view.actionTicket! }); await Promise.all(events);
+    expect(f.controlGoal).toHaveBeenCalledOnce(); expect(f.send).not.toHaveBeenCalled();
+  });
+  it.each(["active", "complete", "unknown"] as const)("실행 턴 없는 Devin %s에는 잘못된 Pause나 Resume 티켓을 발급하지 않는다", async state => {
+    const f = await devin(state, false);
+    expect(await f.service.readGoalEditor("session")).toMatchObject({ ticket: null, actionTicket: null });
+    expect(await f.service.goalControl("session", true, false, true)).toMatchObject({ nativeAction: null });
+  });
+  it("Devin native 루프에는 별도 자동 이어가기 메시지를 보내지 않는다", async () => {
+    const f = await devin("active", false); await f.service.configure({ ...f.settings, enabled: true, continueGoals: true });
+    await f.service.watchGoal("session", "original-goal"); f.advance(120_000); await f.service.scanNow();
+    expect(f.send).not.toHaveBeenCalled(); expect(f.controlGoal).not.toHaveBeenCalled();
   });
   it("네이티브 요청 전 모델 복원이 실패하면 전송 불명 상태로 잠그지 않는다", async () => {
     const f = await controls("omp");

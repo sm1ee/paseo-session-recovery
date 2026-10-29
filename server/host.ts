@@ -16,6 +16,7 @@ import type { GoalAction } from "../shared/goal-actions";
 import { CodexGoals } from "./codex-goals";
 import { OpenCodeGoals } from "./opencode-goals";
 import { ClaudeGoals } from "./claude-goals";
+import { DevinGoals, DEVIN_GOAL_RPC, type DevinNativeOutput } from "./devin-native-goals";
 import { OmpGoals } from "./omp-goals";
 import { OmpNativeGoals, OMP_GOAL_RPC, type OmpNativeOutput } from "./omp-native-goals";
 import { controlSessionGoal } from "./session-goal-controls";
@@ -58,6 +59,7 @@ export function nativeGoalCommand(commands: readonly { name: string; kind?: stri
     opencode: ["Set a session-scoped goal and auto-continue until complete."],
     claude: ["Set a goal — keep working until the condition is met"],
     omp: [],
+    devin: ["Set a goal the agent keeps working on until it is done"],
   };
   return commands.some((command) => command.name === "goal" && command.kind === (source === "claude" ? "skill" : "command") && descriptions[source].includes(command.description));
 }
@@ -162,6 +164,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
   const openCodeGoals = new OpenCodeGoals(home);
   const claudeGoals = new ClaudeGoals(home);
   const ompGoals = new OmpGoals();
+  const devinGoals = new DevinGoals(home, async input => await driver.invokePluginRpc("session-recovery", DEVIN_GOAL_RPC, input) as DevinNativeOutput);
   const ompNativeGoals = new OmpNativeGoals(async (input) => await driver.invokePluginRpc("session-recovery", OMP_GOAL_RPC, input) as OmpNativeOutput);
   const ompDetails = async (agent: PaseoAgent): Promise<GoalDetails | null> => {
     if (agent.provider !== "omp") return null;
@@ -231,6 +234,8 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         await check();
         const agent = (await paseo.agents.ref(id).refresh())?.agent;
         if (!agent) return { state: "unknown", key: null, evidence: true };
+        const devin = await devinGoals.details(agent); await check();
+        if (devin) return devin.reading;
         const openCode = await openCodeGoals.read(agent);
         await check();
         if (openCode) return openCode;
@@ -265,7 +270,7 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         await check();
         const agent = (await paseo.agents.ref(id).refresh())?.agent;
         if (!agent) return null;
-        const details = await ompDetails(agent) ?? await openCodeGoals.details(agent) ?? await claudeGoals.details(agent) ?? (agent.persistence?.sessionId ? await codexGoals.details(agent.provider, agent.persistence.sessionId) : null);
+        const details = await devinGoals.details(agent) ?? await ompDetails(agent) ?? await openCodeGoals.details(agent) ?? await claudeGoals.details(agent) ?? (agent.persistence?.sessionId ? await codexGoals.details(agent.provider, agent.persistence.sessionId) : null);
         await check();
         return details ?? (options?.allowTimeline === false ? null : await timelineDetails(id));
       },
@@ -274,8 +279,15 @@ export async function openLocalHost(configuredHome: string, parentPid = process.
         const agent = (await paseo.agents.ref(id).refresh())?.agent;
         checkGoalSession(agent ? metadata(agent) : null, expected, "initial");
         if (!agent?.persistence?.sessionId) throw new RecoveryError("The session's saved history is unavailable.");
-        const details = await ompDetails(agent) ?? await openCodeGoals.details(agent) ?? await claudeGoals.details(agent) ?? await codexGoals.details(agent.provider, agent.persistence.sessionId);
+        const details = await devinGoals.details(agent) ?? await ompDetails(agent) ?? await openCodeGoals.details(agent) ?? await claudeGoals.details(agent) ?? await codexGoals.details(agent.provider, agent.persistence.sessionId);
         const source = details?.reading.source;
+        if (details && source === "devin" && details.nativeControls) {
+          const workspace = expected.workspaceId ? await paseo.workspaces.ref(expected.workspaceId).refresh() : null;
+          if (!workspace || workspace.archivingAt) throw new RecoveryError("This workspace is unavailable.");
+          if (action === "resume" && driver.getLastServerInfoMessage()?.features?.agentRequestReceipts !== true) throw new RecoveryError("This daemon does not advertise durable message receipts.");
+          return devinGoals.control(agent, revision, action, expected, { guard, submitted, fetch: () => fetch(id),
+            pause: () => driver.cancelAgent(id), resume: async () => { await driver.sendAgentMessage(id, "/goal resume", { messageId, activeTurnBehavior: "steer" }); } });
+        }
         if (details && source === "omp" && details.nativeControls) {
           if (details.revision !== revision || !details.objective) throw new RecoveryError("The OMP goal changed. Reload its goal controls.");
           const workspace = expected.workspaceId ? await paseo.workspaces.ref(expected.workspaceId).refresh() : null;

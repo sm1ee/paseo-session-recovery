@@ -2,11 +2,11 @@ import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 
 export const MAX_GOAL_LENGTH = 16_000;
-export type GoalEditorSource = "codex" | "opencode" | "claude" | "omp";
+export type GoalEditorSource = "codex" | "opencode" | "claude" | "omp" | "devin";
 export function goalLengthLimit(source: GoalEditorSource | null): number { return source === "opencode" || source === "claude" ? 4000 : MAX_GOAL_LENGTH; }
 export const goalEditorSchema = z.object({
   id: z.string(), title: z.string(), provider: z.string(), supported: z.boolean(),
-  source: z.enum(["codex", "opencode", "claude", "omp"]).nullable().default(null),
+  source: z.enum(["codex", "opencode", "claude", "omp", "devin"]).nullable().default(null),
   objective: z.string().nullable(), state: z.enum(["active", "paused", "blocked", "limited", "complete", "cleared", "unknown"]),
   tokenBudget: z.number().finite().nonnegative().nullable(), tokensUsed: z.number().finite().nonnegative().nullable(),
   ticket: z.string().nullable(), note: z.string().nullable(),

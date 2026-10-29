@@ -5,7 +5,7 @@ import { goalControlRpc, unwatchGoalRpc, watchGoalRpc, type GoalControl } from "
 import { actOnGoalRpc } from "../shared/goal-actions";
 import { readGoalRpc } from "../shared/goal-editor";
 import { contributeGoalPills } from "./goal-pill";
-import { goalErrorText, goalPreviewLabel } from "./goal-presentation";
+import { goalErrorText, goalPreviewLabel, goalReadOnlyText } from "./goal-presentation";
 import type { PillAgent } from "./goal-pill-controller";
 vi.mock("./goal-pill-icon", () => ({ GoalPillIcon: () => null }));
 vi.mock("./goal-editor", () => ({ GoalEditorContent: () => null }));
@@ -34,7 +34,7 @@ async function fixture(patch: Partial<GoalControl> = {}, agentPatch: Partial<Pil
     buttons.set(pill.id, pill.button);
     return { update: (value: Partial<PillButton>) => { update(value); buttons.set(pill.id, { ...buttons.get(pill.id)!, ...value }); }, remove };
   });
-  const client = { rpc, addComposerPill, paseo: { agents: { list } } } as unknown as PluginClientContext;
+  const client = { rpc, addComposerPill, paseo: { providers: { snapshot: async () => ({ entries: [{ provider: "devin", source: "custom", enabled: true }] }), subscribe: () => () => {} }, agents: { list } } } as unknown as PluginClientContext;
   cleanup = contributeGoalPills(client);
   await vi.waitFor(() => expect(snapshot).toBeTypeOf("function"));
   snapshot({ entries: [{ agent: observed }] });
@@ -99,6 +99,14 @@ describe("목표 미리보기와 네이티브 재생 제어", () => {
     expect(f.buttons.get("goal-continuation")).toMatchObject({ label: "Finish the fixture", behavior: { kind: "popover" } });
     expect(f.rpc).toHaveBeenCalledExactlyOnceWith(goalControlRpc, { id: agent.id, fresh: true, preview: true });
     expect(f.rpc.mock.calls.some(([contract]) => contract === watchGoalRpc || contract === unwatchGoalRpc)).toBe(false);
+  });
+  it("Devin도 같은 Goal 미리보기와 Resume 버튼으로 네이티브 제어를 한 번만 요청한다", async () => {
+    const f = await fixture({ source: "devin", state: "paused", nativeAction: "resume", nativeActionReady: true }, { provider: "devin", activeTurn: null });
+    expect(f.buttons.get("goal-continuation")).toMatchObject({ label: "Finish the fixture", behavior: { kind: "popover" } });
+    expect(f.buttons.get("goal-playback")).toMatchObject({ label: "Resume", icon: "Play", disabled: false });
+    await f.press(); expect(f.rpc).toHaveBeenCalledWith(actOnGoalRpc, { ticket: "one-use", confirmBudgetReset: false });
+    expect(f.rpc.mock.calls.filter(([contract]) => contract === actOnGoalRpc)).toHaveLength(1);
+    expect(goalReadOnlyText({ source: "devin", supported: true, state: "paused", actionTicket: "one-use" } as Parameters<typeof goalReadOnlyText>[0])).toBe("Goal text cannot be edited.");
   });
   it("일시정지는 최신 Goal을 다시 확인해 네이티브 명령을 한 번만 요청한다", async () => {
     const f = await fixture(); await f.press();
@@ -185,7 +193,7 @@ describe("목표 미리보기와 네이티브 재생 제어", () => {
   it("초기 연결 실패 시 관찰을 정리하고 재시도하며 종료 후에는 멈춘다", async () => {
     vi.useFakeTimers(); vi.spyOn(console, "error").mockImplementation(() => {});
     const subscription = { subscribe: vi.fn() }, list = vi.fn().mockRejectedValueOnce(new Error("Disconnected")).mockResolvedValue({ subscription });
-    cleanup = contributeGoalPills({ rpc: vi.fn(), addComposerPill: vi.fn(), paseo: { agents: { list } } } as unknown as PluginClientContext);
+    cleanup = contributeGoalPills({ rpc: vi.fn(), addComposerPill: vi.fn(), paseo: { providers: { snapshot: async () => ({ entries: [{ provider: "devin", source: "custom", enabled: true }] }), subscribe: () => () => {} }, agents: { list } } } as unknown as PluginClientContext);
     await vi.advanceTimersByTimeAsync(0); expect(list.mock.calls[0][0].signal.aborted).toBe(true);
     await vi.advanceTimersByTimeAsync(5000); expect(list).toHaveBeenCalledTimes(2);
     cleanup(); cleanup = undefined; await vi.advanceTimersByTimeAsync(10_000);

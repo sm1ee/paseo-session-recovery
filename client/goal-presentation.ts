@@ -24,7 +24,7 @@ export function goalErrorText(error: unknown): string {
 export function goalReadOnlyText(goal: GoalEditorSnapshot): string {
   if (goal.state === "complete") return "Goal completed.";
   if (!goal.supported) return "Viewing only. Native controls unavailable.";
-  if (goal.source === "omp" && goal.actionTicket) return "Goal text cannot be edited.";
+  if ((goal.source === "omp" || goal.source === "devin") && goal.actionTicket) return "Goal text cannot be edited.";
   const note = goal.note ?? "";
   if (/current turn/.test(note)) return "Turn running. Edit when idle.";
   if (/pending input|uncertain delivery/.test(note)) return "Resolve pending input or delivery first.";
